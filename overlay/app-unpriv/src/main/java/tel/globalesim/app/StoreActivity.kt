@@ -65,7 +65,10 @@ class StoreActivity : Activity() {
         web.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val u = request.url
-                if (isStore(u)) return false
+                // Only top-level navigations; never hijack iframes (payment widgets, maps…)
+                if (!request.isForMainFrame) return false
+                // Store pages marked ext=1 (PayPal checkout) must run in the real browser
+                if (isStore(u) && u.getQueryParameter("ext") != "1") return false
                 openOutside(u)
                 return true
             }
