@@ -41,6 +41,8 @@ class StoreActivity : Activity() {
         const val STORE_HOST = "globalesim.tel"
         // Card manager = the EasyEUICC main screen, re-labelled by scripts/apply_overlay.py
         const val ACTION_CARD_MANAGER = "tel.globalesim.CARD_MANAGER"
+        // Upstream download wizard; accepts lpa:1$smdp$matchingId and pre-fills the code
+        const val DOWNLOAD_WIZARD = "im.angry.openeuicc.ui.wizard.DownloadWizardActivity"
     }
 
     private lateinit var web: WebView
@@ -141,7 +143,7 @@ class StoreActivity : Activity() {
             .put("esim", phoneHasEsim())
             .put("android", Build.VERSION.SDK_INT)
             .put("model", "${Build.MANUFACTURER} ${Build.MODEL}")
-            .put("app", 2)
+            .put("app", 3)
             .put("cardManager", true)
             .toString()
 
@@ -191,6 +193,22 @@ class StoreActivity : Activity() {
             if (!validCode(ac)) return toast("Invalid activation code")
             copyText("eSIM activation code", ac)
             runOnUiThread {
+                // 1) Open the card writer (download wizard) with the code already filled in:
+                //    the customer just picks the card and taps Next → Download.
+                try {
+                    val lpa = Uri.parse("lpa:" + ac.substring(4)) // "LPA:1$…" → "lpa:1$…"
+                    startActivity(
+                        Intent(Intent.ACTION_VIEW, lpa).setClassName(packageName, DOWNLOAD_WIZARD)
+                    )
+                    Toast.makeText(
+                        this@StoreActivity,
+                        "Choose your GlobaleSIM card, then tap Next to install. Keep the app open until it finishes.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    return@runOnUiThread
+                } catch (e: Exception) {
+                    // fall through to the card manager + paste flow
+                }
                 try {
                     startActivity(Intent(ACTION_CARD_MANAGER).setPackage(packageName))
                     Toast.makeText(
