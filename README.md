@@ -43,8 +43,8 @@ Convert it for GitHub:
 
 ## 3. Build on GitHub (nothing to install)
 1. Create a GitHub repo and upload this folder. A **public** repo also covers the license (below).
-2. Go to Settings → Secrets and variables → Actions, and add:
-   `KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS` (`globalesim`), `KEY_PASSWORD`
+2. Go to Settings → Secrets and variables → Actions, and add two secrets:
+   `KEYSTORE_BASE64` and `KEYSTORE_PASSWORD`. (`KEY_ALIAS` defaults to `globalesim`, and `KEY_PASSWORD` defaults to the keystore password.)
 3. Go to Actions → **Build GlobaleSIM APK** → Run workflow. About 10 minutes later, download **GlobaleSIM-apk** from the run.
    It contains the APK and `cert-fingerprints.txt`.
 4. To publish a release, push a tag like `v1.0.0`. The APK is attached to a GitHub Release.
