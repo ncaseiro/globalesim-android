@@ -141,7 +141,8 @@ class StoreActivity : Activity() {
             .put("esim", phoneHasEsim())
             .put("android", Build.VERSION.SDK_INT)
             .put("model", "${Build.MANUFACTURER} ${Build.MODEL}")
-            .put("app", 1)
+            .put("app", 2)
+            .put("cardManager", true)
             .toString()
 
         @JavascriptInterface
@@ -170,6 +171,18 @@ class StoreActivity : Activity() {
                     else "Code copied. Open Settings → SIMs → Add eSIM and paste it.",
                     Toast.LENGTH_LONG
                 ).show()
+            }
+        }
+
+        /** Open the card manager (plans on the physical eSIM card in this phone): view, add, switch, rename, delete. */
+        @JavascriptInterface
+        fun openCardManager() {
+            runOnUiThread {
+                try {
+                    startActivity(Intent(ACTION_CARD_MANAGER).setPackage(packageName))
+                } catch (e: Exception) {
+                    Toast.makeText(this@StoreActivity, "Card manager not available", Toast.LENGTH_LONG).show()
+                }
             }
         }
 
