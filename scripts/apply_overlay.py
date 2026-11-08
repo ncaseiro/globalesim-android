@@ -139,6 +139,39 @@ def main():
             x = x.replace("<application", '<uses-permission android:name="android.permission.INTERNET" />\n\n    <application', 1)
         mf.write_text(x)
     print("  StoreActivity is the launcher (deep link globalesim://order/<token>)")
+
+    # 6. Brand GlobaleSIM plans on the card: profiles from ESIMAccess are named
+    #    "ESIM_ACCESS_CARRIER" with provider "Carrier". Show "GlobaleSIM" instead
+    #    (a nickname the customer sets still wins).
+    lpa = up / "app-common/src/main/java/im/angry/openeuicc/util/LPAUtils.kt"
+    t = lpa.read_text()
+    old = "val LocalProfileInfo.displayName: String\n    get() = nickName.ifEmpty { name }"
+    if old not in t:
+        die("LPAUtils.displayName changed upstream")
+    t = t.replace(old, '''private val GS_PROFILE = Regex("esim[ _]?access", RegexOption.IGNORE_CASE)
+
+val LocalProfileInfo.isGlobaleSim: Boolean
+    get() = GS_PROFILE.containsMatchIn(name) || GS_PROFILE.containsMatchIn(providerName)
+
+val LocalProfileInfo.displayName: String
+    get() = nickName.ifEmpty { if (isGlobaleSim) "GlobaleSIM" else name }
+
+val LocalProfileInfo.displayProvider: String
+    get() = if (isGlobaleSim || (providerName.equals("Carrier", true) && GS_PROFILE.containsMatchIn(name))) "GlobaleSIM" else providerName''')
+    lpa.write_text(t)
+    frag = up / "app-common/src/main/java/im/angry/openeuicc/ui/EuiccManagementFragment.kt"
+    f = frag.read_text()
+    if "provider.text = profile.providerName" not in f:
+        die("EuiccManagementFragment provider line changed upstream")
+    frag.write_text(f.replace("provider.text = profile.providerName", "provider.text = profile.displayProvider"))
+    print("  GlobaleSIM plans show as 'GlobaleSIM'")
+
+    # 7. Wording: say GlobaleSIM everywhere in the card manager
+    for strings in (mod / "src/main/res").glob("values*/strings.xml"):
+        s = strings.read_text()
+        s2 = s.replace("EasyEUICC", a.app_name)
+        if s2 != s:
+            strings.write_text(s2)
     print("Done.")
 
 

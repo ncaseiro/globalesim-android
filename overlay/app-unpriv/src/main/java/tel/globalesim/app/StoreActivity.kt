@@ -50,11 +50,11 @@ class StoreActivity : Activity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.statusBarColor = Color.parseColor("#06141b")
-        window.navigationBarColor = Color.parseColor("#06141b")
+        window.statusBarColor = Color.parseColor("#0E1A2B")
+        window.navigationBarColor = Color.parseColor("#0E1A2B")
 
         web = WebView(this)
-        web.setBackgroundColor(Color.parseColor("#06141b"))
+        web.setBackgroundColor(Color.parseColor("#0E1A2B"))
         web.overScrollMode = View.OVER_SCROLL_NEVER
         setContentView(web)
 
