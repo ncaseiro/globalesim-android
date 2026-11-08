@@ -1,0 +1,93 @@
+name: Build GlobaleSIM APK
+
+# Runs on every push to main, on version tags (v1.0.0 → GitHub Release), or by hand
+# from the Actions tab ("Run workflow").
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'OpenEUICC branch/tag/commit to build on (blank = latest)'
+        required: false
+        default: ''
+
+env:
+  UPSTREAM_REPO: https://gitea.angry.im/PeterCxy/OpenEUICC.git
+  APP_ID: tel.globalesim.app
+  APP_NAME: GlobaleSIM
+  STORE_URL: https://globalesim.tel/app.php
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout GlobaleSIM overlay
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream OpenEUICC (with lpac submodule)
+        run: |
+          git clone --recurse-submodules "$UPSTREAM_REPO" upstream
+          if [ -n "${{ github.event.inputs.upstream_ref }}" ]; then
+            git -C upstream checkout "${{ github.event.inputs.upstream_ref }}"
+            git -C upstream submodule update --init --recursive
+          fi
+          echo "Building on upstream commit: $(git -C upstream log -1 --format='%h %cd %s')"
+
+      - name: Apply GlobaleSIM overlay
+        run: python3 scripts/apply_overlay.py upstream --app-id "$APP_ID" --app-name "$APP_NAME" --store-url "$STORE_URL"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::Add the KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD secrets (see README)"; exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/globalesim.jks"
+          # upstream reads keystore.properties at the repo root
+          cat > upstream/keystore.properties <<EOF
+          storeFile=$RUNNER_TEMP/globalesim.jks
+          storePassword=$KEYSTORE_PASSWORD
+          unprivKeyAlias=$KEY_ALIAS
+          unprivKeyPassword=$KEY_PASSWORD
+          privKeyAlias=$KEY_ALIAS
+          privKeyPassword=$KEY_PASSWORD
+          EOF
+          sed -i 's/^ *//' upstream/keystore.properties
+          # Print the certificate fingerprints — give these to your card supplier for ARA-M
+          keytool -list -v -keystore "$RUNNER_TEMP/globalesim.jks" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" \
+            | grep -E 'SHA1:|SHA256:' | tee cert-fingerprints.txt
+
+      - name: Build release APK
+        working-directory: upstream
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :app-unpriv:assembleRelease
+          mkdir -p ../out
+          cp app-unpriv/build/outputs/apk/release/*.apk ../out/GlobaleSIM-${GITHUB_REF_NAME//\//-}.apk
+          cp ../cert-fingerprints.txt ../out/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GlobaleSIM-apk
+          path: out/*
+
+      - name: Publish GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.apk
