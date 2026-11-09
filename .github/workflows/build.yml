@@ -74,15 +74,16 @@ jobs:
       - name: Build release APK + Play Store bundle (AAB)
         working-directory: upstream
         env:
-          # Google Play needs a higher versionCode on every upload
-          GS_VERSION_CODE: ${{ 1000 + github.run_number }}
-          GS_VERSION_NAME: 1.0.${{ github.run_number }}
+          RUN_NO: ${{ github.run_number }}
         run: |
+          # Google Play needs a higher versionCode on every upload
+          export GS_VERSION_CODE=$((1000 + RUN_NO))
+          export GS_VERSION_NAME="1.0.$RUN_NO"
           chmod +x gradlew
           ./gradlew --no-daemon :app-unpriv:assembleRelease :app-unpriv:bundleRelease
           mkdir -p ../out
           cp app-unpriv/build/outputs/apk/release/*.apk ../out/GlobaleSIM-${GITHUB_REF_NAME//\//-}.apk
-          cp app-unpriv/build/outputs/bundle/release/*.aab ../out/GlobaleSIM-play-1.0.${{ github.run_number }}.aab
+          cp app-unpriv/build/outputs/bundle/release/*.aab ../out/GlobaleSIM-play-1.0.$RUN_NO.aab
           cp ../cert-fingerprints.txt ../out/
           echo "versionCode $GS_VERSION_CODE, versionName $GS_VERSION_NAME" | tee ../out/version.txt
 
