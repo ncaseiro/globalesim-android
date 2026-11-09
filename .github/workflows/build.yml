@@ -1,4 +1,4 @@
-name: Build GlobaleSIM APK
+name: Build GlobaleSIM APK + AAB
 
 # Runs on every push to main, on version tags (v1.0.0 → GitHub Release), or by hand
 # from the Actions tab ("Run workflow").
@@ -71,14 +71,20 @@ jobs:
           keytool -list -v -keystore "$RUNNER_TEMP/globalesim.jks" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" \
             | grep -E 'SHA1:|SHA256:' | tee cert-fingerprints.txt
 
-      - name: Build release APK
+      - name: Build release APK + Play Store bundle (AAB)
         working-directory: upstream
+        env:
+          # Google Play needs a higher versionCode on every upload
+          GS_VERSION_CODE: ${{ 1000 + github.run_number }}
+          GS_VERSION_NAME: 1.0.${{ github.run_number }}
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon :app-unpriv:assembleRelease
+          ./gradlew --no-daemon :app-unpriv:assembleRelease :app-unpriv:bundleRelease
           mkdir -p ../out
           cp app-unpriv/build/outputs/apk/release/*.apk ../out/GlobaleSIM-${GITHUB_REF_NAME//\//-}.apk
+          cp app-unpriv/build/outputs/bundle/release/*.aab ../out/GlobaleSIM-play-1.0.${{ github.run_number }}.aab
           cp ../cert-fingerprints.txt ../out/
+          echo "versionCode $GS_VERSION_CODE, versionName $GS_VERSION_NAME" | tee ../out/version.txt
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -90,4 +96,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: out/*.apk
+          files: |
+            out/*.apk
+            out/*.aab

@@ -166,6 +166,23 @@ val LocalProfileInfo.displayProvider: String
     frag.write_text(f.replace("provider.text = profile.providerName", "provider.text = profile.displayProvider"))
     print("  GlobaleSIM plans show as 'GlobaleSIM'")
 
+    # 8. Google Play: every upload needs a higher versionCode. Upstream counts its own git
+    #    commits, which doesn't change when only our overlay changes, so the build passes
+    #    GS_VERSION_CODE / GS_VERSION_NAME (from the CI run number). Also point the app's
+    #    web association at our domain instead of easyeuicc.org.
+    bg = mod / "build.gradle.kts"
+    g = bg.read_text()
+    if "targetSdk = " not in g:
+        die("app-unpriv build.gradle.kts changed upstream (targetSdk)")
+    if "GS_VERSION_CODE" not in g:
+        g = re.sub(r"(\n(\s*)targetSdk = \d+\n)",
+                   r'\1\2System.getenv("GS_VERSION_CODE")?.toIntOrNull()?.let { versionCode = it }\n'
+                   r'\2System.getenv("GS_VERSION_NAME")?.takeIf { it.isNotBlank() }?.let { versionName = it }\n',
+                   g, count=1)
+    g = re.sub(r'emitAssetStatements\([^)]*\)', 'emitAssetStatements("https://globalesim.tel")', g)
+    bg.write_text(g)
+    print("  Play versioning from GS_VERSION_CODE")
+
     # 7. Wording: say GlobaleSIM everywhere in the card manager
     for strings in (mod / "src/main/res").glob("values*/strings.xml"):
         s = strings.read_text()
