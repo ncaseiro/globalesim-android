@@ -15,15 +15,34 @@ on:
 
 env:
   UPSTREAM_REPO: https://gitea.angry.im/PeterCxy/OpenEUICC.git
-  APP_ID: tel.globalesim.app
-  APP_NAME: GlobaleSIM
   STORE_URL: https://globalesim.tel/app.php
+  # Public "9eSIM Community Key": the cards from our supplier (open-source COS) trust apps
+  # signed with it. Pinned to a commit and checked by fingerprint.
+  COMMUNITY_KEY_URL: https://raw.githubusercontent.com/9esim/9eSIMCommunityKey/ddc15a8b8c873d42faa6dcda5db03f5dbc4124c4/9eSIMCommunityKey.jks
+  COMMUNITY_KEY_SHA256: 69:66:00:4A:D0:16:11:65:33:5F:92:04:F8:F5:A5:2D:F4:9F:E0:68:C9:54:5C:0C:58:9C:23:22:1A:F8:D3:A4
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Main app: our own key. Google Play + phones with built-in eSIM.
+          - variant: main
+            app_id: tel.globalesim.app
+            app_name: GlobaleSIM
+          # Card edition: signed with the 9eSIM Community Key so open-source eSIM cards
+          # (our supplier's) let it manage them. Separate app id → both can be installed.
+          - variant: card
+            app_id: tel.globalesim.card
+            app_name: GlobaleSIM Card
+    env:
+      APP_ID: ${{ matrix.app_id }}
+      APP_NAME: ${{ matrix.app_name }}
+      VARIANT: ${{ matrix.variant }}
     steps:
       - name: Checkout GlobaleSIM overlay
         uses: actions/checkout@v4
@@ -46,7 +65,26 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Signing key (card edition = 9eSIM Community Key)
+        if: matrix.variant == 'card'
+        run: |
+          curl -fsSL "$COMMUNITY_KEY_URL" -o "$RUNNER_TEMP/globalesim.jks"
+          got=$(keytool -list -v -keystore "$RUNNER_TEMP/globalesim.jks" -storepass 147258369 -alias key0 | grep -E 'SHA256:' | awk '{print $2}')
+          [ "$got" = "$COMMUNITY_KEY_SHA256" ] || { echo "::error::Community key fingerprint mismatch: $got"; exit 1; }
+          cat > upstream/keystore.properties <<EOF
+          storeFile=$RUNNER_TEMP/globalesim.jks
+          storePassword=147258369
+          unprivKeyAlias=key0
+          unprivKeyPassword=147258369
+          privKeyAlias=key0
+          privKeyPassword=147258369
+          EOF
+          sed -i 's/^ *//' upstream/keystore.properties
+          keytool -list -v -keystore "$RUNNER_TEMP/globalesim.jks" -storepass 147258369 -alias key0 \
+            | grep -E 'SHA1:|SHA256:' | tee cert-fingerprints.txt
+
       - name: Signing key
+        if: matrix.variant == 'main'
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -80,17 +118,22 @@ jobs:
           export GS_VERSION_CODE=$((1000 + RUN_NO))
           export GS_VERSION_NAME="1.0.$RUN_NO"
           chmod +x gradlew
-          ./gradlew --no-daemon :app-unpriv:assembleRelease :app-unpriv:bundleRelease
           mkdir -p ../out
-          cp app-unpriv/build/outputs/apk/release/*.apk ../out/GlobaleSIM-${GITHUB_REF_NAME//\//-}.apk
-          cp app-unpriv/build/outputs/bundle/release/*.aab ../out/GlobaleSIM-play-1.0.$RUN_NO.aab
+          if [ "$VARIANT" = main ]; then
+            ./gradlew --no-daemon :app-unpriv:assembleRelease :app-unpriv:bundleRelease
+            cp app-unpriv/build/outputs/apk/release/*.apk ../out/GlobaleSIM-${GITHUB_REF_NAME//\//-}.apk
+            cp app-unpriv/build/outputs/bundle/release/*.aab ../out/GlobaleSIM-play-1.0.$RUN_NO.aab
+          else
+            ./gradlew --no-daemon :app-unpriv:assembleRelease
+            cp app-unpriv/build/outputs/apk/release/*.apk ../out/GlobaleSIM-Card-${GITHUB_REF_NAME//\//-}.apk
+          fi
           cp ../cert-fingerprints.txt ../out/
           echo "versionCode $GS_VERSION_CODE, versionName $GS_VERSION_NAME" | tee ../out/version.txt
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: GlobaleSIM-apk
+          name: ${{ matrix.variant == 'card' && 'GlobaleSIM-Card-apk' || 'GlobaleSIM-apk' }}
           path: out/*
 
       - name: Publish GitHub Release (tags only)
