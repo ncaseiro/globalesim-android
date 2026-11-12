@@ -183,6 +183,19 @@ val LocalProfileInfo.displayProvider: String
     bg.write_text(g)
     print("  Play versioning from GS_VERSION_CODE")
 
+    # 9. Keep GlobaleSIM colors: upstream uses Material You (wallpaper colors) on
+    #    Android 12+, which replaces our navy/amber theme. Turn it off.
+    app_kt = up / "app-common/src/main/java/im/angry/openeuicc/OpenEuiccApplication.kt"
+    k = app_kt.read_text()
+    if "DynamicColors.applyToActivitiesIfAvailable(this)" in k:
+        app_kt.write_text(k.replace("DynamicColors.applyToActivitiesIfAvailable(this)",
+                                    "// GlobaleSIM: brand colors, no wallpaper colors"))
+    dlg = up / "app-common/src/main/java/im/angry/openeuicc/ui/BaseMaterialDialogFragment.kt"
+    d = dlg.read_text()
+    d = d.replace("DynamicColors.wrapContextIfAvailable(wrappedContext)", "wrappedContext")
+    dlg.write_text(d)
+    print("  Material You off (GlobaleSIM colors everywhere)")
+
     # 7. Wording: say GlobaleSIM everywhere in the card manager
     for strings in (mod / "src/main/res").glob("values*/strings.xml"):
         s = strings.read_text()
