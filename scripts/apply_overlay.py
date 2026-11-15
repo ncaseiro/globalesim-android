@@ -209,6 +209,32 @@ val LocalProfileInfo.displayProvider: String
         appmk.write_text(m)
     print("  16 KB page size for native libs")
 
+    # 11. Google Play: turn on R8 code optimization/obfuscation for the release build
+    #     (Play flags apps under 25% obfuscation). Keep everything the native code and
+    #     the WebView look up by name.
+    g = bg.read_text()
+    rel = re.search(r"release\s*\{[^}]*?isMinifyEnabled\s*=\s*false", g, re.S)
+    if rel:
+        g = g[:rel.start()] + rel.group(0).replace("isMinifyEnabled = false", "isMinifyEnabled = true\n            isShrinkResources = true") + g[rel.end():]
+        bg.write_text(g)
+    rules = mod / "proguard-rules.pro"
+    extra = """
+# ---- GlobaleSIM (added by apply_overlay.py) ----
+# lpac native code finds these classes, methods and fields by name (JNI)
+-keep class net.typeblog.lpac_jni.** { *; }
+-keepclasseswithmembernames,includedescriptorclasses class * { native <methods>; }
+# Store page bridge: window.GlobaleSIM.*
+-keepclassmembers class * { @android.webkit.JavascriptInterface <methods>; }
+-keep class tel.globalesim.app.StoreActivity$Bridge { *; }
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod,SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
+-dontwarn **
+"""
+    r = rules.read_text() if rules.exists() else ""
+    if "GlobaleSIM (added by apply_overlay.py)" not in r:
+        rules.write_text(r + extra)
+    print("  R8 optimization on (minify + resource shrink)" if rel else "  WARNING: release minify flag not found")
+
     # 7. Wording: say GlobaleSIM everywhere in the card manager
     for strings in (mod / "src/main/res").glob("values*/strings.xml"):
         s = strings.read_text()
