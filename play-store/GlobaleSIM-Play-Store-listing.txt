@@ -1,0 +1,148 @@
+GLOBALESIM — GOOGLE PLAY STORE LISTING (copy & paste)
+=====================================================
+
+App name (max 30):        GlobaleSIM: Travel eSIM Data
+Default language:         English (United States)
+App or game:              App
+Free or paid:             Free
+Category:                 Travel & Local
+Contact email:            (your support email from globalesim.tel)
+Website:                  https://globalesim.tel
+Privacy policy:           https://globalesim.tel/privacy
+Contains ads:             No
+Package name:             tel.globalesim.app   (upload GlobaleSIM-play-1.0.xx.aab)
+
+
+ENGLISH
+-------
+Short description (max 80):
+Mobile data in 190+ countries. Buy an eSIM in a minute, no roaming bills.
+
+Full description:
+Travel with data from the moment you land. GlobaleSIM gives you affordable mobile data in 190+ countries — no roaming bills, no hunting for a local SIM.
+
+HOW IT WORKS
+• Pick your destination and a data plan
+• Pay securely with PayPal or card
+• Install your eSIM in a few taps — the app does the work for you
+
+ONE PLAN, THE WHOLE WORLD
+Going to more than one country? A Global plan works in 100+ countries, so you never need a new SIM at every border. Regional plans cover Europe, Asia, the Americas and more.
+
+NO eSIM PHONE? NO PROBLEM
+Use a GlobaleSIM card: put it in your phone's SIM slot and install plans on it right from the app. See the plans on your card, switch between them, rename or delete them.
+
+WHY GLOBALESIM
+• Daily deals on popular destinations
+• Check your data balance anytime in "My eSIMs"
+• Top up when you need more
+• Works on unlocked phones that support eSIM
+• Available in English, Português, Español and Français
+
+Your phone must be carrier-unlocked. Data-only plans; calls and texts over apps like WhatsApp work as usual.
+
+
+PORTUGUÊS (pt-BR)
+-----------------
+Descrição curta:
+Internet móvel em mais de 190 países. Compre um eSIM em um minuto, sem roaming.
+
+Descrição completa:
+Viaje conectado desde o momento em que você chega. A GlobaleSIM oferece internet móvel barata em mais de 190 países — sem contas de roaming e sem procurar chip local.
+
+COMO FUNCIONA
+• Escolha o destino e um plano de dados
+• Pague com segurança com PayPal ou cartão
+• Instale o eSIM em poucos toques — o app faz o trabalho por você
+
+UM PLANO, O MUNDO INTEIRO
+Vai a mais de um país? Um plano Global funciona em mais de 100 países, sem trocar de chip a cada fronteira.
+
+SEU CELULAR NÃO TEM eSIM?
+Use um cartão GlobaleSIM: coloque na entrada do chip e instale os planos direto pelo app.
+
+O celular precisa estar desbloqueado. Planos somente de dados.
+
+
+ESPAÑOL (es-419)
+----------------
+Descripción breve:
+Datos móviles en más de 190 países. Compra un eSIM en un minuto, sin roaming.
+
+Descripción completa:
+Viaja con datos desde que aterrizas. GlobaleSIM te da datos móviles económicos en más de 190 países — sin cargos de roaming y sin buscar una SIM local.
+
+CÓMO FUNCIONA
+• Elige tu destino y un plan de datos
+• Paga de forma segura con PayPal o tarjeta
+• Instala tu eSIM en pocos toques — la app lo hace por ti
+
+UN PLAN, TODO EL MUNDO
+¿Vas a más de un país? Un plan Global funciona en más de 100 países, sin cambiar de SIM en cada frontera.
+
+¿TU TELÉFONO NO TIENE eSIM?
+Usa una tarjeta GlobaleSIM: ponla en la ranura SIM e instala los planes desde la app.
+
+Tu teléfono debe estar liberado. Planes solo de datos.
+
+
+FRANÇAIS (fr-FR)
+----------------
+Description courte :
+Données mobiles dans plus de 190 pays. Achetez une eSIM en une minute.
+
+Description complète :
+Voyagez connecté dès l'atterrissage. GlobaleSIM vous offre des données mobiles abordables dans plus de 190 pays — sans frais d'itinérance ni carte SIM locale.
+
+COMMENT ÇA MARCHE
+• Choisissez votre destination et un forfait
+• Payez en toute sécurité avec PayPal ou carte
+• Installez votre eSIM en quelques touches — l'app s'occupe de tout
+
+UN FORFAIT, LE MONDE ENTIER
+Plusieurs pays ? Un forfait Global fonctionne dans plus de 100 pays, sans nouvelle SIM à chaque frontière.
+
+PAS D'eSIM SUR VOTRE TÉLÉPHONE ?
+Utilisez une carte GlobaleSIM : insérez-la dans le tiroir SIM et installez les forfaits depuis l'app.
+
+Votre téléphone doit être désimlocké. Forfaits données uniquement.
+
+
+GRAPHICS
+--------
+App icon 512x512:          play-icon-512.png
+Feature graphic 1024x500:  play-feature-graphic-1024x500.png
+Phone screenshots (2–8):   take on your phone (Power + Volume Down):
+                           1) Store home   2) A country's plans   3) Plan details popup
+                           4) Checkout     5) My eSIMs            6) SIM card / card manager
+
+
+DATA SAFETY FORM — answers
+--------------------------
+Does your app collect or share any required user data types?   Yes
+Is all user data encrypted in transit?                         Yes (HTTPS)
+Do you provide a way for users to request data deletion?       Yes — by email (see privacy policy)
+
+Data collected:
+• Personal info → Email address
+    Collected: Yes   Shared: No   Optional: No (needed to deliver the eSIM)
+    Purposes: App functionality, Customer support (account management: order lookup)
+• Financial info → Purchase history
+    Collected: Yes   Shared: No   Optional: No
+    Purposes: App functionality
+• Financial info → Payment info (card numbers)
+    NOT collected by the app — payment happens on PayPal's page.
+Everything else (location, contacts, photos, device IDs, app activity): Not collected.
+Camera is only used to scan an eSIM QR code; images are not saved or sent.
+
+
+OTHER FORMS
+-----------
+App access:            All functionality available without special access (no login needed)
+Ads:                   No ads
+Content rating:        Category "Utility, Productivity, Communication, or Other" → answer No to everything → rated Everyone
+Target audience:       18 and over
+News app:              No
+Government app:        No
+Financial features:    None of these (you don't offer loans/banking; eSIM purchase only)
+Health:                None
