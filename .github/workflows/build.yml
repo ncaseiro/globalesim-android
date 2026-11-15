@@ -156,6 +156,19 @@ jobs:
           name: ${{ matrix.variant == 'card' && 'GlobaleSIM-Card-apk' || 'GlobaleSIM-apk' }}
           path: out/*
 
+      # Keep the latest Play bundle on the 'play-uploads' branch so Play Console can
+      # fetch it (raw.githubusercontent.com) without a manual download.
+      - name: Publish Play bundle to play-uploads branch
+        if: matrix.variant == 'main' && github.ref == 'refs/heads/main'
+        run: |
+          set -e
+          mkdir pu && cd pu
+          git init -q && git checkout -q -b play-uploads
+          cp ../out/*.aab ../out/mapping-*.txt ../out/version.txt . 2>/dev/null || true
+          git add -A
+          git -c user.name="GlobaleSIM CI" -c user.email="ci@globalesim.tel" commit -qm "Play bundle $(cat version.txt)"
+          git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" play-uploads
+
       - name: Publish GitHub Release (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
