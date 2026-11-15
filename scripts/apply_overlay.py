@@ -196,6 +196,19 @@ val LocalProfileInfo.displayProvider: String
     dlg.write_text(d)
     print("  Material You off (GlobaleSIM colors everywhere)")
 
+    # 10. Google Play: native libs must support 16 KB memory pages. Upstream puts the
+    #     max-page-size flag before $(CLEAR_VARS) in lpac-jni.mk, which wipes it, so
+    #     liblpac-jni.so ships 4 KB aligned. Set it for every module in Application.mk.
+    appmk = up / "libs/lpac-jni/src/main/jni/Application.mk"
+    m = appmk.read_text()
+    if "max-page-size=16384" not in m:
+        if "APP_LDFLAGS :=" in m:
+            m = m.replace("APP_LDFLAGS :=", "APP_LDFLAGS := -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384", 1)
+        else:
+            m += "\nAPP_LDFLAGS += -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384\n"
+        appmk.write_text(m)
+    print("  16 KB page size for native libs")
+
     # 7. Wording: say GlobaleSIM everywhere in the card manager
     for strings in (mod / "src/main/res").glob("values*/strings.xml"):
         s = strings.read_text()
