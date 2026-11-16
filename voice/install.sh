@@ -33,6 +33,7 @@ fi
 read -rp "Your phone number from the carrier, digits only with country code, e.g. 12145550123 [${DID:-}]: " x; DID=${x:-${DID:-}}
 DID=$(echo "$DID" | tr -cd '0-9')
 read -rp "Is 911 (E911 with your address) enabled on that number at the carrier? y/N [${E911:-n}]: " x; E911=${x:-${E911:-n}}
+NEW_PASS=0; [ -z "$TEST_PASS" ] && NEW_PASS=1
 TEST_PASS=${TEST_PASS:-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20)}
 TEST_USER=${TEST_USER:-gs$(shuf -i 100000-999999 -n 1)}   # not "1001": bots guess short numbers
 
@@ -257,6 +258,9 @@ if [ -f /etc/ufw/before.rules ] && ! grep -q "globalesim-scanners" /etc/ufw/befo
   awk -v r="$RULES" '/^# End required lines/ && !d {print; print r; d=1; next} {print}' /etc/ufw/before.rules > /tmp/before.rules && cat /tmp/before.rules > /etc/ufw/before.rules
 fi
 ufw reload >/dev/null 2>&1 || true
+KEEP_IPS=$(grep -oP '^ignoreip\s*=\s*\K.*' /etc/fail2ban/jail.d/asterisk.local 2>/dev/null | tr ' ' '\n' | grep -v '^127.0.0.1/8$' | tr '\n' ' ')
+ADMIN_IP=$(echo "${SSH_CLIENT:-}" | awk '{print $1}')
+IGNORE_IPS=$(echo "127.0.0.1/8 $KEEP_IPS $ADMIN_IP" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
 cat > /etc/fail2ban/jail.d/asterisk.local <<EOF
 [asterisk]
 enabled  = true
@@ -267,7 +271,7 @@ banaction = iptables-allports
 maxretry = 3
 findtime = 3600
 bantime  = 604800
-ignoreip = 127.0.0.1/8
+ignoreip = $IGNORE_IPS
 EOF
 systemctl enable --now fail2ban >/dev/null 2>&1; systemctl restart fail2ban
 
@@ -284,11 +288,11 @@ cat <<EOF
 Test phone login (for Zoiper or Linphone on your phone):
    Server / domain : $PUBIP
    Username        : $TEST_USER
-   Password        : $TEST_PASS
+   Password        : $( [ "$NEW_PASS" = 1 ] && echo "$TEST_PASS   <-- NEW, copy it into Zoiper now; it will not be shown again" || echo "(unchanged — see /etc/globalesim-voice.conf)" )
    Transport       : UDP, port 5060
 Your number        : ${DID:-not set yet}
 Carrier            : $( [ -n "$DL_USER" ] && echo "$PROVIDER ($DL_USER @ $DL_SERVER) — 'Registered' above means it's connected" || echo "NOT set yet — run 'bash install.sh' again after creating the SIP account")
-911                : $( [ "$E911_ON" = 1 ] && echo "ON" || echo "OFF (plays 'no service' — turn on E911 at DIDLogic, then rerun)")
+911                : $( [ "$E911_ON" = 1 ] && echo "ON" || echo "OFF (plays 'no service' — turn on E911 at your carrier, then rerun)")
 
 Keep this password private. Settings are saved in $CONF (root only).
 Check status any time:  asterisk -rx "pjsip show registrations"
