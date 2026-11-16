@@ -1,5 +1,6 @@
 package tel.globalesim.app
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ClipData
@@ -64,6 +65,11 @@ class StoreActivity : Activity() {
             userAgentString = "$userAgentString GlobaleSIMApp/1"
         }
         web.addJavascriptInterface(Bridge(), "GlobaleSIM")
+        // GlobaleSIM Phone: native calling engine, reports to the page as window.gsVoiceEvent(json)
+        runCatching { VoiceManager.init(this) }
+        VoiceManager.listener = { js ->
+            runOnUiThread { web.evaluateJavascript("window.gsVoiceEvent && window.gsVoiceEvent($js)", null) }
+        }
         web.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val u = request.url
@@ -85,6 +91,27 @@ class StoreActivity : Activity() {
         if (intent.data != null) web.loadUrl(urlFor(intent))
     }
 
+    override fun onDestroy() {
+        VoiceManager.listener = null
+        super.onDestroy()
+    }
+
+    private val MIC_REQUEST = 7
+    private fun hasMic() = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    private fun askMic() {
+        val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= 31) perms += Manifest.permission.BLUETOOTH_CONNECT
+        requestPermissions(perms.toTypedArray(), MIC_REQUEST)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == MIC_REQUEST) {
+            val js = JSONObject().put("type", "perm").put("mic", hasMic()).toString()
+            web.evaluateJavascript("window.gsVoiceEvent && window.gsVoiceEvent($js)", null)
+        }
+    }
+
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         web.saveState(outState)
@@ -103,6 +130,7 @@ class StoreActivity : Activity() {
     /** globalesim://order/<token> → store order page */
     private fun urlFor(i: Intent?): String {
         val d = i?.data ?: return STORE_URL
+        if (d.scheme == "globalesim" && d.host == "phone") return "$STORE_URL?phone"
         if (d.scheme == "globalesim" && d.host == "order") {
             val token = d.lastPathSegment ?: ""
             if (Regex("^[a-f0-9]{32}$").matches(token)) return "$STORE_URL?order=$token"
@@ -143,7 +171,9 @@ class StoreActivity : Activity() {
             .put("esim", phoneHasEsim())
             .put("android", Build.VERSION.SDK_INT)
             .put("model", "${Build.MANUFACTURER} ${Build.MODEL}")
-            .put("app", 3)
+            .put("app", 4)
+            .put("voice", true)
+            .put("mic", hasMic())
             .put("cardManager", true)
             .toString()
 
@@ -221,6 +251,33 @@ class StoreActivity : Activity() {
                 }
             }
         }
+
+        // ---------------- GlobaleSIM Phone ----------------
+        /** Asks for the microphone if needed; returns true when calls can use it. */
+        @JavascriptInterface
+        fun voiceReady(): Boolean {
+            if (hasMic()) return true
+            runOnUiThread { askMic() }
+            return false
+        }
+        @JavascriptInterface fun voiceLogin(json: String) = VoiceManager.login(json)
+        @JavascriptInterface fun voiceLogout() = VoiceManager.logout()
+        @JavascriptInterface fun voiceState(): String = VoiceManager.snapshot()
+        @JavascriptInterface
+        fun voiceCall(number: String) {
+            if (!hasMic()) { runOnUiThread { askMic() }; return }
+            VoiceManager.call(number)
+        }
+        @JavascriptInterface
+        fun voiceAnswer() {
+            if (!hasMic()) { runOnUiThread { askMic() }; return }
+            VoiceManager.answer()
+        }
+        @JavascriptInterface fun voiceDecline() = VoiceManager.decline()
+        @JavascriptInterface fun voiceHangup() = VoiceManager.hangup()
+        @JavascriptInterface fun voiceDtmf(d: String) = VoiceManager.dtmf(d)
+        @JavascriptInterface fun voiceMute(on: Boolean) = VoiceManager.mute(on)
+        @JavascriptInterface fun voiceSpeaker(on: Boolean) = VoiceManager.speaker(on)
 
         @JavascriptInterface
         fun openExternal(url: String) {

@@ -235,6 +235,53 @@ val LocalProfileInfo.displayProvider: String
         rules.write_text(r + extra)
     print("  R8 optimization on (minify + resource shrink)" if rel else "  WARNING: release minify flag not found")
 
+
+    # 12. GlobaleSIM Phone: Linphone SDK (calls over data), mic permission, R8 keep rules
+    #     Newest stable 5.x from Linphone's Maven repo (no-video build: smaller).
+    import json as _json, urllib.request as _ur
+    ver = "5.4.+"
+    try:
+        meta = _ur.urlopen("https://download.linphone.org/maven_repository/org/linphone/no-video/linphone-sdk-android/maven-metadata.xml", timeout=30).read().decode()
+        vers = [v for v in re.findall(r"<version>([^<]+)</version>", meta) if re.fullmatch(r"5\.\d+\.\d+", v)]
+        if vers:
+            ver = sorted(vers, key=lambda v: tuple(int(x) for x in v.split(".")))[-1]
+    except Exception as e:
+        print(f"  WARNING: could not read Linphone versions ({e}); using {ver}")
+    repo_line = 'maven { url = uri("https://download.linphone.org/maven_repository") }'
+    settings = up / "settings.gradle.kts"
+    added_repo = False
+    if settings.exists():
+        st = settings.read_text()
+        if "download.linphone.org" not in st:
+            m = re.search(r"dependencyResolutionManagement\s*\{.*?repositories\s*\{", st, re.S)
+            if m:
+                st = st[:m.end()] + "\n        " + repo_line + st[m.end():]
+                settings.write_text(st); added_repo = True
+        else:
+            added_repo = True
+    g = bg.read_text()
+    if not added_repo and "download.linphone.org" not in g:
+        g = "repositories {\n    " + repo_line + "\n}\n" + g
+    if "linphone-sdk-android" not in g:
+        m = re.search(r"\ndependencies\s*\{", g)
+        if not m:
+            die("no dependencies block in app-unpriv build.gradle.kts")
+        g = g[:m.end()] + f'\n    implementation("org.linphone.no-video:linphone-sdk-android:{ver}")' + g[m.end():]
+    bg.write_text(g)
+    x = mf.read_text()
+    for perm in ("RECORD_AUDIO", "MODIFY_AUDIO_SETTINGS", "BLUETOOTH_CONNECT", "WAKE_LOCK"):
+        if f"android.permission.{perm}" not in x:
+            x = x.replace("<application", f'<uses-permission android:name="android.permission.{perm}" />\n    <application', 1)
+    if 'android:host="phone"' not in x:
+        x = x.replace('<data android:scheme="globalesim" android:host="order" />',
+                      '<data android:scheme="globalesim" android:host="order" />\n                <data android:scheme="globalesim" android:host="phone" />', 1)
+    mf.write_text(x)
+    rules = mod / "proguard-rules.pro"
+    r = rules.read_text() if rules.exists() else ""
+    if "org.linphone" not in r:
+        rules.write_text(r + "\n# Linphone SDK (JNI)\n-keep class org.linphone.** { *; }\n-keep class tel.globalesim.app.VoiceManager { *; }\n")
+    print(f"  Phone: Linphone SDK {ver}, mic permission, repo {'settings' if added_repo else 'module'}")
+
     # 7. Wording: say GlobaleSIM everywhere in the card manager
     for strings in (mod / "src/main/res").glob("values*/strings.xml"):
         s = strings.read_text()
