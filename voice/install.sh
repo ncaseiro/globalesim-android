@@ -368,6 +368,7 @@ $API_DOMAIN {
     respond "GlobaleSIM Voice" 200
 }
 EOF
+chmod 644 /etc/caddy/Caddyfile /etc/systemd/system/gsvoice-api.service   # readable by the caddy user (script runs with umask 077)
 ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null
 systemctl daemon-reload; systemctl enable gsvoice-api caddy >/dev/null 2>&1
 systemctl restart gsvoice-api caddy
