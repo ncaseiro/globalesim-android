@@ -59,6 +59,24 @@ TEST_USER='$TEST_USER'
 EOF
 chmod 600 "$CONF"
 
+# certificate for the app's encrypted connection (Caddy gets it from Let's Encrypt)
+cat > /usr/local/bin/gsvoice-cert <<EOF
+#!/bin/sh
+# copy Caddy's certificate for $API_DOMAIN to Asterisk (TLS for the app); reload when it changed
+SRC=\$(ls -d /var/lib/caddy/.local/share/caddy/certificates/*/$API_DOMAIN 2>/dev/null | head -1)
+[ -n "\$SRC" ] || exit 0
+mkdir -p /etc/asterisk/keys
+if ! cmp -s "\$SRC/$API_DOMAIN.crt" /etc/asterisk/keys/voice.crt; then
+  cp "\$SRC/$API_DOMAIN.crt" /etc/asterisk/keys/voice.crt; cp "\$SRC/$API_DOMAIN.key" /etc/asterisk/keys/voice.key
+  chown asterisk:asterisk /etc/asterisk/keys/voice.*; chmod 600 /etc/asterisk/keys/voice.key
+  asterisk -rx "module reload res_pjsip.so" >/dev/null 2>&1 || true
+fi
+EOF
+chmod 755 /usr/local/bin/gsvoice-cert
+echo '17 4 * * * root /usr/local/bin/gsvoice-cert' > /etc/cron.d/gsvoice-cert
+/usr/local/bin/gsvoice-cert || true
+ufw allow 5061/tcp >/dev/null
+
 say "3/6 Writing Asterisk configuration"
 cd /etc/asterisk
 [ -d /etc/asterisk/original ] || { mkdir original; cp -a pjsip.conf extensions.conf rtp.conf logger.conf original/ 2>/dev/null || true; }
@@ -106,6 +124,25 @@ local_net=10.0.0.0/8
 local_net=172.16.0.0/12
 local_net=192.168.0.0/16
 
+EOF
+if [ -s /etc/asterisk/keys/voice.crt ] && [ -s /etc/asterisk/keys/voice.key ]; then cat <<EOF
+; Encrypted SIP for the GlobaleSIM app (certificate from Caddy / Let's Encrypt)
+[transport-tls]
+type=transport
+protocol=tls
+bind=0.0.0.0:5061
+cert_file=/etc/asterisk/keys/voice.crt
+priv_key_file=/etc/asterisk/keys/voice.key
+method=tlsv1_2
+external_media_address=$PUBIP
+external_signaling_address=$PUBIP
+local_net=10.0.0.0/8
+local_net=172.16.0.0/12
+local_net=192.168.0.0/16
+
+EOF
+fi
+cat <<EOF
 ; ---- Test phone (Zoiper/Linphone) — later each app customer gets one of these ----
 [$TEST_USER]
 type=endpoint
@@ -372,6 +409,7 @@ chmod 644 /etc/caddy/Caddyfile /etc/systemd/system/gsvoice-api.service   # reada
 ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null
 systemctl daemon-reload; systemctl enable gsvoice-api caddy >/dev/null 2>&1
 systemctl restart gsvoice-api caddy
+
 
 say "6/6 Starting Asterisk"
 systemctl enable asterisk >/dev/null 2>&1

@@ -138,6 +138,8 @@ force_rport=yes
 rewrite_contact=yes
 dtmf_mode=rfc4733
 device_state_busy_at=1
+media_encryption=sdes
+media_encryption_optimistic=no
 callerid=<{c['did'] or '0'}>
 
 [{u}-auth]
@@ -246,8 +248,10 @@ def api_route(method, path, q, body):
             return {"numbers": [{"phone_number": n.get("phone_number"), "region": ", ".join(x.get("region_name", "") for x in n.get("region_information", []) if x.get("region_type") in ("rate_center", "state")),
                                  "monthly": (n.get("cost_information") or {}).get("monthly_cost")} for n in r.get("data", [])]}
         if p == ["customers"] and method == "GET":
-            st = q.get("status")
-            rows = con.execute("SELECT * FROM customers" + (" WHERE status=?" if st else "") + " ORDER BY created_at DESC LIMIT 500", (st,) if st else ()).fetchall()
+            where, args = [], []
+            if q.get("status"): where.append("status=?"); args.append(q["status"])
+            if q.get("email"): where.append("email=?"); args.append(q["email"].strip().lower())
+            rows = con.execute("SELECT * FROM customers" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created_at DESC LIMIT 500", args).fetchall()
             return {"customers": [cust_json(con, c) for c in rows]}
         if p == ["customers"] and method == "POST":
             email = (body.get("email") or "").strip().lower(); plan = body.get("plan", "num300")
