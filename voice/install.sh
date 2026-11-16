@@ -153,6 +153,7 @@ allow=ulaw,alaw
 outbound_auth=carrier-auth
 aors=carrier
 $( [ "$PROVIDER" = didlogic ] && echo "from_user=$DL_USER" )
+contact_user=$DL_USER
 from_domain=$DL_SERVER
 send_pai=yes
 direct_media=no
