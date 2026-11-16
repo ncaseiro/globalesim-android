@@ -33,6 +33,15 @@ fi
 read -rp "Your phone number from the carrier, digits only with country code, e.g. 12145550123 [${DID:-}]: " x; DID=${x:-${DID:-}}
 DID=$(echo "$DID" | tr -cd '0-9')
 read -rp "Is 911 (E911 with your address) enabled on that number at the carrier? y/N [${E911:-n}]: " x; E911=${x:-${E911:-n}}
+
+# Customer service (accounts, minutes, number buying) — settings live in /etc/gsvoice/gsvoice.json
+GSJ=/etc/gsvoice/gsvoice.json; mkdir -p /etc/gsvoice
+jget(){ python3 -c "import json,sys;print(json.load(open('$GSJ')).get(sys.argv[1],''))" "$1" 2>/dev/null; }
+API_DOMAIN=$(jget sip_domain); TX_KEY=$(jget telnyx_api_key); TX_CONN=$(jget telnyx_connection_id); API_TOKEN=$(jget api_token)
+read -rp "Domain for the customer API and app [${API_DOMAIN:-voice.globalesim.tel}]: " x; API_DOMAIN=${x:-${API_DOMAIN:-voice.globalesim.tel}}
+read -rsp "Telnyx API key (hidden, Enter = keep current / skip): " x; echo; TX_KEY=${x:-$TX_KEY}
+read -rp "Telnyx SIP connection ID [${TX_CONN:-}]: " x; TX_CONN=${x:-$TX_CONN}
+API_TOKEN=${API_TOKEN:-$(openssl rand -hex 24)}
 NEW_PASS=0; [ -z "$TEST_PASS" ] && NEW_PASS=1
 TEST_PASS=${TEST_PASS:-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20)}
 TEST_USER=${TEST_USER:-gs$(shuf -i 100000-999999 -n 1)}   # not "1001": bots guess short numbers
@@ -174,7 +183,10 @@ endpoint=carrier
 EOF
 for h in $( [ "$PROVIDER" = didlogic ] && echo sip.nyc.didlogic.net sip.lax.didlogic.net ) "$DL_SERVER"; do echo "match=$h"; done | sort -u
 fi
+echo
+echo "#include pjsip_customers.conf"
 } > pjsip.conf
+[ -f pjsip_customers.conf ] || echo "; customers are added by gsvoice" > pjsip_customers.conf
 
 E911_ON=0; case "$E911" in y|Y|yes|YES) E911_ON=1;; esac
 cat > extensions.conf <<EOF
@@ -190,9 +202,45 @@ E911_ON=$E911_ON
 
 ; Calls coming in from the carrier to your number -> ring the test phone
 [from-carrier]
-exten => _.,1,NoOp(Inbound call to \${EXTEN} from \${CALLERID(num)})
- same => n,Dial(PJSIP/$TEST_USER,30)
+exten => _.,1,Set(GS_TO=\${PJSIP_HEADER(read,To)})
+ same => n,AGI(gs-agi.py,in,\${EXTEN},"\${GS_TO}",\${CALLERID(num)})
+ same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok)
+ same => n,Playback(ss-noservice)
+ same => n,Hangup()
+ same => n(ok),Set(CHANNEL(hangup_handler_push)=gs-charge,s,1(\${GS_CALLID}))
+ same => n,Dial(PJSIP/\${GS_USER},30,L(\${GS_MAXMS}))
  same => n,Playback(vm-nobodyavail)
+ same => n,Hangup()
+
+; After every customer call: charge the minutes (rounded up) and run the robocall check
+[gs-charge]
+exten => s,1,AGI(gs-agi.py,charge,\${ARG1},\${ANSWEREDTIME})
+ same => n,Return()
+
+; Calls made by paying customers from the GlobaleSIM app
+; Checked by gsvoice before every call: active account, minutes left, max 5 calls / 10 min,
+; 100 / day, one call at a time; the call is cut off when the minutes run out.
+[from-customer]
+exten => 911,1,GotoIf(\$[\${E911_ON} = 1]?go)
+ same => n,Playback(ss-noservice)
+ same => n,Hangup()
+ same => n(go),Dial(PJSIP/911@carrier,120)
+ same => n,Hangup()
+exten => _NXXNXXXXXX,1,Goto(from-customer,1\${EXTEN},1)
+exten => _+1NXXNXXXXXX,1,Goto(from-customer,\${EXTEN:1},1)
+exten => _1NXXNXXXXXX,1,GotoIf(\$[\${REGEX("^(900|976)" \${EXTEN:1:3})}]?blocked)
+ same => n,Set(GS_EP=\${CHANNEL(endpoint)})
+ same => n,AGI(gs-agi.py,out,\${GS_EP},\${EXTEN})
+ same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok:blocked)
+ same => n(ok),Set(GROUP(gsuser)=\${GS_EP})
+ same => n,GotoIf(\$[\${GROUP_COUNT(\${GS_EP}@gsuser)} > 1]?blocked)
+ same => n,Set(CALLERID(all)=<\${GS_CID}>)
+ same => n,Set(CHANNEL(hangup_handler_push)=gs-charge,s,1(\${GS_CALLID}))
+ same => n,Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60,L(\${GS_MAXMS}))
+ same => n,Hangup()
+ same => n(blocked),Playback(ss-noservice)
+ same => n,Hangup()
+exten => _X.,1,Playback(ss-noservice)
  same => n,Hangup()
 
 ; Calls made from the app/test phone
@@ -274,6 +322,57 @@ ignoreip = $IGNORE_IPS
 EOF
 systemctl enable --now fail2ban >/dev/null 2>&1; systemctl restart fail2ban
 
+say "5b Customer service: accounts, minutes, safety limits, HTTPS API ($API_DOMAIN)"
+GS_REF=${GS_REF:-voice}
+mkdir -p /opt/gsvoice /var/lib/gsvoice /var/lib/asterisk/agi-bin
+curl -fsSL "https://raw.githubusercontent.com/ncaseiro/globalesim-android/$GS_REF/voice/gsvoice.py" -o /opt/gsvoice/gsvoice.py.new && python3 -m py_compile /opt/gsvoice/gsvoice.py.new && mv /opt/gsvoice/gsvoice.py.new /opt/gsvoice/gsvoice.py
+cat > /var/lib/asterisk/agi-bin/gs-agi.py <<'EOF'
+#!/usr/bin/env python3
+import sys; sys.path.insert(0, "/opt/gsvoice"); import gsvoice; gsvoice.agi_main(sys.argv[1:])
+EOF
+chmod 755 /var/lib/asterisk/agi-bin/gs-agi.py
+python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" <<'EOF'
+import json, sys
+p, dom, key, conn, tok, did, test = sys.argv[1:8]
+try: c = json.load(open(p))
+except Exception: c = {}
+c.update({"sip_domain": dom, "telnyx_api_key": key, "telnyx_connection_id": conn, "api_token": tok, "company_did": did, "test_user": test})
+json.dump(c, open(p, "w"), indent=2)
+EOF
+chown -R asterisk:asterisk /opt/gsvoice /var/lib/gsvoice /etc/gsvoice; chmod 640 "$GSJ"; chmod 750 /etc/gsvoice
+cat > /etc/systemd/system/gsvoice-api.service <<EOF
+[Unit]
+Description=GlobaleSIM Voice customer API
+After=network.target asterisk.service
+[Service]
+User=asterisk
+Group=asterisk
+ExecStart=/usr/bin/python3 /opt/gsvoice/gsvoice.py api
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+# HTTPS in front of the API (automatic Let's Encrypt certificate once DNS points here)
+if ! command -v caddy >/dev/null; then
+  apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https gnupg >/dev/null 2>&1
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list
+  apt-get update -qq && apt-get install -y -qq caddy >/dev/null
+fi
+mkdir -p /etc/caddy
+cat > /etc/caddy/Caddyfile <<EOF
+$API_DOMAIN {
+    handle /api/* {
+        reverse_proxy 127.0.0.1:8090
+    }
+    respond "GlobaleSIM Voice" 200
+}
+EOF
+ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null
+systemctl daemon-reload; systemctl enable gsvoice-api caddy >/dev/null 2>&1
+systemctl restart gsvoice-api caddy
+
 say "6/6 Starting Asterisk"
 systemctl enable asterisk >/dev/null 2>&1
 systemctl restart asterisk
@@ -294,6 +393,8 @@ Carrier            : $( [ -n "$DL_USER" ] && echo "$PROVIDER ($DL_USER @ $DL_SER
 911                : $( [ "$E911_ON" = 1 ] && echo "ON" || echo "OFF (plays 'no service' — turn on E911 at your carrier, then rerun)")
 
 Keep this password private. Settings are saved in $CONF (root only).
+Customer API       : https://$API_DOMAIN/api/health  (key: see /etc/gsvoice/gsvoice.json — never share it)
+Telnyx number API  : $( [ -n "$TX_KEY" ] && echo "configured" || echo "not set (number buying from the store disabled)" )
 Check status any time:  asterisk -rx "pjsip show registrations"
 =======================================
 EOF
