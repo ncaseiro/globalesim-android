@@ -36,7 +36,7 @@ read -rp "Is 911 (E911 with your address) enabled on that number at the carrier?
 
 # Customer service (accounts, minutes, number buying) — settings live in /etc/gsvoice/gsvoice.json
 GSJ=/etc/gsvoice/gsvoice.json; mkdir -p /etc/gsvoice
-jget(){ python3 -c "import json,sys;print(json.load(open('$GSJ')).get(sys.argv[1],''))" "$1" 2>/dev/null; }
+jget(){ python3 -c "import json,sys;print(json.load(open('$GSJ')).get(sys.argv[1],''))" "$1" 2>/dev/null || true; }
 API_DOMAIN=$(jget sip_domain); TX_KEY=$(jget telnyx_api_key); TX_CONN=$(jget telnyx_connection_id); API_TOKEN=$(jget api_token)
 read -rp "Domain for the customer API and app [${API_DOMAIN:-voice.globalesim.tel}]: " x; API_DOMAIN=${x:-${API_DOMAIN:-voice.globalesim.tel}}
 read -rsp "Telnyx API key (hidden, Enter = keep current / skip): " x; echo; TX_KEY=${x:-$TX_KEY}
