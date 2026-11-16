@@ -6,6 +6,7 @@ set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "Run as root"; exit 1; }
 say(){ printf '\n\033[1;33m== %s ==\033[0m\n' "$*"; }
 CONF=/etc/globalesim-voice.conf
+DL_SERVER=""; DL_USER=""; DL_PASS=""; DID=""; E911=""; TEST_PASS=""
 [ -f "$CONF" ] && . "$CONF"
 
 say "1/6 Installing Asterisk, firewall and fail2ban (takes 2-4 minutes)"
