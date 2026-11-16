@@ -100,7 +100,6 @@ local_net=192.168.0.0/16
 ; ---- Test phone (Zoiper/Linphone) — later each app customer gets one of these ----
 [$TEST_USER]
 type=endpoint
-transport=transport-udp
 context=from-app
 disallow=all
 allow=ulaw,alaw,g722,gsm
