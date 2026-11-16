@@ -6,13 +6,13 @@ set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "Run as root"; exit 1; }
 say(){ printf '\n\033[1;33m== %s ==\033[0m\n' "$*"; }
 CONF=/etc/globalesim-voice.conf
-PROVIDER=""; DL_SERVER=""; DL_USER=""; DL_PASS=""; DID=""; E911=""; TEST_PASS=""
+PROVIDER=""; DL_SERVER=""; DL_USER=""; DL_PASS=""; DID=""; E911=""; TEST_PASS=""; TEST_USER=""
 [ -f "$CONF" ] && . "$CONF"
 
 say "1/6 Installing Asterisk, firewall and fail2ban (takes 2-4 minutes)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq asterisk asterisk-core-sounds-en-gsm fail2ban ufw curl openssl >/dev/null
+apt-get install -y -qq asterisk asterisk-core-sounds-en-gsm fail2ban ufw curl openssl logrotate cron >/dev/null
 PUBIP=${PUBIP:-$(curl -fsS4 ifconfig.me || curl -fsS4 api.ipify.org || true)}
 [ -n "$PUBIP" ] || { echo "Could not detect the public IP. Run: PUBIP=x.x.x.x bash install.sh"; exit 1; }
 echo "Public IP: $PUBIP"
@@ -34,6 +34,7 @@ read -rp "Your phone number from the carrier, digits only with country code, e.g
 DID=$(echo "$DID" | tr -cd '0-9')
 read -rp "Is 911 (E911 with your address) enabled on that number at the carrier? y/N [${E911:-n}]: " x; E911=${x:-${E911:-n}}
 TEST_PASS=${TEST_PASS:-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20)}
+TEST_USER=${TEST_USER:-gs$(shuf -i 100000-999999 -n 1)}   # not "1001": bots guess short numbers
 
 umask 077
 cat > "$CONF" <<EOF
@@ -44,6 +45,7 @@ DL_PASS='$DL_PASS'
 DID='$DID'
 E911='$E911'
 TEST_PASS='$TEST_PASS'
+TEST_USER='$TEST_USER'
 EOF
 chmod 600 "$CONF"
 
@@ -62,8 +64,8 @@ cat > logger.conf <<EOF
 dateformat=%F %T
 [logfiles]
 console => notice,warning,error
-messages => notice,warning,error
-security => security
+messages => warning,error
+fail2ban => notice
 EOF
 
 {
@@ -95,14 +97,14 @@ local_net=172.16.0.0/12
 local_net=192.168.0.0/16
 
 ; ---- Test phone (Zoiper/Linphone) — later each app customer gets one of these ----
-[1001]
+[$TEST_USER]
 type=endpoint
 transport=transport-udp
 context=from-app
 disallow=all
 allow=ulaw,alaw,g722,gsm
-auth=1001-auth
-aors=1001
+auth=$TEST_USER-auth
+aors=$TEST_USER
 direct_media=no
 rtp_symmetric=yes
 force_rport=yes
@@ -110,13 +112,13 @@ rewrite_contact=yes
 dtmf_mode=rfc4733
 callerid=GlobaleSIM <${DID:-0}>
 
-[1001-auth]
+[$TEST_USER-auth]
 type=auth
 auth_type=userpass
-username=1001
+username=$TEST_USER
 password=$TEST_PASS
 
-[1001]
+[$TEST_USER]
 type=aor
 max_contacts=3
 remove_existing=yes
@@ -189,7 +191,7 @@ E911_ON=$E911_ON
 ; Calls coming in from the carrier to your number -> ring the test phone
 [from-carrier]
 exten => _.,1,NoOp(Inbound call to \${EXTEN} from \${CALLERID(num)})
- same => n,Dial(PJSIP/1001,30)
+ same => n,Dial(PJSIP/$TEST_USER,30)
  same => n,Playback(vm-nobodyavail)
  same => n,Hangup()
 
@@ -227,20 +229,45 @@ ufw allow 5060/udp >/dev/null
 ufw allow 5060/tcp >/dev/null
 ufw allow 10000:20000/udp >/dev/null
 ufw --force enable >/dev/null
+ufw reload >/dev/null 2>&1 || true
 ufw status | head -12
 
 say "5/6 fail2ban: block anyone guessing passwords"
-mkdir -p /var/log/asterisk; touch /var/log/asterisk/messages /var/log/asterisk/security; chown asterisk:asterisk /var/log/asterisk/*
+mkdir -p /var/log/asterisk; touch /var/log/asterisk/messages /var/log/asterisk/fail2ban; chown asterisk:asterisk /var/log/asterisk/*
+rm -f /var/log/asterisk/security
+# 4) logs can never fill the disk again: rotate at 50 MB, checked every 10 minutes
+cat > /etc/logrotate.d/globalesim-asterisk <<EOF
+/var/log/asterisk/messages /var/log/asterisk/fail2ban /var/log/asterisk/full {
+    size 50M
+    rotate 3
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+echo '*/10 * * * * root /usr/sbin/logrotate /etc/logrotate.d/globalesim-asterisk >/dev/null 2>&1' > /etc/cron.d/globalesim-logrotate
+# 5) drop well-known SIP scanner tools before they even reach Asterisk (kept in ufw's own rules)
+if [ -f /etc/ufw/before.rules ] && ! grep -q "globalesim-scanners" /etc/ufw/before.rules; then
+  RULES="# globalesim-scanners: drop SIP scanner tools"
+  for ua in friendly-scanner sipvicious sipcli sip-scan VaxSIPUserAgent pplsip sundayddr SIPScan; do
+    for proto in udp tcp; do RULES="$RULES
+-A ufw-before-input -p $proto --dport 5060 -m string --string \"$ua\" --algo bm -j DROP"; done
+  done
+  awk -v r="$RULES" '/^# End required lines/ && !d {print; print r; d=1; next} {print}' /etc/ufw/before.rules > /tmp/before.rules && cat /tmp/before.rules > /etc/ufw/before.rules
+fi
+ufw reload >/dev/null 2>&1 || true
 cat > /etc/fail2ban/jail.d/asterisk.local <<EOF
 [asterisk]
 enabled  = true
+backend  = polling
 filter   = asterisk
-logpath  = /var/log/asterisk/messages
-           /var/log/asterisk/security
+logpath  = /var/log/asterisk/fail2ban
 banaction = iptables-allports
-maxretry = 5
-findtime = 600
-bantime  = 86400
+maxretry = 3
+findtime = 3600
+bantime  = 604800
+ignoreip = 127.0.0.1/8
 EOF
 systemctl enable --now fail2ban >/dev/null 2>&1; systemctl restart fail2ban
 
@@ -256,7 +283,7 @@ cat <<EOF
 ================  DONE  ================
 Test phone login (for Zoiper or Linphone on your phone):
    Server / domain : $PUBIP
-   Username        : 1001
+   Username        : $TEST_USER
    Password        : $TEST_PASS
    Transport       : UDP, port 5060
 Your number        : ${DID:-not set yet}
