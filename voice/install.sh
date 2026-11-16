@@ -359,7 +359,7 @@ if ! command -v caddy >/dev/null; then
   rm -f /etc/apt/sources.list.d/caddy-stable.list   # Ubuntu 24.04 ships caddy itself; no third-party repo needed
   apt-get install -y -qq caddy >/dev/null
 fi
-mkdir -p /etc/caddy
+mkdir -p /etc/caddy && chmod 755 /etc/caddy
 cat > /etc/caddy/Caddyfile <<EOF
 $API_DOMAIN {
     handle /api/* {
