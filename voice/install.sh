@@ -324,13 +324,14 @@ systemctl enable --now fail2ban >/dev/null 2>&1; systemctl restart fail2ban
 
 say "5b Customer service: accounts, minutes, safety limits, HTTPS API ($API_DOMAIN)"
 GS_REF=${GS_REF:-voice}
-mkdir -p /opt/gsvoice /var/lib/gsvoice /var/lib/asterisk/agi-bin
+AGIDIR=$(grep -oP '^\s*astagidir\s*=>\s*\K\S+' /etc/asterisk/asterisk.conf 2>/dev/null || true); AGIDIR=${AGIDIR:-/usr/share/asterisk/agi-bin}
+mkdir -p /opt/gsvoice /var/lib/gsvoice "$AGIDIR"
 curl -fsSL "https://raw.githubusercontent.com/ncaseiro/globalesim-android/$GS_REF/voice/gsvoice.py" -o /opt/gsvoice/gsvoice.py.new && python3 -m py_compile /opt/gsvoice/gsvoice.py.new && mv /opt/gsvoice/gsvoice.py.new /opt/gsvoice/gsvoice.py
-cat > /var/lib/asterisk/agi-bin/gs-agi.py <<'EOF'
+cat > "$AGIDIR/gs-agi.py" <<'EOF'
 #!/usr/bin/env python3
 import sys; sys.path.insert(0, "/opt/gsvoice"); import gsvoice; gsvoice.agi_main(sys.argv[1:])
 EOF
-chmod 755 /var/lib/asterisk/agi-bin/gs-agi.py
+chmod 755 "$AGIDIR/gs-agi.py"
 python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" <<'EOF'
 import json, sys
 p, dom, key, conn, tok, did, test = sys.argv[1:8]
