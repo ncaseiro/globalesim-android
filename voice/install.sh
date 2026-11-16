@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# GlobaleSIM Voice — call server installer (Asterisk + DIDLogic) for Ubuntu 24.04
+# GlobaleSIM Voice — call server installer (Asterisk + Telnyx or DIDLogic) for Ubuntu 24.04
 # Safe to run again: it rewrites the config with the answers you give.
 # Usage:  bash install.sh
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "Run as root"; exit 1; }
 say(){ printf '\n\033[1;33m== %s ==\033[0m\n' "$*"; }
 CONF=/etc/globalesim-voice.conf
-DL_SERVER=""; DL_USER=""; DL_PASS=""; DID=""; E911=""; TEST_PASS=""
+PROVIDER=""; DL_SERVER=""; DL_USER=""; DL_PASS=""; DID=""; E911=""; TEST_PASS=""
 [ -f "$CONF" ] && . "$CONF"
 
 say "1/6 Installing Asterisk, firewall and fail2ban (takes 2-4 minutes)"
@@ -17,21 +17,27 @@ PUBIP=${PUBIP:-$(curl -fsS4 ifconfig.me || curl -fsS4 api.ipify.org || true)}
 [ -n "$PUBIP" ] || { echo "Could not detect the public IP. Run: PUBIP=x.x.x.x bash install.sh"; exit 1; }
 echo "Public IP: $PUBIP"
 
-say "2/6 DIDLogic details (from your DIDLogic portal → SIP accounts)"
-echo "Press Enter to keep the value in [brackets]. Leave the username empty to set DIDLogic up later."
-read -rp "DIDLogic SIP server [${DL_SERVER:-sip.nyc.didlogic.net}]: " x; DL_SERVER=${x:-${DL_SERVER:-sip.nyc.didlogic.net}}
-read -rp "DIDLogic SIP username [${DL_USER:-}]: " x; DL_USER=${x:-${DL_USER:-}}
+say "2/6 Phone carrier details (Telnyx: SIP Connection → Authentication; DIDLogic: SIP Trunks)"
+echo "Press Enter to keep the value in [brackets]. Leave the username empty to set the carrier up later."
+read -rp "Carrier — telnyx or didlogic [${PROVIDER:-telnyx}]: " x; x=${x:-${PROVIDER:-telnyx}}; x=$(echo "$x" | tr 'A-Z' 'a-z')
+case "$x" in telnyx|didlogic) ;; *) echo "Type telnyx or didlogic"; exit 1;; esac
+if [ "$x" != "${PROVIDER:-}" ]; then DL_SERVER=""; DL_USER=""; DL_PASS=""; fi   # switching carrier: ask fresh
+PROVIDER=$x
+DEF_SERVER=$([ "$PROVIDER" = telnyx ] && echo sip.telnyx.com || echo sip.nyc.didlogic.net)
+read -rp "SIP server [${DL_SERVER:-$DEF_SERVER}]: " x; DL_SERVER=${x:-${DL_SERVER:-$DEF_SERVER}}
+read -rp "SIP username [${DL_USER:-}]: " x; DL_USER=${x:-${DL_USER:-}}
 if [ -n "$DL_USER" ]; then
-  read -rsp "DIDLogic SIP password (hidden, Enter = keep current): " x; echo; DL_PASS=${x:-${DL_PASS:-}}
+  read -rsp "SIP password (hidden, Enter = keep current): " x; echo; DL_PASS=${x:-${DL_PASS:-}}
   [ -n "$DL_PASS" ] || { echo "A password is required"; exit 1; }
 fi
-read -rp "Your DIDLogic phone number, digits only with country code, e.g. 12145550123 [${DID:-}]: " x; DID=${x:-${DID:-}}
+read -rp "Your phone number from the carrier, digits only with country code, e.g. 12145550123 [${DID:-}]: " x; DID=${x:-${DID:-}}
 DID=$(echo "$DID" | tr -cd '0-9')
-read -rp "Is 911 (E911 with your address) enabled on that number at DIDLogic? y/N [${E911:-n}]: " x; E911=${x:-${E911:-n}}
+read -rp "Is 911 (E911 with your address) enabled on that number at the carrier? y/N [${E911:-n}]: " x; E911=${x:-${E911:-n}}
 TEST_PASS=${TEST_PASS:-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20)}
 
 umask 077
 cat > "$CONF" <<EOF
+PROVIDER='$PROVIDER'
 DL_SERVER='$DL_SERVER'
 DL_USER='$DL_USER'
 DL_PASS='$DL_PASS'
@@ -118,17 +124,17 @@ qualify_frequency=30
 EOF
 if [ -n "$DL_USER" ]; then cat <<EOF
 
-; ---- DIDLogic trunk ----
-[didlogic-auth]
+; ---- Phone carrier trunk ($PROVIDER) ----
+[carrier-auth]
 type=auth
 auth_type=userpass
 username=$DL_USER
 password=$DL_PASS
 
-[didlogic-reg]
+[carrier-reg]
 type=registration
 transport=transport-udp
-outbound_auth=didlogic-auth
+outbound_auth=carrier-auth
 server_uri=sip:$DL_SERVER
 client_uri=sip:$DL_USER@$DL_SERVER
 contact_user=$DL_USER
@@ -136,33 +142,34 @@ retry_interval=60
 forbidden_retry_interval=600
 expiration=300
 line=yes
-endpoint=didlogic
+endpoint=carrier
 
-[didlogic]
+[carrier]
 type=endpoint
 transport=transport-udp
-context=from-didlogic
+context=from-carrier
 disallow=all
 allow=ulaw,alaw
-outbound_auth=didlogic-auth
-aors=didlogic
-from_user=$DL_USER
+outbound_auth=carrier-auth
+aors=carrier
+$( [ "$PROVIDER" = didlogic ] && echo "from_user=$DL_USER" )
 from_domain=$DL_SERVER
+send_pai=yes
 direct_media=no
 rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
 dtmf_mode=rfc4733
 
-[didlogic]
+[carrier]
 type=aor
 contact=sip:$DL_SERVER
 
-[didlogic-identify]
+[carrier-identify]
 type=identify
-endpoint=didlogic
+endpoint=carrier
 EOF
-for h in sip.nyc.didlogic.net sip.lax.didlogic.net "$DL_SERVER"; do echo "match=$h"; done | sort -u
+for h in $( [ "$PROVIDER" = didlogic ] && echo sip.nyc.didlogic.net sip.lax.didlogic.net ) "$DL_SERVER"; do echo "match=$h"; done | sort -u
 fi
 } > pjsip.conf
 
@@ -175,10 +182,11 @@ writeprotect=yes
 
 [globals]
 DID=$DID
+DIALPFX=$( [ "$PROVIDER" = telnyx ] && echo "+" )
 E911_ON=$E911_ON
 
-; Calls coming in from DIDLogic to your number -> ring the test phone
-[from-didlogic]
+; Calls coming in from the carrier to your number -> ring the test phone
+[from-carrier]
 exten => _.,1,NoOp(Inbound call to \${EXTEN} from \${CALLERID(num)})
  same => n,Dial(PJSIP/1001,30)
  same => n,Playback(vm-nobodyavail)
@@ -192,14 +200,14 @@ exten => 911,1,GotoIf(\$[\${E911_ON} = 1]?go)
  same => n,Playback(ss-noservice)
  same => n,Hangup()
  same => n(go),Set(CALLERID(num)=\${DID})
- same => n,Dial(PJSIP/911@didlogic,120)
+ same => n,Dial(PJSIP/911@carrier,120)
  same => n,Hangup()
 exten => _NXXNXXXXXX,1,Goto(from-app,1\${EXTEN},1)
 exten => _+1NXXNXXXXXX,1,Goto(from-app,\${EXTEN:1},1)
 exten => _1NXXNXXXXXX,1,GotoIf(\$[\${REGEX("^(900|976)" \${EXTEN:1:3})}]?blocked)
  same => n,Set(CALLERID(num)=\${DID})
  same => n,Set(TIMEOUT(absolute)=7200)
- same => n,Dial(PJSIP/\${EXTEN}@didlogic,60)
+ same => n,Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60)
  same => n,Hangup()
  same => n(blocked),Playback(ss-noservice)
  same => n,Hangup()
@@ -240,7 +248,7 @@ systemctl enable asterisk >/dev/null 2>&1
 systemctl restart asterisk
 sleep 6
 asterisk -rx "logger reload" >/dev/null || true
-if [ -n "$DL_USER" ]; then asterisk -rx "pjsip show registrations" | grep -E "didlogic|Registered|Rejected|Unregistered" || true; fi
+if [ -n "$DL_USER" ]; then asterisk -rx "pjsip show registrations" | grep -E "carrier-reg" || true; fi
 
 cat <<EOF
 
@@ -251,7 +259,7 @@ Test phone login (for Zoiper or Linphone on your phone):
    Password        : $TEST_PASS
    Transport       : UDP, port 5060
 Your number        : ${DID:-not set yet}
-DIDLogic           : $( [ -n "$DL_USER" ] && echo "configured ($DL_USER @ $DL_SERVER) — 'Registered' above means it's connected" || echo "NOT set yet — run 'bash install.sh' again after creating the SIP account")
+Carrier            : $( [ -n "$DL_USER" ] && echo "$PROVIDER ($DL_USER @ $DL_SERVER) — 'Registered' above means it's connected" || echo "NOT set yet — run 'bash install.sh' again after creating the SIP account")
 911                : $( [ "$E911_ON" = 1 ] && echo "ON" || echo "OFF (plays 'no service' — turn on E911 at DIDLogic, then rerun)")
 
 Keep this password private. Settings are saved in $CONF (root only).
