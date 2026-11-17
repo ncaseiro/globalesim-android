@@ -12,12 +12,16 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaPlayer
 import android.media.Ringtone
 import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 
@@ -112,33 +116,72 @@ class CallActionReceiver : BroadcastReceiver() {
     }
 }
 
-/** Ringtone + vibration for incoming calls, following the ring / vibrate / silent switch. */
+/**
+ * Ringtone + vibration for incoming calls, following the ring / vibrate / silent switch.
+ * The calling engine puts the phone in "call" audio mode as soon as a call arrives, which sends
+ * sound to the small earpiece (a faint ring). We switch to ringtone mode (loudspeaker, ring volume)
+ * and keep re-asserting it while ringing.
+ */
 object Ringer {
+    private var player: MediaPlayer? = null
     private var tone: Ringtone? = null
     private var vib: Vibrator? = null
+    private var focus: AudioFocusRequest? = null
+    private var ringing = false
+    private val main = Handler(Looper.getMainLooper())
+    private lateinit var am: AudioManager
+
+    private val attrs: AudioAttributes = AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+        .build()
+
+    private val keepRingMode = object : Runnable {
+        override fun run() {
+            if (!ringing) return
+            runCatching { if (am.mode != AudioManager.MODE_RINGTONE) am.mode = AudioManager.MODE_RINGTONE }
+            main.postDelayed(this, 700)
+        }
+    }
 
     @Suppress("DEPRECATION")
     fun start(ctx: Context) {
         stop()
         val app = ctx.applicationContext
-        val mode = app.getSystemService(AudioManager::class.java)?.ringerMode ?: AudioManager.RINGER_MODE_NORMAL
-        val attrs = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-            .build()
-        if (mode == AudioManager.RINGER_MODE_NORMAL) runCatching {
+        am = app.getSystemService(AudioManager::class.java) ?: return
+        ringing = true
+        val mode = am.ringerMode
+        if (mode == AudioManager.RINGER_MODE_NORMAL) {
+            runCatching { am.mode = AudioManager.MODE_RINGTONE }
+            if (Build.VERSION.SDK_INT >= 26) runCatching {
+                focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT).setAudioAttributes(attrs).build()
+                am.requestAudioFocus(focus!!)
+            }
             val uri: Uri = RingtoneManager.getActualDefaultRingtoneUri(app, RingtoneManager.TYPE_RINGTONE)
                 ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-            tone = RingtoneManager.getRingtone(app, uri)?.also { t ->
-                t.audioAttributes = attrs
-                if (Build.VERSION.SDK_INT >= 28) t.isLooping = true
-                t.play()
+            val ok = runCatching {
+                player = MediaPlayer().apply {
+                    setAudioAttributes(attrs)
+                    setDataSource(app, uri)
+                    isLooping = true
+                    prepare()
+                    start()
+                }
+            }.isSuccess
+            if (!ok) runCatching {
+                player = null
+                tone = RingtoneManager.getRingtone(app, uri)?.also { t ->
+                    t.audioAttributes = attrs
+                    if (Build.VERSION.SDK_INT >= 28) t.isLooping = true
+                    t.play()
+                }
             }
+            main.postDelayed(keepRingMode, 300)
         }
         if (mode != AudioManager.RINGER_MODE_SILENT) runCatching {
             val v = app.getSystemService(Vibrator::class.java)
             if (v != null && v.hasVibrator()) {
-                val pattern = longArrayOf(0, 900, 700)          // buzz… pause… repeat
+                val pattern = longArrayOf(0, 1000, 800)          // buzz… pause… repeat
                 if (Build.VERSION.SDK_INT >= 26) v.vibrate(VibrationEffect.createWaveform(pattern, 0), attrs)
                 else v.vibrate(pattern, 0)
                 vib = v
@@ -147,8 +190,16 @@ object Ringer {
     }
 
     fun stop() {
+        val was = ringing
+        ringing = false
+        main.removeCallbacks(keepRingMode)
+        runCatching { player?.stop() }; runCatching { player?.release() }; player = null
         runCatching { tone?.stop() }; tone = null
         runCatching { vib?.cancel() }; vib = null
+        if (Build.VERSION.SDK_INT >= 26) runCatching { focus?.let { am.abandonAudioFocusRequest(it) } }
+        focus = null
+        // hand the audio back: the call engine sets "call" mode itself if the call is answered
+        if (was) runCatching { if (am.mode == AudioManager.MODE_RINGTONE) am.mode = AudioManager.MODE_NORMAL }
     }
 }
 
@@ -226,6 +277,7 @@ object CallNotif {
             .setAutoCancel(false)
             .setContentIntent(full)
             .setFullScreenIntent(full, true)
+            .setColor(0xFFFFB547.toInt())
             .also { if (Build.VERSION.SDK_INT < 26) @Suppress("DEPRECATION") it.setPriority(Notification.PRIORITY_MAX) }
         val styled = if (Build.VERSION.SDK_INT >= 31) runCatching {
             val person = Person.Builder().setName(who).setImportant(true).build()

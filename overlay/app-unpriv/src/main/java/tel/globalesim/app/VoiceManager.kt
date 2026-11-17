@@ -188,7 +188,11 @@ object VoiceManager {
                     // ring + vibrate like a normal phone, and show the call over the lock screen
                     Ringer.start(app)
                     CallNotif.incoming(app, peer)
-                    if (uiVisible) runCatching { app.startActivity(CallNotif.phoneIntent(app)) }
+                    // pop the call screen up over whatever is open (needs "Display over other apps",
+                    // or the app already on screen); otherwise the notification / lock-screen call shows
+                    if (uiVisible || android.provider.Settings.canDrawOverlays(app)) runCatching {
+                        app.startActivity(CallNotif.phoneIntent(app).putExtra(CallNotif.EXTRA_INCOMING, true))
+                    }
                 }
                 Call.State.Connected, Call.State.StreamsRunning -> {
                     Ringer.stop(); CallNotif.cancelIncoming(app)

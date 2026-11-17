@@ -120,6 +120,7 @@ class StoreActivity : Activity() {
 
     // ---- what the phone must allow so calls ring when the app is closed ----
     private fun notifOk() = Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+    private fun overlayOk() = Settings.canDrawOverlays(this)
     private fun batteryOk() = getSystemService(PowerManager::class.java)?.isIgnoringBatteryOptimizations(packageName) ?: true
     private fun fullScreenOk() = Build.VERSION.SDK_INT < 34 || (getSystemService(NotificationManager::class.java)?.canUseFullScreenIntent() ?: true)
 
@@ -305,7 +306,7 @@ class StoreActivity : Activity() {
         /** What's still missing for calls to ring with the app closed: {"notif":bool,"battery":bool,"fullscreen":bool} */
         @JavascriptInterface
         fun voiceBackground(): String = JSONObject()
-            .put("notif", notifOk()).put("battery", batteryOk()).put("fullscreen", fullScreenOk()).toString()
+            .put("notif", notifOk()).put("overlay", overlayOk()).put("battery", batteryOk()).put("fullscreen", fullScreenOk()).toString()
 
         /** Ask for the next missing one (notifications → battery → full-screen calls). */
         @SuppressLint("BatteryLife")
@@ -315,6 +316,8 @@ class StoreActivity : Activity() {
                 try {
                     when {
                         !notifOk() -> requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTIF_REQUEST)
+                        !overlayOk() -> startActivity(
+                            Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
                         !batteryOk() -> startActivity(
                             Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
                         !fullScreenOk() && Build.VERSION.SDK_INT >= 34 -> startActivity(
