@@ -271,8 +271,16 @@ def agi_main(args):
             if ok: a.set("GS_CID", "+" + cust["did"])
             event(con, args[1], "e911_call", "routed" if ok else "no 911 address")
         elif mode == "in":                # in <exten> <to-header> <caller>
-            did = digits(args[2]) or digits(args[1]); caller = digits(args[3]) if len(args) > 3 else ""
+            # the dialed number = user part of the To URI (never the host/port digits), else the extension
+            def num(x):
+                m = re.search(r"sip:\+?(\d{7,15})@", x or ""); d = m.group(1) if m else (digits(x) if len(digits(x or "")) <= 15 else "")
+                return ("1" + d) if len(d) == 10 else d
+            to_raw = args[2] if len(args) > 2 else ""; caller = digits(args[3]) if len(args) > 3 else ""
+            did = num(to_raw) or num(args[1]) or num("sip:" + args[1] + "@")
             cust = con.execute("SELECT * FROM customers WHERE did=? AND status='active'", (did,)).fetchone()
+            if not cust and did:
+                other = con.execute("SELECT * FROM customers WHERE did=?", (did,)).fetchone()
+                if other: event(con, other["sip_user"], "blocked_in", f"line {other['status']} " + caller)
             if cust:
                 u = usage(con, cust)
                 if u["remaining"] <= 0:
@@ -284,6 +292,8 @@ def agi_main(args):
                 a.set("GS_OK", "1"); a.set("GS_USER", C["test_user"]); a.set("GS_CALLID", "0"); a.set("GS_MAXMS", str(4 * 3600 * 1000))
             else:
                 a.set("GS_OK", "0"); a.set("GS_REASON", "unknown_number")
+                if not con.execute("SELECT 1 FROM customers WHERE did=?", (did,)).fetchone():
+                    event(con, "", "unknown_in", f"to={to_raw[:120]} exten={args[1]} caller={caller}")
         elif mode == "charge":            # charge <callid> <answered-seconds>
             cid = int(args[1] or 0); secs = int(float(args[2] or 0)) if len(args) > 2 and args[2] else 0
             if cid:
@@ -377,7 +387,7 @@ def api_route(method, path, q, body):
             c = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
             return dict(cust_json(con, c), picked=(num == want))
         if p == ["alerts"]:
-            return {"events": [dict(r) for r in con.execute("SELECT * FROM events WHERE kind IN ('auto_suspend','blocked_out','blocked_in','e911_failed','release_failed','released') ORDER BY id DESC LIMIT 200")]}
+            return {"events": [dict(r) for r in con.execute("SELECT * FROM events WHERE kind IN ('auto_suspend','blocked_out','blocked_in','unknown_in','e911_failed','release_failed','released') ORDER BY id DESC LIMIT 200")]}
         if len(p) >= 2 and p[0] == "customers":
             c = con.execute("SELECT * FROM customers WHERE sip_user=?", (p[1],)).fetchone()
             if not c: raise ApiError(404, "no such customer")
