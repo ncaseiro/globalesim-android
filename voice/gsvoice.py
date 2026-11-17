@@ -406,7 +406,6 @@ def buy_for(con, user, want, area, e911):
 def save_greeting(con, co, kind, text, lang):
     ok = tts(text, greet_file(co["id"], kind), lang)
     if not ok: raise ApiError(500, "could not create the greeting audio")
-    if kind == "main": con.execute("UPDATE companies SET greeting=? WHERE id=?", (text[:1500], co["id"]))
 
 # ---------------------------------------------------------------- texts (receive only)
 import base64, socket
@@ -798,8 +797,9 @@ def api_route(method, path, q, body):
                     if re.fullmatch(r"[0-9]", str(k)) and isinstance(v, dict) and v.get("type") in ("ext", "group", "vm", "repeat"):
                         ivr["options"][str(k)] = {"label": str(v.get("label", ""))[:40], "type": v["type"], "target": v.get("target")}
                 con.execute("UPDATE companies SET ivr_json=? WHERE id=?", (json.dumps(ivr), cid))
-                text = (body.get("greeting_text") or "").strip() or default_greeting(co, ivr)
-                if ivr["enabled"]: save_greeting(con, co, "main", text, body.get("lang", "en"))
+                custom = (body.get("greeting_text") or "").strip()
+                if ivr["enabled"]: save_greeting(con, co, "main", custom or default_greeting(co, ivr), body.get("lang", "en"))
+                con.execute("UPDATE companies SET greeting=? WHERE id=?", (custom[:1500], cid))   # empty = built from the menu each time
                 con.commit()
                 return company_json(con, company(con, cid))
             if sub == "hours" and method == "POST":
