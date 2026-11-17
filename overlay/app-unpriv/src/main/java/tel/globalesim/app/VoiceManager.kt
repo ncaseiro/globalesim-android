@@ -117,12 +117,16 @@ object VoiceManager {
     }
     private var domainFor = "voice.globalesim.tel"
 
-    fun call(number: String) = onMain {
-        val c = core ?: return@onMain
+    private fun target(number: String): org.linphone.core.Address? {
         var d = number.filter { it.isDigit() }
         if (d.length == 10) d = "1$d"
-        if (d.isEmpty()) return@onMain
-        val addr = Factory.instance().createAddress("sip:$d@$domainFor") ?: return@onMain
+        if (d.isEmpty()) return null
+        return Factory.instance().createAddress("sip:$d@$domainFor")
+    }
+
+    fun call(number: String) = onMain {
+        val c = core ?: return@onMain
+        val addr = target(number) ?: return@onMain
         val params = c.createCallParams(null) ?: return@onMain
         params.mediaEncryption = MediaEncryption.SRTP
         params.isVideoEnabled = false
@@ -140,6 +144,46 @@ object VoiceManager {
         (core?.currentCall ?: core?.calls?.firstOrNull())?.decline(Reason.Declined)
     }
     fun hangup() = onMain { (core?.currentCall ?: core?.calls?.firstOrNull())?.terminate() }
+
+    // ---- business call handling: hold (caller hears music), transfer now, talk first then transfer ----
+    private fun held(): Call? = core?.calls?.firstOrNull { it.state == Call.State.Paused || it.state == Call.State.Pausing }
+    private fun active(): Call? = core?.currentCall ?: core?.calls?.firstOrNull { it.state == Call.State.StreamsRunning || it.state == Call.State.Connected }
+
+    fun hold(on: Boolean) = onMain {
+        if (on) active()?.pause() else if ((core?.callsNb ?: 0) == 1) held()?.resume()
+        emit(snapshot())
+    }
+    /** Transfer now: the other person is sent straight to [number] (extension or phone number). */
+    fun transfer(number: String) = onMain {
+        val call = active() ?: held() ?: return@onMain
+        val addr = target(number) ?: return@onMain
+        call.transferTo(addr)
+    }
+    /** Talk first: put the caller on hold and call [number]. */
+    fun consult(number: String) = onMain {
+        val c = core ?: return@onMain
+        val first = active() ?: held() ?: return@onMain
+        if (first.state != Call.State.Paused) first.pause()
+        val addr = target(number) ?: return@onMain
+        val params = c.createCallParams(null) ?: return@onMain
+        params.mediaEncryption = MediaEncryption.SRTP
+        params.isVideoEnabled = false
+        c.inviteAddressWithParams(addr, params)
+    }
+    /** Connect the held caller with the person you're talking to now, and drop out. */
+    fun completeTransfer() = onMain {
+        val c = core ?: return@onMain
+        val first = held() ?: return@onMain
+        val second = c.calls.firstOrNull { it != first } ?: return@onMain
+        first.transferToAnother(second)
+    }
+    /** Give up the transfer: hang up the second call, back to the held caller. */
+    fun cancelConsult() = onMain {
+        val c = core ?: return@onMain
+        val first = held() ?: return@onMain
+        c.calls.firstOrNull { it != first }?.terminate()
+        main.postDelayed({ if (first.state == Call.State.Paused) first.resume() }, 400)
+    }
     fun dtmf(digit: String) = onMain { digit.firstOrNull()?.let { core?.currentCall?.sendDtmf(it) } }
     fun mute(on: Boolean) = onMain { core?.isMicEnabled = !on; emit(snapshot()) }
 
@@ -155,15 +199,21 @@ object VoiceManager {
     fun snapshot(): String {
         val o = JSONObject().put("type", "state").put("reg", regState).put("regMessage", regMessage)
         val c = core
-        val call = c?.currentCall ?: c?.calls?.firstOrNull()
+        val calls: Array<Call> = c?.calls ?: arrayOf()
+        val pausedOne = calls.firstOrNull { it.state == Call.State.Paused || it.state == Call.State.Pausing }
+        // with two calls (talk first, then transfer) the one in progress is shown, the other is "on hold"
+        val call = (if (calls.size > 1) calls.firstOrNull { it != pausedOne } else null) ?: c?.currentCall ?: calls.firstOrNull()
         if (call != null) {
             o.put("call", JSONObject()
                 .put("state", call.state?.name ?: "")
                 .put("dir", if (call.dir == Call.Dir.Incoming) "in" else "out")
                 .put("peer", call.remoteAddress.username ?: "")
                 .put("duration", call.duration)
+                .put("held", call.state == Call.State.Paused || call.state == Call.State.Pausing)
                 .put("muted", c?.isMicEnabled == false)
                 .put("speaker", call.outputAudioDevice?.type == AudioDevice.Type.Speaker))
+            if (calls.size > 1 && pausedOne != null && pausedOne != call)
+                o.put("held_call", JSONObject().put("peer", pausedOne.remoteAddress.username ?: "").put("duration", pausedOne.duration))
         }
         return o.toString()
     }
