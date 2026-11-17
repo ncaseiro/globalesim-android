@@ -118,6 +118,7 @@ def main():
             android:name="tel.globalesim.app.StoreActivity"
             android:exported="true"
             android:launchMode="singleTask"
+            android:screenOrientation="portrait"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
             android:theme="@android:style/Theme.Material.NoActionBar">
             <intent-filter>
