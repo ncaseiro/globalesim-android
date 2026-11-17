@@ -12,7 +12,7 @@ PROVIDER=""; DL_SERVER=""; DL_USER=""; DL_PASS=""; DID=""; E911=""; TEST_PASS=""
 say "1/6 Installing Asterisk, firewall and fail2ban (takes 2-4 minutes)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq asterisk asterisk-core-sounds-en-gsm fail2ban ufw curl openssl logrotate cron espeak-ng sox >/dev/null
+apt-get install -y -qq asterisk asterisk-core-sounds-en-gsm fail2ban ufw curl openssl logrotate cron espeak-ng sox ffmpeg >/dev/null
 PUBIP=${PUBIP:-$(curl -fsS4 ifconfig.me || curl -fsS4 api.ipify.org || true)}
 [ -n "$PUBIP" ] || { echo "Could not detect the public IP. Run: PUBIP=x.x.x.x bash install.sh"; exit 1; }
 echo "Public IP: $PUBIP"
@@ -451,6 +451,20 @@ cat > "$AGIDIR/gs-agi.py" <<'EOF'
 import sys; sys.path.insert(0, "/opt/gsvoice"); import gsvoice; gsvoice.agi_main(sys.argv[1:])
 EOF
 chmod 755 "$AGIDIR/gs-agi.py"
+# Natural voices for phone-menu greetings (Piper, runs locally — free). Skipped quietly if a download fails.
+PIPER=/opt/piper; mkdir -p "$PIPER/voices"
+if [ ! -x "$PIPER/piper" ]; then
+  curl -fsSL https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz -o /tmp/piper.tgz \
+    && tar xzf /tmp/piper.tgz -C /opt && rm -f /tmp/piper.tgz || echo "  (natural voices not installed — greetings use the basic voice)"
+fi
+for v in en/en_US/lessac/medium/en_US-lessac-medium en/en_US/amy/medium/en_US-amy-medium en/en_US/ryan/high/en_US-ryan-high en/en_US/joe/medium/en_US-joe-medium \
+         es/es_MX/claude/high/es_MX-claude-high es/es_ES/davefx/medium/es_ES-davefx-medium pt/pt_BR/faber/medium/pt_BR-faber-medium fr/fr_FR/siwis/medium/fr_FR-siwis-medium; do
+  f="$PIPER/voices/$(basename $v)"
+  [ -s "$f.onnx" ] || { curl -fsSL "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/$v.onnx" -o "$f.onnx" \
+      && curl -fsSL "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/$v.onnx.json" -o "$f.onnx.json" || rm -f "$f.onnx" "$f.onnx.json"; }
+done
+echo "  natural voices: $(ls $PIPER/voices/*.onnx 2>/dev/null | wc -l) installed"
+
 # Asterisk's built-in web server, local only — Caddy passes browser calls (wss://…/ws) to it
 cat > /etc/asterisk/http.conf <<EOF
 [general]

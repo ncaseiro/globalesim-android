@@ -26,6 +26,8 @@ DEFAULTS = {
     # where voicemail / alerts are reported (app.php?api=voice_hook), with a shared secret
     "notify_url": "", "notify_token": "",
     "data_dir": "/var/lib/gsvoice", "tts_cmd": "espeak-ng",
+    # natural voices (Piper, runs on this server); the installer downloads the models into piper_dir/voices
+    "piper_dir": "/opt/piper",
     "topup_minutes": 300,
     "limits": {"new_calls_per_10min": 5, "calls_per_day": 100, "new_account_days": 7, "new_account_minutes": 100,
                "robocall_window_min": 30, "robocall_calls": 8, "robocall_short_sec": 15, "robocall_short_calls": 6},
@@ -72,7 +74,7 @@ def db():
     CREATE INDEX IF NOT EXISTS texts_user ON texts(sip_user, id);
     CREATE TABLE IF NOT EXISTS companies (id INTEGER PRIMARY KEY, name TEXT, owner_email TEXT, main_user TEXT, period_anchor TEXT,
         status TEXT DEFAULT 'active', note TEXT, created_at TEXT, ivr_json TEXT, hours_json TEXT, greeting TEXT DEFAULT '', sub_ref TEXT, paused_at TEXT,
-        comp INTEGER DEFAULT 0);
+        comp INTEGER DEFAULT 0, voice TEXT DEFAULT '', rec_main INTEGER DEFAULT 0, rec_closed INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS voicemails (id INTEGER PRIMARY KEY, sip_user TEXT, company_id INTEGER, caller TEXT, file TEXT, secs INTEGER,
         created_at TEXT, heard INTEGER DEFAULT 0);
     CREATE INDEX IF NOT EXISTS vm_user ON voicemails(sip_user, id);
@@ -83,8 +85,9 @@ def db():
                      ("paused_at", "TEXT"), ("sub_ref", "TEXT"), ("company_id", "INTEGER"), ("ext", "TEXT"), ("display_name", "TEXT"),
                      ("vm_on", "INTEGER DEFAULT 1"), ("web_pass", "TEXT"), ("web_exp", "TEXT")):
         if col not in cols: con.execute(f"ALTER TABLE customers ADD COLUMN {col} {typ}")
-    if "comp" not in {r[1] for r in con.execute("PRAGMA table_info(companies)")}:
-        con.execute("ALTER TABLE companies ADD COLUMN comp INTEGER DEFAULT 0")
+    cc = {r[1] for r in con.execute("PRAGMA table_info(companies)")}
+    for col, typ in (("comp", "INTEGER DEFAULT 0"), ("voice", "TEXT DEFAULT ''"), ("rec_main", "INTEGER DEFAULT 0"), ("rec_closed", "INTEGER DEFAULT 0")):
+        if col not in cc: con.execute(f"ALTER TABLE companies ADD COLUMN {col} {typ}")
     if "company_id" not in {r[1] for r in con.execute("PRAGMA table_info(topups)")}:
         con.execute("ALTER TABLE topups ADD COLUMN company_id INTEGER")
     return con
@@ -369,8 +372,44 @@ def biz_closed(co, t=None):
 def greet_file(co_id, kind):
     return os.path.join(C["data_dir"], "greet", f"co{co_id}-{kind}")
 
-def tts(text, path_noext, lang="en"):
-    """Text → 8 kHz mono WAV that Asterisk plays (espeak-ng + sox). Returns True on success."""
+VOICES = [  # id, label, language — only those whose model is installed are offered
+    ("en_US-lessac-medium", "Lessac — female, US English", "en"), ("en_US-amy-medium", "Amy — female, US English", "en"),
+    ("en_US-ryan-high", "Ryan — male, US English", "en"), ("en_US-joe-medium", "Joe — male, US English", "en"),
+    ("es_MX-claude-high", "Claude — Spanish (Mexico)", "es"), ("es_ES-davefx-medium", "Dave — male, Spanish (Spain)", "es"),
+    ("pt_BR-faber-medium", "Faber — male, Portuguese (Brazil)", "pt"), ("fr_FR-siwis-medium", "Siwis — female, French", "fr"),
+]
+
+def voices():
+    return [{"id": v, "label": lab, "lang": lg} for v, lab, lg in VOICES
+            if os.path.exists(os.path.join(C["piper_dir"], "voices", v + ".onnx")) and os.path.exists(os.path.join(C["piper_dir"], "piper"))]
+
+def default_voice(lang):
+    for v in voices():
+        if v["lang"] == lang: return v["id"]
+    return ""
+
+def to_8k(src, path_noext):
+    """Any audio (wav/mp3/webm/ogg/m4a) → 8 kHz mono 16-bit WAV for Asterisk, loudness evened out."""
+    out = path_noext + ".wav"
+    if subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-ac", "1", "-ar", "8000", "-sample_fmt", "s16", "-af", "loudnorm=I=-18:TP=-2", "-t", "120", out],
+                      timeout=60, capture_output=True).returncode == 0: return True
+    return subprocess.run(["sox", src, "-r", "8000", "-c", "1", "-b", "16", out], timeout=60, capture_output=True).returncode == 0
+
+def tts(text, path_noext, lang="en", voice=""):
+    """Text → 8 kHz mono WAV that Asterisk plays: a natural Piper voice when installed, espeak-ng otherwise."""
+    voice = voice if any(v["id"] == voice for v in voices()) else default_voice(lang)
+    if voice:
+        os.makedirs(os.path.dirname(path_noext), exist_ok=True)
+        raw = path_noext + ".piper.wav"
+        try:
+            subprocess.run([os.path.join(C["piper_dir"], "piper"), "-m", os.path.join(C["piper_dir"], "voices", voice + ".onnx"), "-f", raw],
+                           input=text[:1500].encode(), check=True, timeout=60, capture_output=True)
+            if to_8k(raw, path_noext): return True
+        except Exception as e:
+            sys.stderr.write("piper %r\n" % e)
+        finally:
+            try: os.remove(raw)
+            except OSError: pass
     voice = {"en": "en-us+f3", "pt": "pt-br+f3", "es": "es-419+f3", "fr": "fr-fr+f3"}.get(lang, "en-us+f3")
     os.makedirs(os.path.dirname(path_noext), exist_ok=True)
     raw = path_noext + ".tts.wav"
@@ -416,6 +455,7 @@ def company_json(con, co):
     d["members"] = [member_json(con, m) for m in co_members(con, co["id"])]
     d["usage"] = company_usage(con, co)
     d["closed_now"] = biz_closed(co)
+    d["voices"] = voices()
     d["greeting_main"] = os.path.exists(greet_file(co["id"], "main") + ".wav")
     d["greeting_closed"] = os.path.exists(greet_file(co["id"], "closed") + ".wav")
     return d
@@ -450,8 +490,9 @@ def buy_for(con, user, want, area, e911):
             event(con, user, "e911_failed", e.msg[:200])
     return num
 
-def save_greeting(con, co, kind, text, lang):
-    ok = tts(text, greet_file(co["id"], kind), lang)
+def save_greeting(con, co, kind, text, lang, voice=""):
+    if co["rec_" + kind]: return            # the owner's own recording stays until they switch back to a voice
+    ok = tts(text, greet_file(co["id"], kind), lang, voice or co["voice"])
     if not ok: raise ApiError(500, "could not create the greeting audio")
 
 # ---------------------------------------------------------------- texts (receive only)
@@ -778,6 +819,15 @@ def api_route(method, path, q, body):
             rows = con.execute("SELECT * FROM companies WHERE owner_email=? ORDER BY id DESC" if q.get("owner_email") else "SELECT * FROM companies ORDER BY id DESC LIMIT 500",
                                (q["owner_email"].strip().lower(),) if q.get("owner_email") else ()).fetchall()
             return {"companies": [company_json(con, c) for c in rows]}
+        if p == ["voices"] and method == "GET": return {"voices": voices()}
+        if p == ["tts", "preview"] and method == "POST":
+            tmp = os.path.join(C["data_dir"], "greet", "preview-" + secrets.token_hex(6))
+            if not tts(str(body.get("text") or "Thank you for calling. For sales, press 1.")[:400], tmp, body.get("lang", "en"), str(body.get("voice") or "")):
+                raise ApiError(500, "could not create audio")
+            try: return ("raw", open(tmp + ".wav", "rb").read(), "audio/wav")
+            finally:
+                try: os.remove(tmp + ".wav")
+                except OSError: pass
         if p == ["companies", "adopt"] and method == "POST":
             # admin: turn an existing line (with its number) into a complimentary business line — owner = extension 101
             c = con.execute("SELECT * FROM customers WHERE sip_user=?", (str(body.get("sip_user", "")),)).fetchone()
@@ -861,6 +911,7 @@ def api_route(method, path, q, body):
                         ivr["options"][str(k)] = {"label": str(v.get("label", ""))[:40], "type": v["type"], "target": v.get("target")}
                 con.execute("UPDATE companies SET ivr_json=? WHERE id=?", (json.dumps(ivr), cid))
                 custom = (body.get("greeting_text") or "").strip()
+                if body.get("voice") is not None: con.execute("UPDATE companies SET voice=? WHERE id=?", (str(body["voice"])[:60], cid)); co = company(con, cid)
                 if ivr["enabled"]: save_greeting(con, co, "main", custom or default_greeting(co, ivr), body.get("lang", "en"))
                 con.execute("UPDATE companies SET greeting=? WHERE id=?", (custom[:1500], cid))   # empty = built from the menu each time
                 con.commit()
@@ -873,6 +924,7 @@ def api_route(method, path, q, body):
                 con.execute("UPDATE companies SET hours_json=? WHERE id=?", (json.dumps(h), cid))
                 if h["enabled"]:
                     txt = (body.get("closed_text") or "").strip() or f"Thank you for calling {co['name']}. We are closed right now. Please leave a message after the tone and we will call you back."
+                    if body.get("voice") is not None: con.execute("UPDATE companies SET voice=? WHERE id=?", (str(body["voice"])[:60], cid)); co = company(con, cid)
                     save_greeting(con, co, "closed", txt, body.get("lang", "en"))
                 con.commit()
                 return company_json(con, company(con, cid))
@@ -894,6 +946,34 @@ def api_route(method, path, q, body):
                     con.execute("UPDATE customers SET status=?, note=? WHERE sip_user=?", (st, ("company " + note) if st != "active" else None, m["sip_user"]))
                 con.commit(); write_pjsip(con)
                 return company_json(con, company(con, cid))
+            if sub == "greeting" and len(p) == 4 and p[3] in ("main", "closed"):
+                kind = p[3]
+                if method == "GET":
+                    try: return ("raw", open(greet_file(cid, kind) + ".wav", "rb").read(), "audio/wav")
+                    except OSError: raise ApiError(404, "no greeting yet")
+                if method == "POST" and body.get("audio_b64"):          # the owner's own recording / file
+                    import base64 as b64
+                    data = b64.b64decode(body["audio_b64"])[:8_000_000]
+                    if len(data) < 2000: raise ApiError(400, "recording too short")
+                    src = greet_file(cid, kind) + ".upload"
+                    os.makedirs(os.path.dirname(src), exist_ok=True)
+                    open(src, "wb").write(data)
+                    try:
+                        if not to_8k(src, greet_file(cid, kind)): raise ApiError(400, "could not read that audio file")
+                    finally:
+                        try: os.remove(src)
+                        except OSError: pass
+                    con.execute(f"UPDATE companies SET rec_{kind}=1 WHERE id=?", (cid,)); con.commit()
+                    return company_json(con, company(con, cid))
+                if method == "POST" and body.get("use_voice"):          # back to a spoken (Piper) greeting
+                    con.execute(f"UPDATE companies SET rec_{kind}=0 WHERE id=?", (cid,)); co = company(con, cid)
+                    if kind == "main":
+                        ivr = json.loads(co["ivr_json"] or "{}"); save_greeting(con, co, "main", co["greeting"] or default_greeting(co, ivr), body.get("lang", "en"))
+                    else:
+                        save_greeting(con, co, "closed", f"Thank you for calling {co['name']}. We are closed right now. Please leave a message after the tone and we will call you back.", body.get("lang", "en"))
+                    con.commit()
+                    return company_json(con, company(con, cid))
+                raise ApiError(400, "bad request")
             if sub == "renew" and method == "POST":        # monthly payment received: fresh pool
                 con.execute("UPDATE companies SET period_anchor=? WHERE id=?", (now().date().isoformat(), cid)); con.commit()
                 return company_json(con, company(con, cid))
