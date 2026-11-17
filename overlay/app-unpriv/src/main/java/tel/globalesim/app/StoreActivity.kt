@@ -16,6 +16,8 @@ import android.app.NotificationManager
 import android.provider.Settings
 import android.telephony.euicc.EuiccManager
 import android.view.View
+import android.view.WindowInsets
+import android.widget.FrameLayout
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -59,7 +61,25 @@ class StoreActivity : Activity() {
         web = WebView(this)
         web.setBackgroundColor(Color.parseColor("#0E1A2B"))
         web.overScrollMode = View.OVER_SCROLL_NEVER
-        setContentView(web)
+        // Android 15+ draws apps under the status bar and the navigation bar: keep the page between them
+        // (and above the keyboard), so the top bar is never covered by the clock and icons.
+        val root = FrameLayout(this)
+        root.setBackgroundColor(Color.parseColor("#0E1A2B"))
+        root.addView(web, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        // same on every Android version: we draw edge to edge and pad by the bars ourselves (never twice)
+        if (Build.VERSION.SDK_INT >= 30) window.setDecorFitsSystemWindows(false)
+        else window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+        root.setOnApplyWindowInsetsListener { v, insets ->
+            if (Build.VERSION.SDK_INT >= 30) {
+                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+                val ime = insets.getInsets(WindowInsets.Type.ime())
+                v.setPadding(bars.left, bars.top, bars.right, maxOf(bars.bottom, ime.bottom))
+            } else {
+                v.setPadding(insets.systemWindowInsetLeft, insets.systemWindowInsetTop, insets.systemWindowInsetRight, insets.systemWindowInsetBottom)
+            }
+            insets
+        }
+        setContentView(root)
 
         with(web.settings) {
             javaScriptEnabled = true
