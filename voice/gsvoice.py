@@ -1579,6 +1579,14 @@ def api_route(method, path, q, body):
                 if not c["phone_id"] or not a.get("street") or not a.get("zip"): raise ApiError(400, "needs a number and a full address")
                 aid = telnyx_e911(c["phone_id"], a)
                 con.execute("UPDATE customers SET e911=1, e911_address_id=?, e911_json=? WHERE sip_user=?", (aid, json.dumps(a), u)); event(con, u, "e911", "address set by admin")
+            elif sub == "email" and method == "POST":          # admin: change the sign-in email of a line (owner email too, if it runs a company)
+                em = str(body.get("email") or "").strip().lower()
+                if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", em): raise ApiError(400, "enter a valid email")
+                if em != c["email"] and con.execute("SELECT 1 FROM customers WHERE email=? AND status<>'canceled' AND sip_user<>?", (em, u)).fetchone():
+                    raise ApiError(409, "another active line already uses that email")
+                con.execute("UPDATE customers SET email=? WHERE sip_user=?", (em, u))
+                con.execute("UPDATE companies SET owner_email=? WHERE main_user=?", (em, u))
+                event(con, u, "email", f"{c['email']} -> {em}")
             elif sub == "note" and method == "POST":
                 con.execute("UPDATE customers SET admin_note=? WHERE sip_user=?", (str(body.get("note") or "")[:1000], u))
             elif sub == "release" and method == "POST":
