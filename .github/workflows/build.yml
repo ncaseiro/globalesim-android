@@ -12,6 +12,10 @@ on:
         description: 'OpenEUICC branch/tag/commit to build on (blank = latest)'
         required: false
         default: ''
+      release_tag:
+        description: 'Publish a public test release with this tag (e.g. v1.1.0-phone1); blank = no release'
+        required: false
+        default: ''
 
 env:
   UPSTREAM_REPO: https://gitea.angry.im/PeterCxy/OpenEUICC.git
@@ -169,10 +173,13 @@ jobs:
           git -c user.name="GlobaleSIM CI" -c user.email="ci@globalesim.tel" commit -qm "Play bundle $(cat version.txt)"
           git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" play-uploads
 
-      - name: Publish GitHub Release (tags only)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish GitHub Release (tags, or a manual test release)
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ github.event.inputs.release_tag != '' }}
           files: |
             out/*.apk
             out/*.aab
