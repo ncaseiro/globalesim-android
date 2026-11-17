@@ -29,6 +29,8 @@ DEFAULTS = {
     # natural voices (Piper, runs on this server); the installer downloads the models into piper_dir/voices
     "piper_dir": "/opt/piper",
     # Master shutoff for outgoing calls (all lines together). Tripping it pauses outgoing calls only and emails you.
+    # Telnyx list prices (USD), used for cost estimates in the admin panel
+    "rates": {"in": 0.0032, "out": 0.005, "number": 1.0, "e911": 1.5, "channel_tiers": [[10, 12.0], [40, 11.0], [200, 9.0], [1000000, 8.0]]},
     "guard": {"out_minutes_hour": 900, "out_minutes_day": 6000, "out_calls_10min": 150, "concurrent": 40, "new_lines_day": 25},
     "low_balance": 20,                 # email when the Telnyx balance drops below this (USD)
     "alert_kinds": ["auto_suspend", "guard_trip", "e911_failed", "release_failed", "low_balance", "line_flood"],
@@ -83,6 +85,7 @@ def db():
         created_at TEXT, heard INTEGER DEFAULT 0);
     CREATE INDEX IF NOT EXISTS vm_user ON voicemails(sip_user, id);
     CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE IF NOT EXISTS stock (number TEXT PRIMARY KEY, phone_id TEXT, bought_at TEXT, note TEXT);
     CREATE UNIQUE INDEX IF NOT EXISTS customers_did ON customers(did) WHERE did IS NOT NULL AND did <> '';
     """)
     cols = {r[1] for r in con.execute("PRAGMA table_info(customers)")}
@@ -466,6 +469,79 @@ def telnyx_buy(num, area_code="", taken=()):
         if pid: return n, pid
     raise ApiError(409, "no number available in that area code — try another")
 
+def get_number(con, want, area, taken):
+    """A number for a new line: the picked one or one from the same area code — from our stock first (ready now, already paid)."""
+    ac = digits(area)[:3] or (want[1:4] if want else "")
+    st = con.execute("SELECT * FROM stock WHERE number=?", (want,)).fetchone() if want else None
+    if not st and not want and ac:
+        st = con.execute("SELECT * FROM stock WHERE number LIKE ? ORDER BY bought_at LIMIT 1", ("1" + ac + "%",)).fetchone()
+    if not st:
+        try: return telnyx_buy(want, area, taken)
+        except ApiError:                              # picked number gone and none to buy: a stock number in the same area code
+            st = con.execute("SELECT * FROM stock WHERE number LIKE ? ORDER BY bought_at LIMIT 1", ("1" + ac + "%",)).fetchone() if ac else None
+            if not st: raise
+    con.execute("DELETE FROM stock WHERE number=?", (st["number"],))
+    return st["number"], st["phone_id"]
+
+def channel_cost(n):
+    left, cost = int(n or 0), 0.0
+    for size, price in C["rates"]["channel_tiers"]:
+        k = min(left, size); cost += k * price; left -= k
+        if left <= 0: break
+    return round(cost, 2)
+
+def telnyx_all(path):
+    out, page = [], 1
+    while page <= 20:
+        r = telnyx("GET", path + ("&" if "?" in path else "?") + f"page[number]={page}&page[size]=250")
+        out += r.get("data") or []
+        tp = ((r.get("meta") or {}).get("total_pages")) or 1
+        if page >= tp: break
+        page += 1
+    return out
+
+def telnyx_channels(n=None):
+    """Incoming channels (unlimited incoming minutes, shared by every number on channel billing). n=None reads, else sets."""
+    for path in ("/inbound_channels", "/phone_numbers/inbound_channels"):
+        try:
+            r = telnyx("GET", path) if n is None else telnyx("PATCH", path, {"channels": int(n)})
+            d = r.get("data") or {}
+            if isinstance(d, list): d = d[0] if d else {}
+            return int(d.get("channels") or 0)
+        except ApiError as e:
+            if "404" not in e.msg and "not found" not in e.msg.lower() and path == "/inbound_channels": raise
+            last = e
+    raise last
+
+def peak_incoming(con, days=30):
+    """Most incoming calls at the same time in the last N days (ringing counted as ~15 s) — what channels must cover."""
+    since = iso(now() - dt.timedelta(days=days)); ev = []
+    for r in con.execute("SELECT started_at, billsec FROM calls WHERE direction='in' AND started_at>=?", (since,)):
+        try: t = dt.datetime.fromisoformat(str(r["started_at"]).replace("Z", "").replace("T", " ")).timestamp()
+        except ValueError: continue
+        ev += [(t, 1), (t + 15 + max(0, int(r["billsec"] or 0)), -1)]
+    cur = peak = 0
+    for _, d in sorted(ev, key=lambda x: (x[0], x[1])):
+        cur += d; peak = max(peak, cur)
+    return peak
+
+def line_costs(con):
+    """This period's Telnyx cost per line and per company (list prices): minutes in/out + number + 911."""
+    R = C["rates"]; lines = []
+    for c in con.execute("SELECT * FROM customers WHERE status<>'canceled' OR did IS NOT NULL"):
+        co = co_of(con, c)
+        ps = period_start((co["period_anchor"] if co else c["period_anchor"]) or c["created_at"]).isoformat()
+        mi = {r["direction"]: r["m"] for r in con.execute("SELECT direction, COALESCE(SUM(minutes),0) m FROM calls WHERE sip_user=? AND started_at>=? GROUP BY direction", (c["sip_user"], ps))}
+        cost = mi.get("in", 0) * R["in"] + mi.get("out", 0) * R["out"] + (R["number"] if c["did"] else 0) + (R["e911"] if c["e911"] else 0)
+        lines.append({"sip_user": c["sip_user"], "email": c["email"], "did": c["did"] or "", "plan": c["plan"], "status": c["status"], "company_id": c["company_id"],
+                      "ext": c["ext"] or "", "since": ps, "min_in": mi.get("in", 0), "min_out": mi.get("out", 0), "cost": round(cost, 2)})
+    cos = {}
+    for l in lines:
+        if l["company_id"]:
+            k = cos.setdefault(l["company_id"], {"company_id": l["company_id"], "min_in": 0, "min_out": 0, "cost": 0.0, "lines": 0})
+            k["min_in"] += l["min_in"]; k["min_out"] += l["min_out"]; k["cost"] = round(k["cost"] + l["cost"], 2); k["lines"] += 1
+    return lines, list(cos.values())
+
 def telnyx_e911(phone_id, a):
     """a = {name, street, unit, city, state, zip}. Returns address id (911 enabled) or raises ApiError."""
     first, _, last = (a.get("name") or "").strip().partition(" ")
@@ -630,7 +706,7 @@ def buy_for(con, user, want, area, e911):
     """Buy a number for a line (fallback in the same area code), receive texts, 911 address."""
     want = digits(want); want = ("1" + want) if len(want) == 10 else want
     taken = {r[0] for r in con.execute("SELECT did FROM customers WHERE did IS NOT NULL")}
-    num, pid = telnyx_buy(want, digits(area), taken)
+    num, pid = get_number(con, want, digits(area), taken)
     con.execute("UPDATE customers SET did=?, phone_id=?, number_id=? WHERE sip_user=?", (num, pid, pid, user))
     event(con, user, "number", num + (" (picked)" if num == want else f" (wanted {want or 'any'})"))
     sms_attach(pid)
@@ -1032,9 +1108,84 @@ def api_route(method, path, q, body):
             if q.get("area_code"): params["filter[national_destination_code]"] = digits(q["area_code"])[:3]
             if q.get("contains"): params["filter[phone_number][contains]"] = digits(q["contains"])
             if q.get("ends_with"): params["filter[phone_number][ends_with]"] = digits(q["ends_with"])
-            r = telnyx("GET", "/available_phone_numbers?" + urllib.parse.urlencode(params))
-            return {"numbers": [{"phone_number": n.get("phone_number"), "region": ", ".join(x.get("region_name", "") for x in n.get("region_information", []) if x.get("region_type") in ("rate_center", "state")),
-                                 "monthly": (n.get("cost_information") or {}).get("monthly_cost")} for n in r.get("data", [])]}
+            # our own stock first: ready at once and already paid for
+            ac, has = digits(q.get("area_code"))[:3], digits(q.get("contains"))
+            mine = [r["number"] for r in con.execute("SELECT number FROM stock ORDER BY number") if (not ac or r["number"][1:4] == ac) and (not has or has in r["number"][1:])]
+            mine = [n for n in mine if not con.execute("SELECT 1 FROM customers WHERE did=?", (n,)).fetchone()]
+            try: r = telnyx("GET", "/available_phone_numbers?" + urllib.parse.urlencode(params))
+            except ApiError:
+                if not mine: raise
+                r = {}
+            out = [{"phone_number": "+" + n, "region": "In stock", "monthly": None, "stock": True} for n in mine[:5]]
+            return {"numbers": out + [{"phone_number": n.get("phone_number"), "region": ", ".join(x.get("region_name", "") for x in n.get("region_information", []) if x.get("region_type") in ("rate_center", "state")),
+                                 "monthly": (n.get("cost_information") or {}).get("monthly_cost")} for n in r.get("data", []) if digits(n.get("phone_number")) not in mine]}
+        # ---- Telnyx tools for the admin panel ----
+        if p == ["telnyx", "overview"] and method == "GET":
+            R = C["rates"]; out = {"rates": R, "errors": []}
+            try: b = telnyx("GET", "/balance").get("data") or {}; out["balance"] = float(b.get("available_credit") or b.get("balance") or 0)
+            except ApiError as e: out["balance"] = None; out["errors"].append(e.msg[:200])
+            try: out["channels"] = telnyx_channels()
+            except ApiError as e: out["channels"] = None; out["errors"].append(e.msg[:200])
+            ps = now().replace(day=1).strftime("%Y-%m-%d")
+            m = {r["direction"]: r["m"] for r in con.execute("SELECT direction, COALESCE(SUM(minutes),0) m FROM calls WHERE started_at>=? GROUP BY direction", (ps,))}
+            nums = con.execute("SELECT COUNT(*) FROM customers WHERE did IS NOT NULL AND did<>''").fetchone()[0]
+            stock = con.execute("SELECT COUNT(*) FROM stock").fetchone()[0]
+            e911 = con.execute("SELECT COUNT(*) FROM customers WHERE e911=1 AND did IS NOT NULL").fetchone()[0]
+            ch = out["channels"] or 0
+            est = {"numbers": round((nums + stock) * R["number"], 2), "e911": round(e911 * R["e911"], 2), "channels": channel_cost(ch),
+                   "calls_in": round(m.get("in", 0) * R["in"], 2), "calls_out": round(m.get("out", 0) * R["out"], 2)}
+            est["total"] = round(sum(est.values()), 2)
+            out.update({"numbers_assigned": nums, "numbers_stock": stock, "e911_numbers": e911, "minutes_in": m.get("in", 0), "minutes_out": m.get("out", 0),
+                        "month_start": ps, "estimate": est, "peak_incoming_30d": peak_incoming(con, 30)})
+            return out
+        if p == ["telnyx", "numbers"] and method == "GET":
+            nums = telnyx_all("/phone_numbers")
+            try: billing = {v.get("id"): v.get("usage_payment_method") for v in telnyx_all("/phone_numbers/voice")}
+            except ApiError: billing = {}
+            stock = {r["number"] for r in con.execute("SELECT number FROM stock")}
+            out = []
+            for n in nums:
+                d = digits(n.get("phone_number")); c = con.execute("SELECT * FROM customers WHERE did=?", (d,)).fetchone()
+                co = co_of(con, c) if c else None
+                out.append({"id": n.get("id"), "number": d, "status": n.get("status"), "connection": n.get("connection_name") or "",
+                            "billing": billing.get(n.get("id")) or "pay-per-minute", "e911": bool(n.get("emergency_enabled")),
+                            "purchased_at": (n.get("purchased_at") or n.get("created_at") or "")[:10],
+                            "use": "customer" if c else ("stock" if d in stock else "other"),
+                            "email": c["email"] if c else "", "sip_user": c["sip_user"] if c else "", "line_status": c["status"] if c else "",
+                            "company": co["name"] if co else "", "ext": (c["ext"] or "") if c else ""})
+            return {"numbers": out}
+        if len(p) == 4 and p[:2] == ["telnyx", "numbers"] and p[3] == "billing" and method == "POST":
+            m = str(body.get("method") or "")
+            if m not in ("pay-per-minute", "channel"): raise ApiError(400, "method must be pay-per-minute or channel")
+            if m == "channel" and telnyx_channels() < 1: raise ApiError(400, "buy at least 1 channel first — otherwise every call to this number gets a busy signal")
+            telnyx("PATCH", f"/phone_numbers/{p[2]}/voice", {"usage_payment_method": m})
+            event(con, "admin", "billing_set", f"{p[2]} {m}"); con.commit()
+            return {"ok": True, "id": p[2], "billing": m}
+        if p == ["telnyx", "channels"]:
+            if method == "POST":
+                n = int(body.get("channels", -1))
+                if not 0 <= n <= 500: raise ApiError(400, "channels must be 0-500")
+                got = telnyx_channels(n); event(con, "admin", "channels_set", str(got)); con.commit()
+                return {"channels": got, "monthly": channel_cost(got)}
+            got = telnyx_channels(); return {"channels": got, "monthly": channel_cost(got)}
+        if p == ["telnyx", "stock"] and method == "POST":           # buy one number into stock
+            want = digits(body.get("phone_number")); want = ("1" + want) if len(want) == 10 else want
+            if not re.fullmatch(r"1\d{10}", want): raise ApiError(400, "phone_number required")
+            if con.execute("SELECT 1 FROM customers WHERE did=? UNION SELECT 1 FROM stock WHERE number=?", (want, want)).fetchone(): raise ApiError(409, "we already own that number")
+            num, pid = telnyx_buy(want, "", ())
+            if num != want: raise ApiError(409, "that number was just taken")
+            con.execute("INSERT INTO stock (number, phone_id, bought_at, note) VALUES (?,?,?,?)", (num, pid, iso(now()), (body.get("note") or "")[:80]))
+            event(con, "admin", "stock_buy", num); con.commit()
+            return {"ok": True, "number": num}
+        if len(p) == 4 and p[:2] == ["telnyx", "stock"] and p[3] == "release" and method == "POST":
+            st = con.execute("SELECT * FROM stock WHERE number=?", (digits(p[2]),)).fetchone()
+            if not st: raise ApiError(404, "not in stock")
+            if st["phone_id"]: telnyx("DELETE", f"/phone_numbers/{st['phone_id']}")
+            con.execute("DELETE FROM stock WHERE number=?", (st["number"],)); event(con, "admin", "stock_release", st["number"]); con.commit()
+            return {"ok": True}
+        if p == ["telnyx", "costs"] and method == "GET":
+            lines, cos = line_costs(con)
+            return {"lines": lines, "companies": cos, "rates": C["rates"]}
         if p == ["customers"] and method == "GET":
             where, args = [], []
             if q.get("status"): where.append("status=?"); args.append(q["status"])
@@ -1079,7 +1230,7 @@ def api_route(method, path, q, body):
             con.commit()
             want = digits(body.get("phone_number")); want = ("1" + want) if len(want) == 10 else want
             taken = {r[0] for r in con.execute("SELECT did FROM customers WHERE did IS NOT NULL")}
-            num, pid = telnyx_buy(want, digits(body.get("area_code")), taken)
+            num, pid = get_number(con, want, digits(body.get("area_code")), taken)
             con.execute("UPDATE customers SET did=?, phone_id=?, number_id=? WHERE sip_user=?", (num, pid, pid, u))
             sms_attach(pid)                                   # receive texts on the new number
             event(con, u, "number", num + (" (picked)" if num == want else f" (wanted {want or 'any'})"))
