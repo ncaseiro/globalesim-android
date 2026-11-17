@@ -255,7 +255,6 @@ def write_pjsip(con):
 type=endpoint
 context=from-customer
 message_context=gs-messages
-transfer_context=gs-transfer
 allow_transfer=yes
 moh_suggest=default
 disallow=all
@@ -292,7 +291,6 @@ qualify_frequency=60""")
 type=endpoint
 context=from-customer
 message_context=gs-messages
-transfer_context=gs-transfer
 allow_transfer=yes
 moh_suggest=default
 disallow=all
@@ -867,6 +865,8 @@ def agi_main(args):
                 if tgt:
                     a.set("GS_OK", "1"); a.set("GS_DIALS", dials(con, [tgt["sip_user"]])); a.set("GS_VMUSER", tgt["sip_user"] if tgt["vm_on"] else "")
                     a.set("GS_XEXT" if mode == "xfer" else "GS_FWDEXT", "1")
+            elif cust and parse_nanp(t) and con.execute("SELECT 1 FROM customers WHERE did=?", (parse_nanp(t),)).fetchone() and mode == "fwd":
+                event(con, cust["sip_user"], "blocked_out", f"fwd loop to own number {t}")   # never loop through our own numbers
             elif cust and parse_nanp(t):                                   # to an outside number: same checks + billing as any call
                 num = parse_nanp(t)
                 ok, reason, maxsec = check_outbound(con, cust, num)
@@ -1203,6 +1203,8 @@ def api_route(method, path, q, body):
                         to = parse_nanp(to)
                         if not to: raise ApiError(400, "enter a US or Canada number")
                         if to == (c["did"] or ""): raise ApiError(400, "can't forward to the same number")
+                        if con.execute("SELECT 1 FROM customers WHERE did=?", (to,)).fetchone() or to == digits(C["company_did"] or ""):
+                            raise ApiError(400, "that's a GlobaleSIM number — forward to its extension instead")
                 con.execute("UPDATE customers SET fwd_mode=?, fwd_to=?, dnd=? WHERE sip_user=?", (mode, to if mode else (c["fwd_to"] or ""), 1 if body.get("dnd") else 0, u))
                 event(con, u, "forward_set", f"{mode or 'off'} {to} dnd={1 if body.get('dnd') else 0}"); con.commit()
                 c = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
