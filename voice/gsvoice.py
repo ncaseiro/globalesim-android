@@ -88,7 +88,8 @@ def db():
     cols = {r[1] for r in con.execute("PRAGMA table_info(customers)")}
     for col, typ in (("phone_id", "TEXT"), ("e911", "INTEGER DEFAULT 0"), ("e911_address_id", "TEXT"), ("e911_json", "TEXT"),
                      ("paused_at", "TEXT"), ("sub_ref", "TEXT"), ("company_id", "INTEGER"), ("ext", "TEXT"), ("display_name", "TEXT"),
-                     ("vm_on", "INTEGER DEFAULT 1"), ("web_pass", "TEXT"), ("web_exp", "TEXT")):
+                     ("vm_on", "INTEGER DEFAULT 1"), ("web_pass", "TEXT"), ("web_exp", "TEXT"),
+                     ("fwd_mode", "TEXT DEFAULT ''"), ("fwd_to", "TEXT"), ("dnd", "INTEGER DEFAULT 0")):
         if col not in cols: con.execute(f"ALTER TABLE customers ADD COLUMN {col} {typ}")
     cc = {r[1] for r in con.execute("PRAGMA table_info(companies)")}
     for col, typ in (("comp", "INTEGER DEFAULT 0"), ("voice", "TEXT DEFAULT ''"), ("rec_main", "INTEGER DEFAULT 0"), ("rec_closed", "INTEGER DEFAULT 0")):
@@ -124,6 +125,21 @@ def co_members(con, cid, active_only=False):
 def co_main_did(con, co):
     r = con.execute("SELECT did FROM customers WHERE sip_user=?", (co["main_user"],)).fetchone() if co else None
     return r["did"] if r and r["did"] else ""
+
+FWD_ON = {"always": "", "busy": "BUSY|CHANUNAVAIL|CONGESTION", "noanswer": "NOANSWER", "busy_noanswer": "BUSY|CHANUNAVAIL|CONGESTION|NOANSWER"}
+
+def set_forward_vars(a, cust):
+    """Do-not-disturb / call-forwarding settings of the line being called → dialplan variables."""
+    a.set("GS_DND", "1" if cust["dnd"] else "0")
+    mode = cust["fwd_mode"] or ""
+    a.set("GS_FWD", "always" if mode == "always" and cust["fwd_to"] else "")
+    a.set("GS_FWDON", FWD_ON.get(mode, "^NEVER$") if mode != "always" and cust["fwd_to"] else "^NEVER$")
+    a.set("GS_FWDUSER", cust["sip_user"])
+
+def parse_nanp(x):
+    d = digits(x)
+    if len(d) == 10: d = "1" + d
+    return d if re.fullmatch(r"1[2-9]\d{2}[2-9]\d{6}", d) and not re.match(r"1(900|976)", d) else ""
 
 def base_user(ep):
     return ep[:-4] if ep and ep.endswith("-web") else ep
@@ -239,6 +255,9 @@ def write_pjsip(con):
 type=endpoint
 context=from-customer
 message_context=gs-messages
+transfer_context=gs-transfer
+allow_transfer=yes
+moh_suggest=default
 disallow=all
 allow=ulaw,alaw,g722
 auth={u}-auth
@@ -273,6 +292,9 @@ qualify_frequency=60""")
 type=endpoint
 context=from-customer
 message_context=gs-messages
+transfer_context=gs-transfer
+allow_transfer=yes
+moh_suggest=default
 disallow=all
 allow=ulaw,alaw
 webrtc=yes
@@ -748,7 +770,7 @@ def agi_main(args):
                 cur = con.execute("INSERT INTO calls (sip_user, direction, peer, started_at, billsec, result) VALUES (?,?,?,?,0,'dialing')", (user, "out", dest, iso(now())))
                 a.set("GS_CALLID", str(cur.lastrowid)); a.set("GS_CID", "+" + (cust["did"] or co_main_did(con, co))); a.set("GS_MAXMS", str(int(maxsec * 1000)))
                 a.set("GS_CO", f"co{co['id']}" if co else ""); a.set("GS_COMAX", str(max(2, len(co_members(con, co["id"], True)))) if co else "0")
-                a.set("GS_GMAX", str(C["guard"]["concurrent"]))
+                a.set("GS_GMAX", str(C["guard"]["concurrent"])); a.set("GS_MAXSEC", str(max(60, int(maxsec))))
             else:
                 event(con, user, "blocked_out", f"{reason} {dest}")
         elif mode == "e911":              # e911 <endpoint>
@@ -777,7 +799,8 @@ def agi_main(args):
                 else:
                     cur = con.execute("INSERT INTO calls (sip_user, direction, peer, started_at, billsec, result) VALUES (?,?,?,?,0,'ringing')", (cust["sip_user"], "in", caller, iso(now())))
                     a.set("GS_OK", "1"); a.set("GS_USER", cust["sip_user"]); a.set("GS_CALLID", str(cur.lastrowid)); a.set("GS_MAXMS", str(u["remaining"] * 60000))
-                    a.set("GS_DIALS", dials(con, [cust["sip_user"]]))
+                    a.set("GS_DIALS", dials(con, [cust["sip_user"]])); a.set("GS_START", str(int(time.time())))
+                    set_forward_vars(a, cust)
                     a.set("GS_VMUSER", cust["sip_user"] if (cust["vm_on"] if "vm_on" in cust.keys() else 1) else "")
                     co = co_of(con, cust); mode = ""
                     if co and co["main_user"] == cust["sip_user"] and co["status"] == "active":
@@ -803,6 +826,7 @@ def agi_main(args):
             a.set("GS_OK", "1" if ok else "0")
             if ok:
                 a.set("GS_USER", tgt["sip_user"]); a.set("GS_DIALS", dials(con, [tgt["sip_user"]])); a.set("GS_VMUSER", tgt["sip_user"] if tgt["vm_on"] else "")
+                set_forward_vars(a, tgt)
                 a.set("GS_CNAME", (me["display_name"] or f"Ext {me['ext']}").replace('"', "")); a.set("GS_CNUM", me["ext"] or "")
         elif mode == "ivr":               # ivr <company id> <digit | 3-digit ext | t>
             co = company(con, int(args[1] or 0)); key = args[2] if len(args) > 2 else ""
@@ -826,6 +850,32 @@ def agi_main(args):
             elif key in (ivr.get("options") or {}): act = resolve(ivr["options"][key])
             else: act = ("invalid", "", "")
             a.set("GS_ACT", act[0]); a.set("GS_DIAL", act[1]); a.set("GS_VMUSER", act[2])
+        elif mode in ("fwd", "xfer"):
+            # fwd <line being forwarded> <caller>  — call forwarding (always / busy / no answer)
+            # xfer <BLINDTRANSFER channel> <target>  — "transfer now" from the app / computer / desk phone
+            a.set("GS_OK", "0"); a.set("GS_XEXT", ""); a.set("GS_FWDEXT", "")
+            if mode == "fwd":
+                cust = con.execute("SELECT * FROM customers WHERE sip_user=?", (args[1],)).fetchone(); target = cust["fwd_to"] if cust else ""
+            else:
+                m = re.match(r"^PJSIP/(.+)-[0-9a-f]{8}$", args[1] or "")
+                cust = con.execute("SELECT * FROM customers WHERE sip_user=?", (base_user(m.group(1)),)).fetchone() if m else None
+                target = args[2] if len(args) > 2 else ""
+            co = co_of(con, cust) if cust else None
+            t = digits(target)
+            if cust and co and re.fullmatch(r"[1-8]\d\d", t):          # to an extension of the same company: free
+                tgt = con.execute("SELECT * FROM customers WHERE company_id=? AND ext=? AND status='active'", (co["id"], t)).fetchone()
+                if tgt:
+                    a.set("GS_OK", "1"); a.set("GS_DIALS", dials(con, [tgt["sip_user"]])); a.set("GS_VMUSER", tgt["sip_user"] if tgt["vm_on"] else "")
+                    a.set("GS_XEXT" if mode == "xfer" else "GS_FWDEXT", "1")
+            elif cust and parse_nanp(t):                                   # to an outside number: same checks + billing as any call
+                num = parse_nanp(t)
+                ok, reason, maxsec = check_outbound(con, cust, num)
+                if ok:
+                    cur = con.execute("INSERT INTO calls (sip_user, direction, peer, started_at, billsec, result) VALUES (?,?,?,?,0,?)", (cust["sip_user"], "out", num, iso(now()), mode))
+                    a.set("GS_OK", "1"); a.set("GS_NUM", num); a.set("GS_XCALL", str(cur.lastrowid)); a.set("GS_XMAX", str(max(60, int(maxsec))))
+                else:
+                    event(con, cust["sip_user"], "blocked_out", f"{mode} {num} {reason}")
+            if cust: event(con, cust["sip_user"], mode, f"to {t or '?'}")
         elif mode == "vmsave":            # vmsave <user> <file without .wav> <caller>
             user, f = args[1], args[2]; caller = digits(args[3]) if len(args) > 3 else ""
             path = f + ".wav"
@@ -843,11 +893,17 @@ def agi_main(args):
                                                    "caller": caller, "secs": secs, "created_at": iso(now())})
         elif mode == "charge":            # charge <callid> <answered-seconds>
             cid = int(args[1] or 0); secs = int(float(args[2] or 0)) if len(args) > 2 and args[2] else 0
-            if len(args) > 4 and args[3].isdigit() and args[4].isdigit():      # answered by the menu / voicemail
+            if len(args) > 4 and args[3].isdigit() and args[4].isdigit():      # answered by the menu / voicemail (or the carrier leg)
                 secs = max(secs, int(args[4]) - int(args[3]))
+            if len(args) > 6 and secs > 0 and args[5].isdigit() and args[6].isdigit() and len(args) > 4 and args[4].isdigit():
+                # incoming call that kept going after a transfer: whole call minus the ringing time
+                ring = max(0, int(float(args[5])) - int(float(args[2] or 0)))
+                secs = max(secs, int(args[4]) - int(args[6]) - ring)
             if cid:
                 mins = math.ceil(secs / 60) if secs > 0 else 0
-                con.execute("UPDATE calls SET billsec=?, minutes=?, result=? WHERE id=?", (secs, mins, "answered" if secs > 0 else "no_answer", cid))
+                # several legs may report (caller side + carrier side after a transfer): keep the longest
+                con.execute("UPDATE calls SET billsec=MAX(billsec, ?), minutes=MAX(COALESCE(minutes,0), ?), result=CASE WHEN ? > 0 OR billsec > 0 THEN 'answered' ELSE 'no_answer' END WHERE id=?",
+                            (secs, mins, secs, cid))
                 row = con.execute("SELECT c.* FROM customers c JOIN calls k ON k.sip_user=c.sip_user WHERE k.id=? AND k.direction='out'", (cid,)).fetchone()
                 if row and row["status"] == "active" and robocall_check(con, row):
                     con.commit(); write_pjsip(con)
@@ -858,7 +914,7 @@ class ApiError(Exception):
     def __init__(self, code, msg): super().__init__(msg); self.code = code; self.msg = msg
 
 def cust_json(con, c):
-    d = {k: c[k] for k in c.keys() if k != "sip_pass"}
+    d = {k: c[k] for k in c.keys() if k not in ("sip_pass", "web_pass")}
     d["usage"] = usage(con, c); d["plan_name"] = C["plans"].get(c["plan"], {}).get("name", c["plan"])
     return d
 
@@ -1135,6 +1191,22 @@ def api_route(method, path, q, body):
                 co = co_of(con, c)
                 if co: d["company"] = {"id": co["id"], "name": co["name"], "owner": co["owner_email"] == c["email"], "ext": c["ext"], "main_did": co_main_did(con, co)}
                 return d
+            if sub == "forward" and method == "POST":         # call forwarding + do not disturb
+                mode = str(body.get("mode") or ""); to = digits(str(body.get("to") or ""))
+                if mode not in ("", "always", "busy", "noanswer", "busy_noanswer"): raise ApiError(400, "bad mode")
+                co = co_of(con, c)
+                if mode:
+                    if co and re.fullmatch(r"[1-8]\d\d", to):
+                        if to == (c["ext"] or ""): raise ApiError(400, "can't forward to yourself")
+                        if not con.execute("SELECT 1 FROM customers WHERE company_id=? AND ext=? AND status='active'", (co["id"], to)).fetchone(): raise ApiError(400, "no such extension")
+                    else:
+                        to = parse_nanp(to)
+                        if not to: raise ApiError(400, "enter a US or Canada number")
+                        if to == (c["did"] or ""): raise ApiError(400, "can't forward to the same number")
+                con.execute("UPDATE customers SET fwd_mode=?, fwd_to=?, dnd=? WHERE sip_user=?", (mode, to if mode else (c["fwd_to"] or ""), 1 if body.get("dnd") else 0, u))
+                event(con, u, "forward_set", f"{mode or 'off'} {to} dnd={1 if body.get('dnd') else 0}"); con.commit()
+                c = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
+                return cust_json(con, c)
             if sub == "webcreds" and method == "GET":         # computer browser login (website checked the owner)
                 if c["status"] != "active": raise ApiError(403, "line not active")
                 if not c["web_pass"] or not c["web_exp"] or c["web_exp"] < iso(now() + dt.timedelta(hours=2)):

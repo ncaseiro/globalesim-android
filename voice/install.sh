@@ -202,6 +202,7 @@ endpoint=carrier
 type=endpoint
 transport=transport-udp
 context=from-carrier
+allow_transfer=no
 disallow=all
 allow=ulaw,alaw
 outbound_auth=carrier-auth
@@ -253,7 +254,10 @@ exten => _.,1,Set(GS_TO=\${PJSIP_HEADER(read,To)})
  same => n(ok),Set(CHANNEL(hangup_handler_push)=gs-charge,s,1(\${GS_CALLID}))
  same => n,GotoIf(\$["\${GS_MODE}" = "ivr"]?gs-ivr,s,1)
  same => n,GotoIf(\$["\${GS_MODE}" = "closed"]?gs-closed,s,1)
+ same => n,GotoIf(\$["\${GS_DND}" = "1"]?gs-vm,s,1)
+ same => n,GotoIf(\$["\${GS_FWD}" = "always"]?gs-fwd,s,1)
  same => n,Dial(\${GS_DIALS},25,L(\${GS_MAXMS}))
+ same => n,GotoIf(\$[\${REGEX("^(\${GS_FWDON})\$" \${DIALSTATUS})}]?gs-fwd,s,1)
  same => n,Goto(gs-vm,s,1)
 
 ; ===== Business phone system =====
@@ -315,8 +319,38 @@ exten => s,1,AGI(gs-agi.py,vmsave,\${ARG1},\${ARG2},\${ARG3})
 ; After every customer call: charge the minutes (rounded up) and run the robocall check
 [gs-charge]
 ; minutes = the longer of: time talking to a person (ANSWEREDTIME) or time since the server answered (menu / voicemail, GS_ANS)
-exten => s,1,AGI(gs-agi.py,charge,\${ARG1},\${ANSWEREDTIME},\${GS_ANS},\${EPOCH})
+exten => s,1,AGI(gs-agi.py,charge,\${ARG1},\${ANSWEREDTIME},\${GS_ANS},\${EPOCH},\${DIALEDTIME},\${GS_START})
  same => n,Return()
+
+; Outside call answered: bill on the carrier leg itself (keeps counting after a transfer) and enforce the time limit there
+[gs-outans]
+exten => s,1,Set(GS_ANS=\${EPOCH})
+ same => n,Set(TIMEOUT(absolute)=\${ARG2})
+ same => n,Set(CHANNEL(hangup_handler_push)=gs-charge,s,1(\${ARG1}))
+ same => n,Return()
+
+; "Transfer now" (blind transfer) from the app, computer or desk phone: same checks + billing as a normal call
+[gs-transfer]
+exten => _X.,1,AGI(gs-agi.py,xfer,\${BLINDTRANSFER},\${EXTEN})
+ same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok)
+ same => n,Playback(pbx-invalid)
+ same => n,Hangup()
+ same => n(ok),GotoIf(\$["\${GS_XEXT}" = "1"]?ext)
+ same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,60,U(gs-outans^s^1^\${GS_XCALL}^\${GS_XMAX}))
+ same => n,Hangup()
+ same => n(ext),Dial(\${GS_DIALS},25)
+ same => n,Goto(gs-vm,s,1)
+
+; Call forwarding (always / busy / no answer) to an extension or an outside number
+[gs-fwd]
+exten => s,1,AGI(gs-agi.py,fwd,\${GS_FWDUSER},\${CALLERID(num)})
+ same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok)
+ same => n,Goto(gs-vm,s,1)
+ same => n(ok),GotoIf(\$["\${GS_FWDEXT}" = "1"]?ext)
+ same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,30,U(gs-outans^s^1^\${GS_XCALL}^\${GS_XMAX}))
+ same => n,Goto(gs-vm,s,1)
+ same => n(ext),Dial(\${GS_DIALS},25)
+ same => n,Goto(gs-vm,s,1)
 
 ; Text messages sent FROM the app: not offered (receive-only line) — drop them
 [gs-messages]
@@ -333,8 +367,11 @@ exten => _[1-8]XX,1,AGI(gs-agi.py,ext,\${CHANNEL(endpoint)},\${EXTEN})
  same => n,Hangup()
  same => n(ok),Set(CALLERID(name)=\${GS_CNAME})
  same => n,Set(CALLERID(num)=\${GS_CNUM})
- same => n,Dial(\${GS_DIALS},25)
  same => n,Set(GS_SKIPINTRO=0)
+ same => n,GotoIf(\$["\${GS_DND}" = "1"]?gs-vm,s,1)
+ same => n,GotoIf(\$["\${GS_FWD}" = "always"]?gs-fwd,s,1)
+ same => n,Dial(\${GS_DIALS},25)
+ same => n,GotoIf(\$[\${REGEX("^(\${GS_FWDON})\$" \${DIALSTATUS})}]?gs-fwd,s,1)
  same => n,Goto(gs-vm,s,1)
 ; 911: only lines whose 911 address is registered at Telnyx; caller ID = their own number (so the address shows)
 exten => 911,1,AGI(gs-agi.py,e911,\${CHANNEL(endpoint)})
@@ -351,7 +388,7 @@ exten => _1NXXNXXXXXX,1,GotoIf(\$[\${REGEX("^(900|976)" \${EXTEN:1:3})}]?blocked
  same => n,AGI(gs-agi.py,out,\${GS_EP},\${EXTEN})
  same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok:blocked)
  same => n(ok),Set(GROUP(gsuser)=\${GS_BASE})
- same => n,GotoIf(\$[\${GROUP_COUNT(\${GS_BASE}@gsuser)} > 1]?blocked)
+ same => n,GotoIf(\$[\${GROUP_COUNT(\${GS_BASE}@gsuser)} > 2]?blocked)
  same => n,Set(GROUP(gsall)=out)
  same => n,GotoIf(\$[\${GROUP_COUNT(out@gsall)} > \${GS_GMAX}]?blocked)
  same => n,GotoIf(\$["\${GS_CO}" = ""]?go)
@@ -359,7 +396,7 @@ exten => _1NXXNXXXXXX,1,GotoIf(\$[\${REGEX("^(900|976)" \${EXTEN:1:3})}]?blocked
  same => n,GotoIf(\$[\${GROUP_COUNT(\${GS_CO}@gsco)} > \${GS_COMAX}]?blocked)
  same => n(go),Set(CALLERID(all)=<\${GS_CID}>)
  same => n,Set(CHANNEL(hangup_handler_push)=gs-charge,s,1(\${GS_CALLID}))
- same => n,Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60,L(\${GS_MAXMS}))
+ same => n,Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60,L(\${GS_MAXMS})U(gs-outans^s^1^\${GS_CALLID}^\${GS_MAXSEC}))
  same => n,Hangup()
  same => n(blocked),Playback(ss-noservice)
  same => n,Hangup()
@@ -476,6 +513,17 @@ for v in en/en_US/lessac/medium/en_US-lessac-medium en/en_US/amy/medium/en_US-am
       && curl -fsSL "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/$v.onnx.json" -o "$f.onnx.json" || rm -f "$f.onnx" "$f.onnx.json"; }
 done
 echo "  natural voices: $(ls $PIPER/voices/*.onnx 2>/dev/null | wc -l) installed"
+
+# Music on hold (callers hear it when put on hold)
+apt-get install -y -qq asterisk-moh-opsound-gsm >/dev/null 2>&1 || true
+cat > /etc/asterisk/musiconhold.conf <<EOF
+[general]
+[default]
+mode=files
+directory=moh
+random=yes
+EOF
+chown asterisk:asterisk /etc/asterisk/musiconhold.conf
 
 # Asterisk's built-in web server, local only — Caddy passes browser calls (wss://…/ws) to it
 cat > /etc/asterisk/http.conf <<EOF
