@@ -71,7 +71,8 @@ def db():
         received_at TEXT, delivered INTEGER DEFAULT 0, tries INTEGER DEFAULT 0, tx_id TEXT UNIQUE);
     CREATE INDEX IF NOT EXISTS texts_user ON texts(sip_user, id);
     CREATE TABLE IF NOT EXISTS companies (id INTEGER PRIMARY KEY, name TEXT, owner_email TEXT, main_user TEXT, period_anchor TEXT,
-        status TEXT DEFAULT 'active', note TEXT, created_at TEXT, ivr_json TEXT, hours_json TEXT, greeting TEXT DEFAULT '', sub_ref TEXT, paused_at TEXT);
+        status TEXT DEFAULT 'active', note TEXT, created_at TEXT, ivr_json TEXT, hours_json TEXT, greeting TEXT DEFAULT '', sub_ref TEXT, paused_at TEXT,
+        comp INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS voicemails (id INTEGER PRIMARY KEY, sip_user TEXT, company_id INTEGER, caller TEXT, file TEXT, secs INTEGER,
         created_at TEXT, heard INTEGER DEFAULT 0);
     CREATE INDEX IF NOT EXISTS vm_user ON voicemails(sip_user, id);
@@ -82,6 +83,8 @@ def db():
                      ("paused_at", "TEXT"), ("sub_ref", "TEXT"), ("company_id", "INTEGER"), ("ext", "TEXT"), ("display_name", "TEXT"),
                      ("vm_on", "INTEGER DEFAULT 1"), ("web_pass", "TEXT"), ("web_exp", "TEXT")):
         if col not in cols: con.execute(f"ALTER TABLE customers ADD COLUMN {col} {typ}")
+    if "comp" not in {r[1] for r in con.execute("PRAGMA table_info(companies)")}:
+        con.execute("ALTER TABLE companies ADD COLUMN comp INTEGER DEFAULT 0")
     if "company_id" not in {r[1] for r in con.execute("PRAGMA table_info(topups)")}:
         con.execute("ALTER TABLE topups ADD COLUMN company_id INTEGER")
     return con
@@ -138,7 +141,7 @@ def company_usage(con, co, t=None):
     included = sum(C["plans"].get(m["plan"], {"minutes": 0})["minutes"] for m in members)
     L = C["limits"]
     created = dt.datetime.fromisoformat(co["created_at"]).replace(tzinfo=dt.timezone.utc)
-    new_account = (t - created).days < L["new_account_days"]
+    new_account = (t - created).days < L["new_account_days"] and not co["comp"]     # complimentary (own/partner) accounts: no new-account cap
     if new_account: included = min(included, L["new_account_minutes"] * max(1, len(members)))
     return {"period_start": ps, "included": included, "extra": extra, "used": used, "remaining": max(0, included + extra - used),
             "new_account_limit": new_account, "pool": True, "extensions": len(members)}
@@ -775,6 +778,20 @@ def api_route(method, path, q, body):
             rows = con.execute("SELECT * FROM companies WHERE owner_email=? ORDER BY id DESC" if q.get("owner_email") else "SELECT * FROM companies ORDER BY id DESC LIMIT 500",
                                (q["owner_email"].strip().lower(),) if q.get("owner_email") else ()).fetchall()
             return {"companies": [company_json(con, c) for c in rows]}
+        if p == ["companies", "adopt"] and method == "POST":
+            # admin: turn an existing line (with its number) into a complimentary business line — owner = extension 101
+            c = con.execute("SELECT * FROM customers WHERE sip_user=?", (str(body.get("sip_user", "")),)).fetchone()
+            name = (body.get("name") or "").strip()[:80]
+            if not c or not c["did"] or c["status"] == "canceled": raise ApiError(404, "no active line with a number")
+            if c["company_id"]: raise ApiError(409, "this line is already part of a company")
+            if not name: raise ApiError(400, "company name required")
+            cur = con.execute("INSERT INTO companies (name, owner_email, main_user, period_anchor, created_at, sub_ref, ivr_json, hours_json, comp) VALUES (?,?,?,?,?,?,?,?,1)",
+                              (name, c["email"], c["sip_user"], c["period_anchor"], iso(now()), None, "{}", "{}"))
+            cid = cur.lastrowid
+            con.execute("UPDATE customers SET company_id=?, ext='101', display_name=COALESCE(NULLIF(display_name,''), 'Main') WHERE sip_user=?", (cid, c["sip_user"]))
+            event(con, c["sip_user"], "company", f"made business line {cid} ({name})")
+            con.commit(); write_pjsip(con)
+            return company_json(con, company(con, cid))
         if p == ["companies", "provision"] and method == "POST":
             # after payment: company + owner as extension 101 + main number (chosen, or same area code) + 911 address
             email = (body.get("owner_email") or "").strip().lower(); name = (body.get("name") or "").strip()[:80]; ref = str(body.get("ref", ""))[:80]
