@@ -843,6 +843,8 @@ def agi_main(args):
                                                    "caller": caller, "secs": secs, "created_at": iso(now())})
         elif mode == "charge":            # charge <callid> <answered-seconds>
             cid = int(args[1] or 0); secs = int(float(args[2] or 0)) if len(args) > 2 and args[2] else 0
+            if len(args) > 4 and args[3].isdigit() and args[4].isdigit():      # answered by the menu / voicemail
+                secs = max(secs, int(args[4]) - int(args[3]))
             if cid:
                 mins = math.ceil(secs / 60) if secs > 0 else 0
                 con.execute("UPDATE calls SET billsec=?, minutes=?, result=? WHERE id=?", (secs, mins, "answered" if secs > 0 else "no_answer", cid))

@@ -260,6 +260,7 @@ exten => _.,1,Set(GS_TO=\${PJSIP_HEADER(read,To)})
 ; Main menu: "Press 1 for sales…" (greeting made from text, or the company's own); any 3-digit extension works too
 [gs-ivr]
 exten => s,1,Answer()
+ same => n,ExecIf(\$["\${GS_ANS}" = ""]?Set(GS_ANS=\${EPOCH}))
  same => n,Set(GS_TRIES=0)
  same => n(menu),Set(TIMEOUT(digit)=2)
  same => n,Set(TIMEOUT(response)=6)
@@ -288,6 +289,7 @@ exten => s,1,GotoIf(\$["\${GS_ACT}" = "repeat"]?gs-ivr,s,menu)
 ; Outside business hours: closed greeting, then voicemail
 [gs-closed]
 exten => s,1,Answer()
+ same => n,ExecIf(\$["\${GS_ANS}" = ""]?Set(GS_ANS=\${EPOCH}))
  same => n,GotoIf(\$["\${GS_GREET}" = ""]?vm)
  same => n,Playback(\${GS_GREET})
  same => n(vm),Set(GS_SKIPINTRO=1)
@@ -297,6 +299,7 @@ exten => s,1,Answer()
 [gs-vm]
 exten => s,1,GotoIf(\$["\${GS_VMUSER}" = ""]?none)
  same => n,Answer()
+ same => n,ExecIf(\$["\${GS_ANS}" = ""]?Set(GS_ANS=\${EPOCH}))
  same => n,Set(GS_VMFILE=/var/lib/gsvoice/vm/\${GS_VMUSER}-\${EPOCH}-\${RAND(1000,9999)})
  same => n,Set(CHANNEL(hangup_handler_push)=gs-vmsave,s,1(\${GS_VMUSER},\${GS_VMFILE},\${CALLERID(num)}))
  same => n,ExecIf(\$["\${GS_SKIPINTRO}" != "1"]?Playback(vm-intro))
@@ -311,7 +314,8 @@ exten => s,1,AGI(gs-agi.py,vmsave,\${ARG1},\${ARG2},\${ARG3})
 
 ; After every customer call: charge the minutes (rounded up) and run the robocall check
 [gs-charge]
-exten => s,1,AGI(gs-agi.py,charge,\${ARG1},\${ANSWEREDTIME})
+; minutes = the longer of: time talking to a person (ANSWEREDTIME) or time since the server answered (menu / voicemail, GS_ANS)
+exten => s,1,AGI(gs-agi.py,charge,\${ARG1},\${ANSWEREDTIME},\${GS_ANS},\${EPOCH})
  same => n,Return()
 
 ; Text messages sent FROM the app: not offered (receive-only line) — drop them
@@ -512,7 +516,7 @@ echo '41 5 * * * asterisk /usr/bin/python3 /opt/gsvoice/gsvoice.py daily >/dev/n
 cat > /usr/local/bin/gsvoice-f2b <<'EOF'
 #!/bin/bash
 B=$(fail2ban-client status asterisk 2>/dev/null | awk -F: '/Currently banned/{gsub(/ /,"",$2);print $2}')
-N=$(grep -c "Ban " /var/log/fail2ban.log 2>/dev/null); F=$(grep -c "failed for" /var/log/asterisk/fail2ban 2>/dev/null)
+N=$(grep -cE "\] Ban " /var/log/fail2ban.log 2>/dev/null)     # new bans only (not "Restore Ban" after a restart); F=$(grep -c "failed for" /var/log/asterisk/fail2ban 2>/dev/null)
 P=/var/lib/gsvoice/f2b.json; O=$(cat $P.prev 2>/dev/null || echo "0 0")
 read ON OF <<< "$O"
 printf '{"banned": %s, "new_24h": %s, "failed_24h": %s}\n' "${B:-0}" "$(( ${N:-0} >= ON ? ${N:-0} - ON : ${N:-0} ))" "$(( ${F:-0} >= OF ? ${F:-0} - OF : ${F:-0} ))" > $P
