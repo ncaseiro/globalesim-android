@@ -80,7 +80,7 @@ def db():
     cols = {r[1] for r in con.execute("PRAGMA table_info(customers)")}
     for col, typ in (("phone_id", "TEXT"), ("e911", "INTEGER DEFAULT 0"), ("e911_address_id", "TEXT"), ("e911_json", "TEXT"),
                      ("paused_at", "TEXT"), ("sub_ref", "TEXT"), ("company_id", "INTEGER"), ("ext", "TEXT"), ("display_name", "TEXT"),
-                     ("vm_on", "INTEGER DEFAULT 1")):
+                     ("vm_on", "INTEGER DEFAULT 1"), ("web_pass", "TEXT"), ("web_exp", "TEXT")):
         if col not in cols: con.execute(f"ALTER TABLE customers ADD COLUMN {col} {typ}")
     if "company_id" not in {r[1] for r in con.execute("PRAGMA table_info(topups)")}:
         con.execute("ALTER TABLE topups ADD COLUMN company_id INTEGER")
@@ -113,6 +113,18 @@ def co_members(con, cid, active_only=False):
 def co_main_did(con, co):
     r = con.execute("SELECT did FROM customers WHERE sip_user=?", (co["main_user"],)).fetchone() if co else None
     return r["did"] if r and r["did"] else ""
+
+def base_user(ep):
+    return ep[:-4] if ep and ep.endswith("-web") else ep
+
+def dials(con, users):
+    """Dial string ringing each line's phone app and, if signed in, its computer browser too."""
+    out = []
+    for u in users:
+        out.append(f"PJSIP/{u}")
+        r = con.execute("SELECT web_exp FROM customers WHERE sip_user=?", (u,)).fetchone()
+        if r and r["web_exp"] and r["web_exp"] > iso(now()): out.append(f"PJSIP/{u}-web")
+    return "&".join(out)
 
 def company_usage(con, co, t=None):
     """One shared pool: every extension's included minutes + the company's packs, used by everyone."""
@@ -213,6 +225,37 @@ type=aor
 max_contacts=2
 remove_existing=yes
 qualify_frequency=60""")
+    # computer browser logins (WebRTC): "<user>-web", a separate password that expires (24 h, renewed while used)
+    for c in con.execute("SELECT * FROM customers WHERE status='active' AND web_pass IS NOT NULL AND web_exp > ?", (iso(now()),)):
+        u = c["sip_user"]; w = u + "-web"
+        cid_num = c["did"] or co_main_did(con, co_of(con, c)) or "0"
+        out.append(f"""
+[{w}]
+type=endpoint
+context=from-customer
+message_context=gs-messages
+disallow=all
+allow=ulaw,alaw
+webrtc=yes
+auth={w}-auth
+aors={w}
+direct_media=no
+force_rport=yes
+rewrite_contact=yes
+device_state_busy_at=1
+callerid=<{cid_num}>
+
+[{w}-auth]
+type=auth
+auth_type=userpass
+username={w}
+password={c['web_pass']}
+
+[{w}]
+type=aor
+max_contacts=3
+remove_existing=no
+qualify_frequency=30""")
     path = C["pjsip_customers"]
     tmp = path + ".tmp"
     with open(tmp, "w") as f: f.write("\n".join(out) + "\n")
@@ -300,6 +343,7 @@ def daily_main():
             try: os.remove(v["file"])
             except OSError: pass
             con.execute("DELETE FROM voicemails WHERE id=?", (v["id"],))
+        con.execute("UPDATE customers SET web_pass=NULL, web_exp=NULL WHERE web_exp IS NOT NULL AND web_exp < ?", (iso(now()),))
         con.commit(); write_pjsip(con)
 
 # ---------------------------------------------------------------- business phone system
@@ -531,7 +575,8 @@ def agi_main(args):
     mode = args[0] if args else ""
     with _lock, db() as con:
         if mode == "out":                 # out <endpoint> <dest>
-            user, dest = args[1], digits(args[2])
+            user, dest = base_user(args[1]), digits(args[2])
+            a.set("GS_BASE", user)
             cust = con.execute("SELECT * FROM customers WHERE sip_user=?", (user,)).fetchone()
             ok, reason, maxsec = check_outbound(con, cust, dest)
             a.set("GS_OK", "1" if ok else "0"); a.set("GS_REASON", reason)
@@ -543,7 +588,7 @@ def agi_main(args):
             else:
                 event(con, user, "blocked_out", f"{reason} {dest}")
         elif mode == "e911":              # e911 <endpoint>
-            cust = con.execute("SELECT * FROM customers WHERE sip_user=?", (args[1],)).fetchone()
+            cust = con.execute("SELECT * FROM customers WHERE sip_user=?", (base_user(args[1]),)).fetchone()
             if cust and not cust["did"] and co_of(con, cust):
                 cust = con.execute("SELECT * FROM customers WHERE sip_user=?", (co_of(con, cust)["main_user"],)).fetchone()
             ok = bool(cust and cust["e911"] and cust["did"])
@@ -568,6 +613,7 @@ def agi_main(args):
                 else:
                     cur = con.execute("INSERT INTO calls (sip_user, direction, peer, started_at, billsec, result) VALUES (?,?,?,?,0,'ringing')", (cust["sip_user"], "in", caller, iso(now())))
                     a.set("GS_OK", "1"); a.set("GS_USER", cust["sip_user"]); a.set("GS_CALLID", str(cur.lastrowid)); a.set("GS_MAXMS", str(u["remaining"] * 60000))
+                    a.set("GS_DIALS", dials(con, [cust["sip_user"]]))
                     a.set("GS_VMUSER", cust["sip_user"] if (cust["vm_on"] if "vm_on" in cust.keys() else 1) else "")
                     co = co_of(con, cust); mode = ""
                     if co and co["main_user"] == cust["sip_user"] and co["status"] == "active":
@@ -580,19 +626,19 @@ def agi_main(args):
                         a.set("GS_CO", str(co["id"]))
                     a.set("GS_MODE", mode)
             elif C["test_user"] and (not C["company_did"] or did == digits(C["company_did"]) or not did):
-                a.set("GS_OK", "1"); a.set("GS_USER", C["test_user"]); a.set("GS_CALLID", "0"); a.set("GS_MAXMS", str(4 * 3600 * 1000))
+                a.set("GS_OK", "1"); a.set("GS_USER", C["test_user"]); a.set("GS_DIALS", f"PJSIP/{C['test_user']}"); a.set("GS_CALLID", "0"); a.set("GS_MAXMS", str(4 * 3600 * 1000))
             else:
                 a.set("GS_OK", "0"); a.set("GS_REASON", "unknown_number")
                 if not con.execute("SELECT 1 FROM customers WHERE did=?", (did,)).fetchone():
                     event(con, "", "unknown_in", f"to={to_raw[:120]} exten={args[1]} caller={caller}")
         elif mode == "ext":               # ext <endpoint> <3-digit extension> — free calls inside a company
-            me = con.execute("SELECT * FROM customers WHERE sip_user=?", (args[1],)).fetchone()
+            me = con.execute("SELECT * FROM customers WHERE sip_user=?", (base_user(args[1]),)).fetchone()
             co = co_of(con, me)
             tgt = con.execute("SELECT * FROM customers WHERE company_id=? AND ext=? AND status='active'", (co["id"], args[2])).fetchone() if co else None
             ok = bool(tgt and me["status"] == "active" and tgt["sip_user"] != me["sip_user"])
             a.set("GS_OK", "1" if ok else "0")
             if ok:
-                a.set("GS_USER", tgt["sip_user"]); a.set("GS_VMUSER", tgt["sip_user"] if tgt["vm_on"] else "")
+                a.set("GS_USER", tgt["sip_user"]); a.set("GS_DIALS", dials(con, [tgt["sip_user"]])); a.set("GS_VMUSER", tgt["sip_user"] if tgt["vm_on"] else "")
                 a.set("GS_CNAME", (me["display_name"] or f"Ext {me['ext']}").replace('"', "")); a.set("GS_CNUM", me["ext"] or "")
         elif mode == "ivr":               # ivr <company id> <digit | 3-digit ext | t>
             co = company(con, int(args[1] or 0)); key = args[2] if len(args) > 2 else ""
@@ -608,7 +654,7 @@ def agi_main(args):
                     ms = [main] if main else []
                 if not ms: return "invalid", "", ""
                 if typ == "vm": return "vm", "", ms[0]["sip_user"]
-                return "dial", "&".join(f"PJSIP/{m['sip_user']}" for m in ms), ms[0]["sip_user"]
+                return "dial", dials(con, [m["sip_user"] for m in ms]), ms[0]["sip_user"]
             if not co: act = ("invalid", "", "")
             elif key == "t": act = resolve(ivr.get("timeout") or {"type": "ext", "target": None})
             elif len(key) == 3 and key.isdigit():
@@ -863,6 +909,13 @@ def api_route(method, path, q, body):
                 co = co_of(con, c)
                 if co: d["company"] = {"id": co["id"], "name": co["name"], "owner": co["owner_email"] == c["email"], "ext": c["ext"], "main_did": co_main_did(con, co)}
                 return d
+            if sub == "webcreds" and method == "GET":         # computer browser login (website checked the owner)
+                if c["status"] != "active": raise ApiError(403, "line not active")
+                if not c["web_pass"] or not c["web_exp"] or c["web_exp"] < iso(now() + dt.timedelta(hours=2)):
+                    con.execute("UPDATE customers SET web_pass=?, web_exp=? WHERE sip_user=?", (secrets.token_urlsafe(18), iso(now() + dt.timedelta(hours=24)), u))
+                    con.commit(); write_pjsip(con)
+                    c = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
+                return {"sip_user": u + "-web", "sip_pass": c["web_pass"], "domain": C["sip_domain"], "wss": f"wss://{C['sip_domain']}/ws", "expires": c["web_exp"]}
             if sub == "credentials" and method == "GET":     # for the app, after the website verified the signed-in owner
                 return {"sip_user": u, "sip_pass": c["sip_pass"], "sip_server": C["sip_domain"], "did": c["did"]}
             if sub == "number" and method == "POST":

@@ -124,6 +124,12 @@ local_net=10.0.0.0/8
 local_net=172.16.0.0/12
 local_net=192.168.0.0/16
 
+; Calls from a computer browser (WebRTC): wss://$API_DOMAIN/ws → Caddy → Asterisk's local web server
+[transport-ws]
+type=transport
+protocol=ws
+bind=0.0.0.0
+
 EOF
 if [ -s /etc/asterisk/keys/voice.crt ] && [ -s /etc/asterisk/keys/voice.key ]; then cat <<EOF
 ; Encrypted SIP for the GlobaleSIM app (certificate from Caddy / Let's Encrypt)
@@ -247,7 +253,7 @@ exten => _.,1,Set(GS_TO=\${PJSIP_HEADER(read,To)})
  same => n(ok),Set(CHANNEL(hangup_handler_push)=gs-charge,s,1(\${GS_CALLID}))
  same => n,GotoIf(\$["\${GS_MODE}" = "ivr"]?gs-ivr,s,1)
  same => n,GotoIf(\$["\${GS_MODE}" = "closed"]?gs-closed,s,1)
- same => n,Dial(PJSIP/\${GS_USER},25,L(\${GS_MAXMS}))
+ same => n,Dial(\${GS_DIALS},25,L(\${GS_MAXMS}))
  same => n,Goto(gs-vm,s,1)
 
 ; ===== Business phone system =====
@@ -323,7 +329,7 @@ exten => _[1-8]XX,1,AGI(gs-agi.py,ext,\${CHANNEL(endpoint)},\${EXTEN})
  same => n,Hangup()
  same => n(ok),Set(CALLERID(name)=\${GS_CNAME})
  same => n,Set(CALLERID(num)=\${GS_CNUM})
- same => n,Dial(PJSIP/\${GS_USER},25)
+ same => n,Dial(\${GS_DIALS},25)
  same => n,Set(GS_SKIPINTRO=0)
  same => n,Goto(gs-vm,s,1)
 ; 911: only lines whose 911 address is registered at Telnyx; caller ID = their own number (so the address shows)
@@ -340,8 +346,8 @@ exten => _1NXXNXXXXXX,1,GotoIf(\$[\${REGEX("^(900|976)" \${EXTEN:1:3})}]?blocked
  same => n,Set(GS_EP=\${CHANNEL(endpoint)})
  same => n,AGI(gs-agi.py,out,\${GS_EP},\${EXTEN})
  same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok:blocked)
- same => n(ok),Set(GROUP(gsuser)=\${GS_EP})
- same => n,GotoIf(\$[\${GROUP_COUNT(\${GS_EP}@gsuser)} > 1]?blocked)
+ same => n(ok),Set(GROUP(gsuser)=\${GS_BASE})
+ same => n,GotoIf(\$[\${GROUP_COUNT(\${GS_BASE}@gsuser)} > 1]?blocked)
  same => n,GotoIf(\$["\${GS_CO}" = ""]?go)
  same => n,Set(GROUP(gsco)=\${GS_CO})
  same => n,GotoIf(\$[\${GROUP_COUNT(\${GS_CO}@gsco)} > \${GS_COMAX}]?blocked)
@@ -443,6 +449,14 @@ cat > "$AGIDIR/gs-agi.py" <<'EOF'
 import sys; sys.path.insert(0, "/opt/gsvoice"); import gsvoice; gsvoice.agi_main(sys.argv[1:])
 EOF
 chmod 755 "$AGIDIR/gs-agi.py"
+# Asterisk's built-in web server, local only — Caddy passes browser calls (wss://…/ws) to it
+cat > /etc/asterisk/http.conf <<EOF
+[general]
+enabled=yes
+bindaddr=127.0.0.1
+bindport=8088
+EOF
+chown asterisk:asterisk /etc/asterisk/http.conf; chmod 640 /etc/asterisk/http.conf
 # Asterisk manager (local only): lets gsvoice hand incoming texts to the app
 AMI_SECRET=$(jget ami_secret); [ -n "$AMI_SECRET" ] || AMI_SECRET=$(openssl rand -hex 16)
 cat > /etc/asterisk/manager.conf <<EOF
@@ -493,6 +507,9 @@ cat > /etc/caddy/Caddyfile <<EOF
 $API_DOMAIN {
     handle /api/* {
         reverse_proxy 127.0.0.1:8090
+    }
+    handle /ws {
+        reverse_proxy 127.0.0.1:8088
     }
     respond "GlobaleSIM Voice" 200
 }
