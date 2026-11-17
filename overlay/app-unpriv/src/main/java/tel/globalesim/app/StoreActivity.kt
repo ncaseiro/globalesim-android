@@ -170,7 +170,7 @@ class StoreActivity : Activity() {
     /** globalesim://order/<token> → store order page */
     private fun urlFor(i: Intent?): String {
         val d = i?.data ?: return STORE_URL
-        if (d.scheme == "globalesim" && d.host == "phone") return "$STORE_URL?phone"
+        if (d.scheme == "globalesim" && d.host == "phone") return if (i.getBooleanExtra("gs_texts", false)) "$STORE_URL?phone&texts=1" else "$STORE_URL?phone"
         if (d.scheme == "globalesim" && d.host == "order") {
             val token = d.lastPathSegment ?: ""
             if (Regex("^[a-f0-9]{32}$").matches(token)) return "$STORE_URL?order=$token"

@@ -208,6 +208,7 @@ object CallNotif {
     const val CH_LINE = "gs_phone_line"
     const val CH_CALL = "gs_phone_incoming"
     const val CH_MISSED = "gs_phone_missed"
+    const val CH_TEXT = "gs_phone_texts"
     const val ID_LINE = 4101
     const val ID_CALL = 4102
     const val ID_MISSED = 4103
@@ -232,6 +233,10 @@ object CallNotif {
         })
         nm.createNotificationChannel(NotificationChannel(CH_MISSED, "Missed calls", NotificationManager.IMPORTANCE_DEFAULT).apply {
             description = "Calls you didn't answer"
+        })
+        nm.createNotificationChannel(NotificationChannel(CH_TEXT, "Text messages", NotificationManager.IMPORTANCE_HIGH).apply {
+            description = "Texts sent to your GlobaleSIM number"
+            enableVibration(true)
         })
     }
 
@@ -300,6 +305,24 @@ object CallNotif {
 
     fun cancelIncoming(ctx: Context) {
         runCatching { ctx.getSystemService(NotificationManager::class.java)?.cancel(ID_CALL) }
+    }
+
+    /** One notification per sender (a new text from the same person replaces the old one). */
+    fun text(ctx: Context, peer: String, body: String) {
+        val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
+        val open = PendingIntent.getActivity(ctx, 45, phoneIntent(ctx).putExtra("gs_texts", true), FLAGS)
+        runCatching {
+            nm.notify(5000 + (peer.hashCode() and 0xFFF), builder(ctx, CH_TEXT)
+                .setSmallIcon(android.R.drawable.sym_action_chat)
+                .setContentTitle("Text from ${fmt(peer)}")
+                .setContentText(body)
+                .setStyle(Notification.BigTextStyle().bigText(body))
+                .setCategory(Notification.CATEGORY_MESSAGE)
+                .setAutoCancel(true)
+                .setContentIntent(open)
+                .also { if (Build.VERSION.SDK_INT < 26) @Suppress("DEPRECATION") it.setPriority(Notification.PRIORITY_HIGH) }
+                .build())
+        }
     }
 
     fun missed(ctx: Context, peer: String) {

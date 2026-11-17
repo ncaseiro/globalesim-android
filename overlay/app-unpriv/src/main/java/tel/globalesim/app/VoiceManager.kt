@@ -7,6 +7,8 @@ import org.json.JSONObject
 import org.linphone.core.Account
 import org.linphone.core.AudioDevice
 import org.linphone.core.Call
+import org.linphone.core.ChatMessage
+import org.linphone.core.ChatRoom
 import org.linphone.core.Core
 import org.linphone.core.CoreListenerStub
 import org.linphone.core.Factory
@@ -178,6 +180,14 @@ object VoiceManager {
             regMessage = message
             VoiceService.instance?.refresh()
             emit(snapshot())
+        }
+
+        /** Incoming text (receive-only line): notify, and tell the page to refresh its Messages list. */
+        override fun onMessageReceived(core: Core, chatRoom: ChatRoom, message: ChatMessage) {
+            val from = message.fromAddress.username ?: ""
+            val text = message.utf8Text ?: ""
+            if (text.isNotEmpty()) CallNotif.text(app, from, text)
+            emit(JSONObject().put("type", "text").put("from", from).toString())
         }
 
         override fun onCallStateChanged(core: Core, call: Call, state: Call.State?, message: String) {
