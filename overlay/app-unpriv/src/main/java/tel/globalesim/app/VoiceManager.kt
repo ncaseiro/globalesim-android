@@ -35,6 +35,24 @@ object VoiceManager {
     private var regState = "none"
     private var regMessage = ""
 
+    /** True while the store screen is on top (StoreActivity onResume/onPause). */
+    @Volatile var uiVisible = false
+    private var answeredIncoming = false
+    private var declinedIncoming = false
+
+    fun hasLogin(ctx: Context): Boolean =
+        ctx.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("login", null) != null
+
+    fun inCall(): Boolean = (core?.callsNb ?: 0) > 0
+
+    /** Short status for the "phone line" notification. */
+    fun regText(): String = when (regState) {
+        "ok" -> "Ready for calls"
+        "connecting" -> "Connecting…"
+        "failed" -> "Offline — tap to reconnect"
+        else -> "Starting…"
+    }
+
     fun init(ctx: Context) = onMain {
         if (core != null) return@onMain
         app = ctx.applicationContext
@@ -45,6 +63,9 @@ object VoiceManager {
         c.isVideoDisplayEnabled = false
         c.mediaEncryption = MediaEncryption.SRTP
         c.isMediaEncryptionMandatory = true
+        c.isKeepAliveEnabled = true          // keeps the connection open so calls reach a closed app
+        c.isNativeRingingEnabled = false     // Ringer plays the phone's own ringtone + vibration
+        c.ring = null
         c.addListener(coreListener)
         c.start()
         core = c
@@ -58,6 +79,7 @@ object VoiceManager {
         val o = JSONObject(json)
         app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("login", o.toString()).apply()
         applyLogin(o)
+        VoiceService.start(app)
     }
 
     fun logout() = onMain {
@@ -68,6 +90,7 @@ object VoiceManager {
             c.clearAllAuthInfo()
         }
         regState = "none"; emit(snapshot())
+        Ringer.stop(); CallNotif.cancelIncoming(app); VoiceService.stop(app)
     }
 
     private fun applyLogin(o: JSONObject) {
@@ -104,8 +127,16 @@ object VoiceManager {
         c.inviteAddressWithParams(addr, params)
     }
 
-    fun answer() = onMain { core?.currentCall?.accept() ?: core?.calls?.firstOrNull()?.accept() }
-    fun decline() = onMain { (core?.currentCall ?: core?.calls?.firstOrNull())?.decline(Reason.Declined) }
+    fun answer() = onMain {
+        Ringer.stop(); CallNotif.cancelIncoming(app)
+        val c = core ?: return@onMain
+        (c.calls.firstOrNull { it.state == Call.State.IncomingReceived || it.state == Call.State.IncomingEarlyMedia } ?: c.currentCall)?.accept()
+    }
+    fun decline() = onMain {
+        Ringer.stop(); CallNotif.cancelIncoming(app)
+        declinedIncoming = true
+        (core?.currentCall ?: core?.calls?.firstOrNull())?.decline(Reason.Declined)
+    }
     fun hangup() = onMain { (core?.currentCall ?: core?.calls?.firstOrNull())?.terminate() }
     fun dtmf(digit: String) = onMain { digit.firstOrNull()?.let { core?.currentCall?.sendDtmf(it) } }
     fun mute(on: Boolean) = onMain { core?.isMicEnabled = !on; emit(snapshot()) }
@@ -145,18 +176,34 @@ object VoiceManager {
                 else -> state?.name?.lowercase() ?: "none"
             }
             regMessage = message
+            VoiceService.instance?.refresh()
             emit(snapshot())
         }
 
         override fun onCallStateChanged(core: Core, call: Call, state: Call.State?, message: String) {
-            if (state == Call.State.IncomingReceived) {
-                // bring the app up so the customer can answer
-                runCatching {
-                    val i = android.content.Intent(app, StoreActivity::class.java)
-                        .setData(android.net.Uri.parse("globalesim://phone"))
-                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                    app.startActivity(i)
+            val peer = call.remoteAddress.username ?: ""
+            when (state) {
+                Call.State.IncomingReceived -> {
+                    answeredIncoming = false; declinedIncoming = false
+                    // ring + vibrate like a normal phone, and show the call over the lock screen
+                    Ringer.start(app)
+                    CallNotif.incoming(app, peer)
+                    if (uiVisible) runCatching { app.startActivity(CallNotif.phoneIntent(app)) }
                 }
+                Call.State.Connected, Call.State.StreamsRunning -> {
+                    Ringer.stop(); CallNotif.cancelIncoming(app)
+                    if (call.dir == Call.Dir.Incoming) answeredIncoming = true
+                    VoiceService.instance?.foreground(true)
+                }
+                Call.State.OutgoingInit -> VoiceService.instance?.foreground(true)
+                Call.State.End, Call.State.Error, Call.State.Released -> {
+                    Ringer.stop(); CallNotif.cancelIncoming(app)
+                    if (state != Call.State.Released && call.dir == Call.Dir.Incoming && !answeredIncoming && !declinedIncoming)
+                        CallNotif.missed(app, peer)
+                    if (state == Call.State.Released) { answeredIncoming = false; declinedIncoming = false }
+                    if (core.callsNb == 0) VoiceService.instance?.foreground(false)
+                }
+                else -> {}
             }
             if (state == Call.State.StreamsRunning && core.currentCall?.outputAudioDevice == null) {
                 core.audioDevices.firstOrNull { it.type == AudioDevice.Type.Earpiece }?.let { call.outputAudioDevice = it }

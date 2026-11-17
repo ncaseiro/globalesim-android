@@ -269,9 +269,31 @@ val LocalProfileInfo.displayProvider: String
         g = g[:m.end()] + f'\n    implementation("org.linphone.no-video:linphone-sdk-android:{ver}")' + g[m.end():]
     bg.write_text(g)
     x = mf.read_text()
-    for perm in ("RECORD_AUDIO", "MODIFY_AUDIO_SETTINGS", "BLUETOOTH_CONNECT", "WAKE_LOCK"):
+    for perm in ("RECORD_AUDIO", "MODIFY_AUDIO_SETTINGS", "BLUETOOTH_CONNECT", "WAKE_LOCK",
+                 # ring with the app closed: background line, notifications, lock-screen call screen
+                 "POST_NOTIFICATIONS", "FOREGROUND_SERVICE", "FOREGROUND_SERVICE_SPECIAL_USE", "FOREGROUND_SERVICE_MICROPHONE",
+                 "RECEIVE_BOOT_COMPLETED", "VIBRATE", "USE_FULL_SCREEN_INTENT", "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"):
         if f"android.permission.{perm}" not in x:
             x = x.replace("<application", f'<uses-permission android:name="android.permission.{perm}" />\n    <application', 1)
+    if "tel.globalesim.app.VoiceService" not in x:
+        comps = """
+        <service
+            android:name="tel.globalesim.app.VoiceService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse|microphone">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the customer's GlobaleSIM Phone (VoIP) line registered so incoming calls ring while the app is closed" />
+        </service>
+        <receiver android:name="tel.globalesim.app.VoiceBootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+        <receiver android:name="tel.globalesim.app.CallActionReceiver" android:exported="false" />
+"""
+        x = x.replace("</application>", comps + "\n    </application>", 1)
     if 'android:host="phone"' not in x:
         x = x.replace('<data android:scheme="globalesim" android:host="order" />',
                       '<data android:scheme="globalesim" android:host="order" />\n                <data android:scheme="globalesim" android:host="phone" />', 1)
