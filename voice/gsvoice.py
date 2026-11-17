@@ -28,6 +28,10 @@ DEFAULTS = {
     "data_dir": "/var/lib/gsvoice", "tts_cmd": "espeak-ng",
     # natural voices (Piper, runs on this server); the installer downloads the models into piper_dir/voices
     "piper_dir": "/opt/piper",
+    # Master shutoff for outgoing calls (all lines together). Tripping it pauses outgoing calls only and emails you.
+    "guard": {"out_minutes_hour": 900, "out_minutes_day": 6000, "out_calls_10min": 150, "concurrent": 40, "new_lines_day": 25},
+    "low_balance": 20,                 # email when the Telnyx balance drops below this (USD)
+    "alert_kinds": ["auto_suspend", "guard_trip", "e911_failed", "release_failed", "low_balance", "line_flood"],
     "topup_minutes": 300,
     "limits": {"new_calls_per_10min": 5, "calls_per_day": 100, "new_account_days": 7, "new_account_minutes": 100,
                "robocall_window_min": 30, "robocall_calls": 8, "robocall_short_sec": 15, "robocall_short_calls": 6},
@@ -78,6 +82,7 @@ def db():
     CREATE TABLE IF NOT EXISTS voicemails (id INTEGER PRIMARY KEY, sip_user TEXT, company_id INTEGER, caller TEXT, file TEXT, secs INTEGER,
         created_at TEXT, heard INTEGER DEFAULT 0);
     CREATE INDEX IF NOT EXISTS vm_user ON voicemails(sip_user, id);
+    CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT);
     CREATE UNIQUE INDEX IF NOT EXISTS customers_did ON customers(did) WHERE did IS NOT NULL AND did <> '';
     """)
     cols = {r[1] for r in con.execute("PRAGMA table_info(customers)")}
@@ -168,9 +173,37 @@ def usage(con, cust, t=None):
 def event(con, user, kind, detail=""):
     con.execute("INSERT INTO events (sip_user, ts, kind, detail) VALUES (?,?,?,?)", (user, iso(now()), kind, detail))
 
+def setting(con, k, default=""):
+    r = con.execute("SELECT v FROM settings WHERE k=?", (k,)).fetchone()
+    return r["v"] if r else default
+
+def set_setting(con, k, v):
+    con.execute("INSERT INTO settings (k, v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
+
+def guard_metrics(con, t=None):
+    t = t or now()
+    one = lambda q, *a: con.execute(q, a).fetchone()[0] or 0
+    return {"out_minutes_hour": one("SELECT SUM(minutes) FROM calls WHERE direction='out' AND started_at>=?", iso(t - dt.timedelta(hours=1))),
+            "out_minutes_day": one("SELECT SUM(minutes) FROM calls WHERE direction='out' AND started_at>=?", iso(t - dt.timedelta(days=1))),
+            "out_calls_10min": one("SELECT COUNT(*) FROM calls WHERE direction='out' AND started_at>=?", iso(t - dt.timedelta(minutes=10))),
+            "new_lines_day": one("SELECT COUNT(*) FROM customers WHERE created_at>=?", iso(t - dt.timedelta(days=1)))}
+
+def guard_check(con):
+    """Master shutoff: True if outgoing calls may proceed. Trips (and stays tripped) when any limit is passed."""
+    if setting(con, "out_paused") == "1": return False
+    m, G = guard_metrics(con), C["guard"]
+    over = [f"{k} {m[k]} > {G[k]}" for k in ("out_minutes_hour", "out_minutes_day", "out_calls_10min") if m[k] > G[k]]
+    if over:
+        set_setting(con, "out_paused", "1"); set_setting(con, "out_paused_reason", "; ".join(over)); set_setting(con, "out_paused_at", iso(now()))
+        event(con, "", "guard_trip", "Outgoing calls paused: " + "; ".join(over))
+        con.commit()
+        return False
+    return True
+
 def check_outbound(con, cust, dest):
     """Returns (ok, reason, max_seconds)."""
     if cust is None: return False, "unknown", 0
+    if not guard_check(con): return False, "paused_all", 0
     if cust["status"] != "active": return False, "suspended", 0
     co = co_of(con, cust)
     if not cust["did"] and not (co and co_main_did(con, co)): return False, "no_number", 0
@@ -551,6 +584,92 @@ def sms_in(payload):
     if active and ami_message(user, frm, text):
         with _lock, db() as con: con.execute("UPDATE texts SET delivered=1 WHERE id=?", (tid,)); con.commit()
 
+# ---------------------------------------------------------------- alerts + daily security report
+def alert_loop():
+    """Every minute: email new alert events to the owner (via the website), at most one per kind per 30 min; check the Telnyx balance."""
+    last_bal = 0
+    try:
+        with _lock, db() as con:     # very first start: begin after the existing history (don't email old events)
+            if not setting(con, "alert_last_id"):
+                set_setting(con, "alert_last_id", con.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]); con.commit()
+    except Exception: pass
+    while True:
+        time.sleep(60)
+        try:
+            with _lock, db() as con:
+                last = int(setting(con, "alert_last_id", "0") or 0)
+                kinds = C["alert_kinds"]
+                rows = con.execute(f"SELECT * FROM events WHERE id>? AND kind IN ({','.join('?' * len(kinds))}) ORDER BY id LIMIT 100", (last, *kinds)).fetchall()
+                top = con.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
+                set_setting(con, "alert_last_id", top); con.commit()
+                send = {}
+                for r in rows:
+                    if setting(con, "alert_ts_" + r["kind"]) > iso(now() - dt.timedelta(minutes=30)): continue
+                    send.setdefault(r["kind"], []).append(r)
+                for k, rs in send.items():
+                    set_setting(con, "alert_ts_" + k, iso(now()))
+                con.commit()
+            for k, rs in send.items():
+                lines = [f"{r['ts']} UTC  {r['sip_user'] or '-'}  {r['detail']}" for r in rs[:20]]
+                notify_site("alert", {"subject": ALERT_TITLES.get(k, k), "text": "\n".join(lines) + "\n\n" + ALERT_HELP.get(k, "")})
+            if time.time() - last_bal > 1800 and C["telnyx_api_key"]:
+                last_bal = time.time()
+                try:
+                    b = (telnyx("GET", "/balance").get("data") or {})
+                    bal = float(b.get("available_credit") or b.get("balance") or 0)
+                    if bal < float(C["low_balance"]):
+                        with _lock, db() as con:
+                            if setting(con, "alert_ts_low_balance") < iso(now() - dt.timedelta(hours=12)):
+                                event(con, "", "low_balance", f"Telnyx balance ${bal:.2f}"); con.commit()
+                except ApiError: pass
+        except Exception as e:
+            sys.stderr.write("alert loop %r\n" % e)
+
+ALERT_TITLES = {"auto_suspend": "ALERT: a line was paused for robocall-like calling", "guard_trip": "ALERT: all outgoing calls paused (master shutoff)",
+                "e911_failed": "ALERT: a 911 address was not accepted", "release_failed": "ALERT: a number could not be released",
+                "low_balance": "ALERT: Telnyx balance is low", "line_flood": "ALERT: unusual number of new lines"}
+ALERT_HELP = {"auto_suspend": "The line can't call out until you activate it in /shop-admin → Phone lines. Check its recent calls first.",
+              "guard_trip": "Incoming calls still work. If this was real traffic, raise the limits; if not, find the line in /shop-admin and pause it. Turn outgoing calls back on in /shop-admin → Phone lines.",
+              "e911_failed": "Fix the customer's 911 address (contact them), then retry.",
+              "low_balance": "Add funds at Telnyx, or calls and number purchases will stop.",
+              "line_flood": "Many new lines in 24 hours. Check that they are real customers."}
+
+def report_main():
+    """Daily security report → emailed to the owner by the website."""
+    with _lock, db() as con:
+        t = now(); day = iso(t - dt.timedelta(days=1)); one = lambda q, *a: con.execute(q, a).fetchone()[0] or 0
+        outc, outm = one("SELECT COUNT(*) FROM calls WHERE direction='out' AND started_at>=?", day), one("SELECT SUM(minutes) FROM calls WHERE direction='out' AND started_at>=?", day)
+        inc, inm = one("SELECT COUNT(*) FROM calls WHERE direction='in' AND started_at>=?", day), one("SELECT SUM(minutes) FROM calls WHERE direction='in' AND started_at>=?", day)
+        top = con.execute("SELECT c.sip_user, c.email, c.did, SUM(k.minutes) m, COUNT(*) n FROM calls k JOIN customers c ON c.sip_user=k.sip_user WHERE k.started_at>=? GROUP BY c.sip_user ORDER BY m DESC LIMIT 5", (day,)).fetchall()
+        newl = one("SELECT COUNT(*) FROM customers WHERE created_at>=?", day)
+        alerts = con.execute(f"SELECT kind, COUNT(*) n FROM events WHERE ts>=? AND kind IN ({','.join('?' * len(C['alert_kinds']))}) GROUP BY kind", (day, *C["alert_kinds"])).fetchall()
+        blocked = one("SELECT COUNT(*) FROM events WHERE ts>=? AND kind IN ('blocked_out','blocked_in')", day)
+        lines = one("SELECT COUNT(*) FROM customers WHERE status='active' AND did IS NOT NULL")
+        paused = setting(con, "out_paused") == "1"; reason = setting(con, "out_paused_reason")
+    f2b = {}
+    try: f2b = json.load(open(os.path.join(C["data_dir"], "f2b.json")))
+    except Exception: pass
+    bal = "?"
+    try:
+        b = (telnyx("GET", "/balance").get("data") or {}); bal = f"${float(b.get('available_credit') or b.get('balance') or 0):.2f}"
+    except Exception: pass
+    flags = []
+    if paused: flags.append("OUTGOING CALLS ARE PAUSED (master shutoff): " + reason)
+    for a in alerts: flags.append(f"{a['n']} × {ALERT_TITLES.get(a['kind'], a['kind'])}")
+    if f2b.get("failed_24h", 0) > 2000: flags.append(f"Heavy login attacks: {f2b['failed_24h']} failed attempts in 24 h (all blocked)")
+    status = "ALL NORMAL" if not flags else "NEEDS A LOOK"
+    txt = [f"GlobaleSIM Phone — daily security report ({t.strftime('%Y-%m-%d')})", f"Status: {status}", ""]
+    if flags: txt += ["Attention:"] + [" • " + x for x in flags] + [""]
+    txt += [f"Attackers blocked (permanent): {f2b.get('banned', '?')} total, {f2b.get('new_24h', '?')} new in 24 h; failed login attempts 24 h: {f2b.get('failed_24h', '?')}",
+            f"Calls 24 h: {outc} out ({outm} min), {inc} in ({inm} min); calls refused by limits: {blocked}",
+            f"Active lines: {lines}; new lines 24 h: {newl}",
+            f"Telnyx balance: {bal}", "", "Top lines (24 h):"]
+    txt += [f"  {r['did'] or r['sip_user']}  {r['email']}  {r['m']} min / {r['n']} calls" for r in top] or ["  (no calls)"]
+    if newl > C["guard"]["new_lines_day"]:
+        with _lock, db() as con: event(con, "", "line_flood", f"{newl} new lines in 24 h"); con.commit()
+    notify_site("report", {"subject": f"GlobaleSIM security report — {status}", "text": "\n".join(txt)})
+    print("\n".join(txt))
+
 def sms_retry_loop():
     """Every minute: re-send texts the app missed while offline (last 24 h, up to 30 tries)."""
     while True:
@@ -629,6 +748,7 @@ def agi_main(args):
                 cur = con.execute("INSERT INTO calls (sip_user, direction, peer, started_at, billsec, result) VALUES (?,?,?,?,0,'dialing')", (user, "out", dest, iso(now())))
                 a.set("GS_CALLID", str(cur.lastrowid)); a.set("GS_CID", "+" + (cust["did"] or co_main_did(con, co))); a.set("GS_MAXMS", str(int(maxsec * 1000)))
                 a.set("GS_CO", f"co{co['id']}" if co else ""); a.set("GS_COMAX", str(max(2, len(co_members(con, co["id"], True)))) if co else "0")
+                a.set("GS_GMAX", str(C["guard"]["concurrent"]))
             else:
                 event(con, user, "blocked_out", f"{reason} {dest}")
         elif mode == "e911":              # e911 <endpoint>
@@ -819,6 +939,13 @@ def api_route(method, path, q, body):
             rows = con.execute("SELECT * FROM companies WHERE owner_email=? ORDER BY id DESC" if q.get("owner_email") else "SELECT * FROM companies ORDER BY id DESC LIMIT 500",
                                (q["owner_email"].strip().lower(),) if q.get("owner_email") else ()).fetchall()
             return {"companies": [company_json(con, c) for c in rows]}
+        if p == ["guard"]:
+            if method == "POST" and "paused" in body:
+                set_setting(con, "out_paused", "1" if body["paused"] else "0")
+                if not body["paused"]: set_setting(con, "out_paused_reason", "")
+                event(con, "", "guard_set", "paused by admin" if body["paused"] else "resumed by admin"); con.commit()
+            return {"paused": setting(con, "out_paused") == "1", "reason": setting(con, "out_paused_reason"), "since": setting(con, "out_paused_at"),
+                    "metrics": guard_metrics(con), "limits": C["guard"]}
         if p == ["voices"] and method == "GET": return {"voices": voices()}
         if p == ["tts", "preview"] and method == "POST":
             tmp = os.path.join(C["data_dir"], "greet", "preview-" + secrets.token_hex(6))
@@ -993,7 +1120,7 @@ def api_route(method, path, q, body):
                 con.execute("DELETE FROM voicemails WHERE id=?", (v["id"],)); con.commit(); return {"ok": True}
             return {k: v[k] for k in v.keys() if k != "file"}
         if p == ["alerts"]:
-            return {"events": [dict(r) for r in con.execute("SELECT * FROM events WHERE kind IN ('auto_suspend','blocked_out','blocked_in','unknown_in','text_unknown','e911_failed','release_failed','released') ORDER BY id DESC LIMIT 200")]}
+            return {"events": [dict(r) for r in con.execute("SELECT * FROM events WHERE kind IN ('auto_suspend','blocked_out','blocked_in','unknown_in','text_unknown','e911_failed','release_failed','released','guard_trip','guard_set','low_balance','line_flood') ORDER BY id DESC LIMIT 200")]}
         if len(p) >= 2 and p[0] == "customers":
             c = con.execute("SELECT * FROM customers WHERE sip_user=?", (p[1],)).fetchone()
             if not c: raise ApiError(404, "no such customer")
@@ -1094,12 +1221,14 @@ class Handler(BaseHTTPRequestHandler):
 def api_main():
     with db() as con: write_pjsip(con)
     threading.Thread(target=sms_retry_loop, daemon=True).start()
+    threading.Thread(target=alert_loop, daemon=True).start()
     ThreadingHTTPServer((C["api_listen"], int(C["api_port"])), Handler).serve_forever()
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["api"]: api_main()
     elif sys.argv[1:2] == ["agi"]: agi_main(sys.argv[2:])
     elif sys.argv[1:2] == ["daily"]: daily_main()
+    elif sys.argv[1:2] == ["report"]: report_main()
     elif sys.argv[1:2] == ["sms-setup"]: sms_setup(os.environ.get("GSVOICE_CONF", "/etc/gsvoice/gsvoice.json"))
     elif sys.argv[1:2] == ["regen"]:
         with db() as con: write_pjsip(con)

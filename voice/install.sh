@@ -348,6 +348,8 @@ exten => _1NXXNXXXXXX,1,GotoIf(\$[\${REGEX("^(900|976)" \${EXTEN:1:3})}]?blocked
  same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok:blocked)
  same => n(ok),Set(GROUP(gsuser)=\${GS_BASE})
  same => n,GotoIf(\$[\${GROUP_COUNT(\${GS_BASE}@gsuser)} > 1]?blocked)
+ same => n,Set(GROUP(gsall)=out)
+ same => n,GotoIf(\$[\${GROUP_COUNT(out@gsall)} > \${GS_GMAX}]?blocked)
  same => n,GotoIf(\$["\${GS_CO}" = ""]?go)
  same => n,Set(GROUP(gsco)=\${GS_CO})
  same => n,GotoIf(\$[\${GROUP_COUNT(\${GS_CO}@gsco)} > \${GS_COMAX}]?blocked)
@@ -506,6 +508,21 @@ json.dump(c, open(p, "w"), indent=2)
 EOF
 chown -R asterisk:asterisk /opt/gsvoice /var/lib/gsvoice /etc/gsvoice; chmod 640 "$GSJ"; chmod 750 /etc/gsvoice
 echo '41 5 * * * asterisk /usr/bin/python3 /opt/gsvoice/gsvoice.py daily >/dev/null 2>&1' > /etc/cron.d/gsvoice-daily   # releases numbers unpaid 30+ days
+# Security report: root collects fail2ban numbers (only root can), the report itself runs as asterisk and is emailed ~6 AM Central
+cat > /usr/local/bin/gsvoice-f2b <<'EOF'
+#!/bin/bash
+B=$(fail2ban-client status asterisk 2>/dev/null | awk -F: '/Currently banned/{gsub(/ /,"",$2);print $2}')
+N=$(grep -c "Ban " /var/log/fail2ban.log 2>/dev/null); F=$(grep -c "failed for" /var/log/asterisk/fail2ban 2>/dev/null)
+P=/var/lib/gsvoice/f2b.json; O=$(cat $P.prev 2>/dev/null || echo "0 0")
+read ON OF <<< "$O"
+printf '{"banned": %s, "new_24h": %s, "failed_24h": %s}\n' "${B:-0}" "$(( ${N:-0} >= ON ? ${N:-0} - ON : ${N:-0} ))" "$(( ${F:-0} >= OF ? ${F:-0} - OF : ${F:-0} ))" > $P
+echo "${N:-0} ${F:-0}" > $P.prev; chown asterisk:asterisk $P $P.prev
+EOF
+chmod 755 /usr/local/bin/gsvoice-f2b
+cat > /etc/cron.d/gsvoice-report <<'EOF'
+55 11 * * * root /usr/local/bin/gsvoice-f2b
+5 12 * * * asterisk /usr/bin/python3 /opt/gsvoice/gsvoice.py report >/dev/null 2>&1
+EOF
 cat > /etc/systemd/system/gsvoice-api.service <<EOF
 [Unit]
 Description=GlobaleSIM Voice customer API
