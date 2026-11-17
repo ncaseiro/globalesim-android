@@ -12,7 +12,7 @@ PROVIDER=""; DL_SERVER=""; DL_USER=""; DL_PASS=""; DID=""; E911=""; TEST_PASS=""
 say "1/6 Installing Asterisk, firewall and fail2ban (takes 2-4 minutes)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq asterisk asterisk-core-sounds-en-gsm fail2ban ufw curl openssl logrotate cron >/dev/null
+apt-get install -y -qq asterisk asterisk-core-sounds-en-gsm fail2ban ufw curl openssl logrotate cron espeak-ng sox >/dev/null
 PUBIP=${PUBIP:-$(curl -fsS4 ifconfig.me || curl -fsS4 api.ipify.org || true)}
 [ -n "$PUBIP" ] || { echo "Could not detect the public IP. Run: PUBIP=x.x.x.x bash install.sh"; exit 1; }
 echo "Public IP: $PUBIP"
@@ -245,9 +245,63 @@ exten => _.,1,Set(GS_TO=\${PJSIP_HEADER(read,To)})
  same => n,Playback(ss-noservice)
  same => n,Hangup()
  same => n(ok),Set(CHANNEL(hangup_handler_push)=gs-charge,s,1(\${GS_CALLID}))
- same => n,Dial(PJSIP/\${GS_USER},30,L(\${GS_MAXMS}))
- same => n,Playback(vm-nobodyavail)
+ same => n,GotoIf(\$["\${GS_MODE}" = "ivr"]?gs-ivr,s,1)
+ same => n,GotoIf(\$["\${GS_MODE}" = "closed"]?gs-closed,s,1)
+ same => n,Dial(PJSIP/\${GS_USER},25,L(\${GS_MAXMS}))
+ same => n,Goto(gs-vm,s,1)
+
+; ===== Business phone system =====
+; Main menu: "Press 1 for sales…" (greeting made from text, or the company's own); any 3-digit extension works too
+[gs-ivr]
+exten => s,1,Answer()
+ same => n,Set(GS_TRIES=0)
+ same => n(menu),Set(TIMEOUT(digit)=2)
+ same => n,Set(TIMEOUT(response)=6)
+ same => n,Background(\${GS_GREET})
+ same => n,WaitExten(6)
+exten => _X,1,AGI(gs-agi.py,ivr,\${GS_CO},\${EXTEN})
+ same => n,Goto(gs-ivr-act,s,1)
+exten => _XXX,1,AGI(gs-agi.py,ivr,\${GS_CO},\${EXTEN})
+ same => n,Goto(gs-ivr-act,s,1)
+exten => t,1,Set(GS_TRIES=\$[\${GS_TRIES} + 1])
+ same => n,GotoIf(\$[\${GS_TRIES} < 2]?s,menu)
+ same => n,AGI(gs-agi.py,ivr,\${GS_CO},t)
+ same => n,Goto(gs-ivr-act,s,1)
+exten => i,1,Playback(pbx-invalid)
+ same => n,Goto(s,menu)
+
+[gs-ivr-act]
+exten => s,1,GotoIf(\$["\${GS_ACT}" = "repeat"]?gs-ivr,s,menu)
+ same => n,GotoIf(\$["\${GS_ACT}" = "vm"]?gs-vm,s,1)
+ same => n,GotoIf(\$["\${GS_ACT}" = "dial"]?dial)
+ same => n,Playback(pbx-invalid)
+ same => n,Goto(gs-ivr,s,menu)
+ same => n(dial),Dial(\${GS_DIAL},25,L(\${GS_MAXMS}))
+ same => n,Goto(gs-vm,s,1)
+
+; Outside business hours: closed greeting, then voicemail
+[gs-closed]
+exten => s,1,Answer()
+ same => n,GotoIf(\$["\${GS_GREET}" = ""]?vm)
+ same => n,Playback(\${GS_GREET})
+ same => n(vm),Set(GS_SKIPINTRO=1)
+ same => n,Goto(gs-vm,s,1)
+
+; Voicemail: recorded, then the website emails the customer (and it shows in the app)
+[gs-vm]
+exten => s,1,GotoIf(\$["\${GS_VMUSER}" = ""]?none)
+ same => n,Answer()
+ same => n,Set(GS_VMFILE=/var/lib/gsvoice/vm/\${GS_VMUSER}-\${EPOCH}-\${RAND(1000,9999)})
+ same => n,Set(CHANNEL(hangup_handler_push)=gs-vmsave,s,1(\${GS_VMUSER},\${GS_VMFILE},\${CALLERID(num)}))
+ same => n,ExecIf(\$["\${GS_SKIPINTRO}" != "1"]?Playback(vm-intro))
+ same => n,Record(\${GS_VMFILE}.wav,3,180,k)
  same => n,Hangup()
+ same => n(none),Playback(vm-nobodyavail)
+ same => n,Hangup()
+
+[gs-vmsave]
+exten => s,1,AGI(gs-agi.py,vmsave,\${ARG1},\${ARG2},\${ARG3})
+ same => n,Return()
 
 ; After every customer call: charge the minutes (rounded up) and run the robocall check
 [gs-charge]
@@ -262,6 +316,16 @@ exten => _.,1,Hangup()
 ; Checked by gsvoice before every call: active account, minutes left, max 5 calls / 10 min,
 ; 100 / day, one call at a time; the call is cut off when the minutes run out.
 [from-customer]
+; Calls between extensions of the same company (101-899): free, never leave the server
+exten => _[1-8]XX,1,AGI(gs-agi.py,ext,\${CHANNEL(endpoint)},\${EXTEN})
+ same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok)
+ same => n,Playback(pbx-invalid)
+ same => n,Hangup()
+ same => n(ok),Set(CALLERID(name)=\${GS_CNAME})
+ same => n,Set(CALLERID(num)=\${GS_CNUM})
+ same => n,Dial(PJSIP/\${GS_USER},25)
+ same => n,Set(GS_SKIPINTRO=0)
+ same => n,Goto(gs-vm,s,1)
 ; 911: only lines whose 911 address is registered at Telnyx; caller ID = their own number (so the address shows)
 exten => 911,1,AGI(gs-agi.py,e911,\${CHANNEL(endpoint)})
  same => n,GotoIf(\$["\${GS_OK}" = "1"]?go)
@@ -278,7 +342,10 @@ exten => _1NXXNXXXXXX,1,GotoIf(\$[\${REGEX("^(900|976)" \${EXTEN:1:3})}]?blocked
  same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok:blocked)
  same => n(ok),Set(GROUP(gsuser)=\${GS_EP})
  same => n,GotoIf(\$[\${GROUP_COUNT(\${GS_EP}@gsuser)} > 1]?blocked)
- same => n,Set(CALLERID(all)=<\${GS_CID}>)
+ same => n,GotoIf(\$["\${GS_CO}" = ""]?go)
+ same => n,Set(GROUP(gsco)=\${GS_CO})
+ same => n,GotoIf(\$[\${GROUP_COUNT(\${GS_CO}@gsco)} > \${GS_COMAX}]?blocked)
+ same => n(go),Set(CALLERID(all)=<\${GS_CID}>)
  same => n,Set(CHANNEL(hangup_handler_push)=gs-charge,s,1(\${GS_CALLID}))
  same => n,Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60,L(\${GS_MAXMS}))
  same => n,Hangup()
@@ -369,7 +436,7 @@ systemctl enable --now fail2ban >/dev/null 2>&1; systemctl restart fail2ban
 say "5b Customer service: accounts, minutes, safety limits, HTTPS API ($API_DOMAIN)"
 GS_REF=${GS_REF:-voice}
 AGIDIR=$(grep -oP '^\s*astagidir\s*=>\s*\K\S+' /etc/asterisk/asterisk.conf 2>/dev/null || true); AGIDIR=${AGIDIR:-/usr/share/asterisk/agi-bin}
-mkdir -p /opt/gsvoice /var/lib/gsvoice "$AGIDIR"
+mkdir -p /opt/gsvoice /var/lib/gsvoice/vm /var/lib/gsvoice/greet "$AGIDIR"
 curl -fsSL "https://raw.githubusercontent.com/ncaseiro/globalesim-android/$GS_REF/voice/gsvoice.py" -o /opt/gsvoice/gsvoice.py.new && python3 -m py_compile /opt/gsvoice/gsvoice.py.new && mv /opt/gsvoice/gsvoice.py.new /opt/gsvoice/gsvoice.py
 cat > "$AGIDIR/gs-agi.py" <<'EOF'
 #!/usr/bin/env python3
@@ -398,6 +465,7 @@ p, dom, key, conn, tok, did, test, ami = sys.argv[1:9]
 try: c = json.load(open(p))
 except Exception: c = {}
 c.update({"sip_domain": dom, "telnyx_api_key": key, "telnyx_connection_id": conn, "api_token": tok, "company_did": did, "test_user": test, "ami_secret": ami})
+c.setdefault("notify_url", "https://globalesim.tel/app.php?api=voice_hook")   # voicemail emails go out from the website
 json.dump(c, open(p, "w"), indent=2)
 EOF
 chown -R asterisk:asterisk /opt/gsvoice /var/lib/gsvoice /etc/gsvoice; chmod 640 "$GSJ"; chmod 750 /etc/gsvoice

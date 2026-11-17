@@ -19,7 +19,13 @@ DEFAULTS = {
     "sip_domain": "voice.globalesim.tel",
     "company_did": "", "test_user": "",
     "telnyx_api_key": "", "telnyx_connection_id": "", "telnyx_api_base": "https://api.telnyx.com/v2",
-    "plans": {"num300": {"name": "GlobaleSIM Number 300", "minutes": 300}, "num1000": {"name": "GlobaleSIM Number 1000", "minutes": 1000}},
+    "plans": {"num300": {"name": "GlobaleSIM Number 300", "minutes": 300}, "num1000": {"name": "GlobaleSIM Number 1000", "minutes": 1000},
+              "biz_ext": {"name": "GlobaleSIM Business extension", "minutes": 1000}},
+    # business lines: busier than personal lines, still capped (per extension)
+    "limits_biz": {"new_calls_per_10min": 20, "calls_per_day": 300},
+    # where voicemail / alerts are reported (app.php?api=voice_hook), with a shared secret
+    "notify_url": "", "notify_token": "",
+    "data_dir": "/var/lib/gsvoice", "tts_cmd": "espeak-ng",
     "topup_minutes": 300,
     "limits": {"new_calls_per_10min": 5, "calls_per_day": 100, "new_account_days": 7, "new_account_minutes": 100,
                "robocall_window_min": 30, "robocall_calls": 8, "robocall_short_sec": 15, "robocall_short_calls": 6},
@@ -64,12 +70,20 @@ def db():
     CREATE TABLE IF NOT EXISTS texts (id INTEGER PRIMARY KEY, sip_user TEXT, did TEXT, peer TEXT, body TEXT, media INTEGER DEFAULT 0,
         received_at TEXT, delivered INTEGER DEFAULT 0, tries INTEGER DEFAULT 0, tx_id TEXT UNIQUE);
     CREATE INDEX IF NOT EXISTS texts_user ON texts(sip_user, id);
+    CREATE TABLE IF NOT EXISTS companies (id INTEGER PRIMARY KEY, name TEXT, owner_email TEXT, main_user TEXT, period_anchor TEXT,
+        status TEXT DEFAULT 'active', note TEXT, created_at TEXT, ivr_json TEXT, hours_json TEXT, greeting TEXT DEFAULT '', sub_ref TEXT, paused_at TEXT);
+    CREATE TABLE IF NOT EXISTS voicemails (id INTEGER PRIMARY KEY, sip_user TEXT, company_id INTEGER, caller TEXT, file TEXT, secs INTEGER,
+        created_at TEXT, heard INTEGER DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS vm_user ON voicemails(sip_user, id);
     CREATE UNIQUE INDEX IF NOT EXISTS customers_did ON customers(did) WHERE did IS NOT NULL AND did <> '';
     """)
     cols = {r[1] for r in con.execute("PRAGMA table_info(customers)")}
     for col, typ in (("phone_id", "TEXT"), ("e911", "INTEGER DEFAULT 0"), ("e911_address_id", "TEXT"), ("e911_json", "TEXT"),
-                     ("paused_at", "TEXT"), ("sub_ref", "TEXT")):
+                     ("paused_at", "TEXT"), ("sub_ref", "TEXT"), ("company_id", "INTEGER"), ("ext", "TEXT"), ("display_name", "TEXT"),
+                     ("vm_on", "INTEGER DEFAULT 1")):
         if col not in cols: con.execute(f"ALTER TABLE customers ADD COLUMN {col} {typ}")
+    if "company_id" not in {r[1] for r in con.execute("PRAGMA table_info(topups)")}:
+        con.execute("ALTER TABLE topups ADD COLUMN company_id INTEGER")
     return con
 
 # ---------------------------------------------------------------- minutes & limits
@@ -87,7 +101,39 @@ def period_start(anchor_iso, t=None):
         s = mk(y, m)
     return max(s, a)
 
+def company(con, cid):
+    return con.execute("SELECT * FROM companies WHERE id=?", (cid,)).fetchone() if cid else None
+
+def co_of(con, cust):
+    return company(con, cust["company_id"]) if cust is not None and "company_id" in cust.keys() and cust["company_id"] else None
+
+def co_members(con, cid, active_only=False):
+    return con.execute("SELECT * FROM customers WHERE company_id=? AND status " + ("='active'" if active_only else "<>'canceled'") + " ORDER BY ext", (cid,)).fetchall()
+
+def co_main_did(con, co):
+    r = con.execute("SELECT did FROM customers WHERE sip_user=?", (co["main_user"],)).fetchone() if co else None
+    return r["did"] if r and r["did"] else ""
+
+def company_usage(con, co, t=None):
+    """One shared pool: every extension's included minutes + the company's packs, used by everyone."""
+    t = t or now()
+    ps = period_start(co["period_anchor"], t).isoformat()
+    members = co_members(con, co["id"])
+    users = [m["sip_user"] for m in members]
+    used = con.execute(f"SELECT COALESCE(SUM(minutes),0) FROM calls WHERE started_at>=? AND sip_user IN ({','.join('?' * len(users))})",
+                       (ps, *users)).fetchone()[0] if users else 0
+    extra = con.execute("SELECT COALESCE(SUM(minutes),0) FROM topups WHERE company_id=? AND period_start=?", (co["id"], ps)).fetchone()[0]
+    included = sum(C["plans"].get(m["plan"], {"minutes": 0})["minutes"] for m in members)
+    L = C["limits"]
+    created = dt.datetime.fromisoformat(co["created_at"]).replace(tzinfo=dt.timezone.utc)
+    new_account = (t - created).days < L["new_account_days"]
+    if new_account: included = min(included, L["new_account_minutes"] * max(1, len(members)))
+    return {"period_start": ps, "included": included, "extra": extra, "used": used, "remaining": max(0, included + extra - used),
+            "new_account_limit": new_account, "pool": True, "extensions": len(members)}
+
 def usage(con, cust, t=None):
+    co = co_of(con, cust)
+    if co: return company_usage(con, co, t)
     t = t or now()
     ps = period_start(cust["period_anchor"], t).isoformat()
     used = con.execute("SELECT COALESCE(SUM(minutes),0) FROM calls WHERE sip_user=? AND started_at>=?", (cust["sip_user"], ps)).fetchone()[0]
@@ -108,10 +154,12 @@ def check_outbound(con, cust, dest):
     """Returns (ok, reason, max_seconds)."""
     if cust is None: return False, "unknown", 0
     if cust["status"] != "active": return False, "suspended", 0
-    if not cust["did"]: return False, "no_number", 0
+    co = co_of(con, cust)
+    if not cust["did"] and not (co and co_main_did(con, co)): return False, "no_number", 0
+    if co and co["status"] != "active": return False, "suspended", 0
     u = usage(con, cust)
     if u["remaining"] <= 0: return False, "no_minutes", 0
-    L = C["limits"]; t = now()
+    L = dict(C["limits"], **(C["limits_biz"] if co else {})); t = now()
     n10 = con.execute("SELECT COUNT(*) FROM calls WHERE sip_user=? AND direction='out' AND started_at>=?", (cust["sip_user"], iso(t - dt.timedelta(minutes=10)))).fetchone()[0]
     if n10 >= L["new_calls_per_10min"]: return False, "rate_10min", 0
     nday = con.execute("SELECT COUNT(*) FROM calls WHERE sip_user=? AND direction='out' AND started_at>=?", (cust["sip_user"], iso(t - dt.timedelta(days=1)))).fetchone()[0]
@@ -134,6 +182,7 @@ def write_pjsip(con):
     out = ["; generated by gsvoice.py — do not edit by hand"]
     for c in con.execute("SELECT * FROM customers WHERE status='active' ORDER BY sip_user"):
         u = c["sip_user"]
+        cid_num = c["did"] or co_main_did(con, co_of(con, c)) or "0"
         out.append(f"""
 [{u}]
 type=endpoint
@@ -151,7 +200,7 @@ dtmf_mode=rfc4733
 device_state_busy_at=1
 media_encryption=sdes
 media_encryption_optimistic=no
-callerid=<{c['did'] or '0'}>
+callerid=<{cid_num}>
 
 [{u}-auth]
 type=auth
@@ -242,7 +291,122 @@ def daily_main():
         cutoff = iso(now() - dt.timedelta(days=30))
         for c in con.execute("SELECT * FROM customers WHERE status='suspended' AND note LIKE 'unpaid%' AND paused_at IS NOT NULL AND paused_at < ?", (cutoff,)).fetchall():
             release_number(con, c, "released after 30 days unpaid")
+        for co in con.execute("SELECT * FROM companies WHERE status='suspended' AND note LIKE 'unpaid%' AND paused_at IS NOT NULL AND paused_at < ?", (cutoff,)).fetchall():
+            for m in co_members(con, co["id"]):
+                if m["did"]: release_number(con, m, "company released after 30 days unpaid")
+                con.execute("UPDATE customers SET status='canceled' WHERE sip_user=?", (m["sip_user"],))
+            con.execute("UPDATE companies SET status='canceled' WHERE id=?", (co["id"],))
+        for v in con.execute("SELECT * FROM voicemails WHERE created_at < ?", (iso(now() - dt.timedelta(days=60)),)).fetchall():
+            try: os.remove(v["file"])
+            except OSError: pass
+            con.execute("DELETE FROM voicemails WHERE id=?", (v["id"],))
         con.commit(); write_pjsip(con)
+
+# ---------------------------------------------------------------- business phone system
+DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+def biz_closed(co, t=None):
+    """hours_json = {"tz":"America/Chicago","days":{"mon":["09:00","17:00"],...}} — a day missing = closed all day."""
+    h = json.loads(co["hours_json"] or "{}")
+    if not h.get("enabled"): return False
+    try:
+        from zoneinfo import ZoneInfo
+        lt = (t or now()).astimezone(ZoneInfo(h.get("tz") or "America/Chicago"))
+    except Exception:
+        lt = (t or now())
+    span = (h.get("days") or {}).get(DAYS[lt.weekday()])
+    if not span or len(span) != 2: return True
+    hm = lt.strftime("%H:%M")
+    return not (span[0] <= hm < span[1])
+
+def greet_file(co_id, kind):
+    return os.path.join(C["data_dir"], "greet", f"co{co_id}-{kind}")
+
+def tts(text, path_noext, lang="en"):
+    """Text → 8 kHz mono WAV that Asterisk plays (espeak-ng + sox). Returns True on success."""
+    voice = {"en": "en-us+f3", "pt": "pt-br+f3", "es": "es-419+f3", "fr": "fr-fr+f3"}.get(lang, "en-us+f3")
+    os.makedirs(os.path.dirname(path_noext), exist_ok=True)
+    raw = path_noext + ".tts.wav"
+    try:
+        subprocess.run([C["tts_cmd"], "-v", voice, "-s", "150", "-w", raw, text[:1500]], check=True, timeout=30, capture_output=True)
+        subprocess.run(["sox", raw, "-r", "8000", "-c", "1", "-b", "16", path_noext + ".wav"], check=True, timeout=30, capture_output=True)
+        return True
+    except Exception as e:
+        sys.stderr.write("tts %r\n" % e); return False
+    finally:
+        try: os.remove(raw)
+        except OSError: pass
+
+def default_greeting(co, ivr):
+    parts = [f"Thank you for calling {co['name']}."]
+    for d in sorted((ivr.get("options") or {}).keys()):
+        lab = (ivr["options"][d].get("label") or "").strip()
+        if lab: parts.append(f"For {lab}, press {d}.")
+    parts.append("If you know your party's extension, you may dial it at any time.")
+    return " ".join(parts)
+
+def notify_site(kind, data):
+    if not C["notify_url"]: return
+    try:
+        req = urllib.request.Request(C["notify_url"], data=json.dumps(dict(data, kind=kind)).encode(), method="POST",
+                                     headers={"Content-Type": "application/json", "X-GS-Token": C["notify_token"] or C["api_token"]})
+        urllib.request.urlopen(req, timeout=6).read()
+    except Exception as e:
+        sys.stderr.write("notify %s %r\n" % (kind, e))
+
+def member_json(con, m):
+    d = {k: m[k] for k in ("sip_user", "email", "did", "ext", "display_name", "status", "note", "created_at", "plan")}
+    d["vm_new"] = con.execute("SELECT COUNT(*) FROM voicemails WHERE sip_user=? AND heard=0", (m["sip_user"],)).fetchone()[0]
+    ps = period_start(company(con, m["company_id"])["period_anchor"]).isoformat()
+    d["used"] = con.execute("SELECT COALESCE(SUM(minutes),0) FROM calls WHERE sip_user=? AND started_at>=?", (m["sip_user"], ps)).fetchone()[0]
+    return d
+
+def company_json(con, co):
+    d = {k: co[k] for k in co.keys()}
+    d["ivr"] = json.loads(co["ivr_json"] or "{}"); d["hours"] = json.loads(co["hours_json"] or "{}")
+    d.pop("ivr_json", None); d.pop("hours_json", None)
+    d["main_did"] = co_main_did(con, co)
+    d["members"] = [member_json(con, m) for m in co_members(con, co["id"])]
+    d["usage"] = company_usage(con, co)
+    d["closed_now"] = biz_closed(co)
+    d["greeting_main"] = os.path.exists(greet_file(co["id"], "main") + ".wav")
+    d["greeting_closed"] = os.path.exists(greet_file(co["id"], "closed") + ".wav")
+    return d
+
+def next_ext(con, cid):
+    used = {m["ext"] for m in con.execute("SELECT ext FROM customers WHERE company_id=?", (cid,))}
+    for n in range(101, 900):
+        if str(n) not in used: return str(n)
+    raise ApiError(409, "no free extension numbers")
+
+def new_member(con, cid, email, name, ext, plan="biz_ext"):
+    user = "c" + secrets.token_hex(5)
+    con.execute("INSERT INTO customers (sip_user, sip_pass, email, plan, period_anchor, created_at, company_id, ext, display_name) VALUES (?,?,?,?,?,?,?,?,?)",
+                (user, secrets.token_urlsafe(18), email.strip().lower(), plan, now().date().isoformat(), iso(now()), cid, ext, (name or "").strip()[:60]))
+    event(con, user, "created", f"company {cid} ext {ext}")
+    return user
+
+def buy_for(con, user, want, area, e911):
+    """Buy a number for a line (fallback in the same area code), receive texts, 911 address."""
+    want = digits(want); want = ("1" + want) if len(want) == 10 else want
+    taken = {r[0] for r in con.execute("SELECT did FROM customers WHERE did IS NOT NULL")}
+    num, pid = telnyx_buy(want, digits(area), taken)
+    con.execute("UPDATE customers SET did=?, phone_id=?, number_id=? WHERE sip_user=?", (num, pid, pid, user))
+    event(con, user, "number", num + (" (picked)" if num == want else f" (wanted {want or 'any'})"))
+    sms_attach(pid)
+    if e911 and e911.get("street") and e911.get("zip"):
+        con.execute("UPDATE customers SET e911_json=? WHERE sip_user=?", (json.dumps(e911), user))
+        try:
+            aid = telnyx_e911(pid, e911)
+            con.execute("UPDATE customers SET e911=1, e911_address_id=? WHERE sip_user=?", (aid, user))
+        except ApiError as e:
+            event(con, user, "e911_failed", e.msg[:200])
+    return num
+
+def save_greeting(con, co, kind, text, lang):
+    ok = tts(text, greet_file(co["id"], kind), lang)
+    if not ok: raise ApiError(500, "could not create the greeting audio")
+    if kind == "main": con.execute("UPDATE companies SET greeting=? WHERE id=?", (text[:1500], co["id"]))
 
 # ---------------------------------------------------------------- texts (receive only)
 import base64, socket
@@ -373,12 +537,16 @@ def agi_main(args):
             ok, reason, maxsec = check_outbound(con, cust, dest)
             a.set("GS_OK", "1" if ok else "0"); a.set("GS_REASON", reason)
             if ok:
+                co = co_of(con, cust)
                 cur = con.execute("INSERT INTO calls (sip_user, direction, peer, started_at, billsec, result) VALUES (?,?,?,?,0,'dialing')", (user, "out", dest, iso(now())))
-                a.set("GS_CALLID", str(cur.lastrowid)); a.set("GS_CID", "+" + cust["did"]); a.set("GS_MAXMS", str(int(maxsec * 1000)))
+                a.set("GS_CALLID", str(cur.lastrowid)); a.set("GS_CID", "+" + (cust["did"] or co_main_did(con, co))); a.set("GS_MAXMS", str(int(maxsec * 1000)))
+                a.set("GS_CO", f"co{co['id']}" if co else ""); a.set("GS_COMAX", str(max(2, len(co_members(con, co["id"], True)))) if co else "0")
             else:
                 event(con, user, "blocked_out", f"{reason} {dest}")
         elif mode == "e911":              # e911 <endpoint>
             cust = con.execute("SELECT * FROM customers WHERE sip_user=?", (args[1],)).fetchone()
+            if cust and not cust["did"] and co_of(con, cust):
+                cust = con.execute("SELECT * FROM customers WHERE sip_user=?", (co_of(con, cust)["main_user"],)).fetchone()
             ok = bool(cust and cust["e911"] and cust["did"])
             a.set("GS_OK", "1" if ok else "0")
             if ok: a.set("GS_CID", "+" + cust["did"])
@@ -401,12 +569,69 @@ def agi_main(args):
                 else:
                     cur = con.execute("INSERT INTO calls (sip_user, direction, peer, started_at, billsec, result) VALUES (?,?,?,?,0,'ringing')", (cust["sip_user"], "in", caller, iso(now())))
                     a.set("GS_OK", "1"); a.set("GS_USER", cust["sip_user"]); a.set("GS_CALLID", str(cur.lastrowid)); a.set("GS_MAXMS", str(u["remaining"] * 60000))
+                    a.set("GS_VMUSER", cust["sip_user"] if (cust["vm_on"] if "vm_on" in cust.keys() else 1) else "")
+                    co = co_of(con, cust); mode = ""
+                    if co and co["main_user"] == cust["sip_user"] and co["status"] == "active":
+                        if biz_closed(co):
+                            mode = "closed"
+                            g = greet_file(co["id"], "closed"); a.set("GS_GREET", g if os.path.exists(g + ".wav") else "")
+                        elif (json.loads(co["ivr_json"] or "{}")).get("enabled"):
+                            mode = "ivr"
+                            g = greet_file(co["id"], "main"); a.set("GS_GREET", g if os.path.exists(g + ".wav") else "beep")
+                        a.set("GS_CO", str(co["id"]))
+                    a.set("GS_MODE", mode)
             elif C["test_user"] and (not C["company_did"] or did == digits(C["company_did"]) or not did):
                 a.set("GS_OK", "1"); a.set("GS_USER", C["test_user"]); a.set("GS_CALLID", "0"); a.set("GS_MAXMS", str(4 * 3600 * 1000))
             else:
                 a.set("GS_OK", "0"); a.set("GS_REASON", "unknown_number")
                 if not con.execute("SELECT 1 FROM customers WHERE did=?", (did,)).fetchone():
                     event(con, "", "unknown_in", f"to={to_raw[:120]} exten={args[1]} caller={caller}")
+        elif mode == "ext":               # ext <endpoint> <3-digit extension> — free calls inside a company
+            me = con.execute("SELECT * FROM customers WHERE sip_user=?", (args[1],)).fetchone()
+            co = co_of(con, me)
+            tgt = con.execute("SELECT * FROM customers WHERE company_id=? AND ext=? AND status='active'", (co["id"], args[2])).fetchone() if co else None
+            ok = bool(tgt and me["status"] == "active" and tgt["sip_user"] != me["sip_user"])
+            a.set("GS_OK", "1" if ok else "0")
+            if ok:
+                a.set("GS_USER", tgt["sip_user"]); a.set("GS_VMUSER", tgt["sip_user"] if tgt["vm_on"] else "")
+                a.set("GS_CNAME", (me["display_name"] or f"Ext {me['ext']}").replace('"', "")); a.set("GS_CNUM", me["ext"] or "")
+        elif mode == "ivr":               # ivr <company id> <digit | 3-digit ext | t>
+            co = company(con, int(args[1] or 0)); key = args[2] if len(args) > 2 else ""
+            ivr = json.loads(co["ivr_json"] or "{}") if co else {}
+            def resolve(opt):
+                typ = (opt or {}).get("type"); tg = (opt or {}).get("target")
+                exts = tg if isinstance(tg, list) else ([tg] if tg else [])
+                ms = [con.execute("SELECT * FROM customers WHERE company_id=? AND ext=? AND status='active'", (co["id"], str(e))).fetchone() for e in exts]
+                ms = [m for m in ms if m]
+                if typ == "repeat": return "repeat", "", ""
+                if not ms:
+                    main = con.execute("SELECT * FROM customers WHERE sip_user=?", (co["main_user"],)).fetchone()
+                    ms = [main] if main else []
+                if not ms: return "invalid", "", ""
+                if typ == "vm": return "vm", "", ms[0]["sip_user"]
+                return "dial", "&".join(f"PJSIP/{m['sip_user']}" for m in ms), ms[0]["sip_user"]
+            if not co: act = ("invalid", "", "")
+            elif key == "t": act = resolve(ivr.get("timeout") or {"type": "ext", "target": None})
+            elif len(key) == 3 and key.isdigit():
+                act = resolve({"type": "ext", "target": key}) if con.execute("SELECT 1 FROM customers WHERE company_id=? AND ext=? AND status='active'", (co["id"], key)).fetchone() else ("invalid", "", "")
+            elif key in (ivr.get("options") or {}): act = resolve(ivr["options"][key])
+            else: act = ("invalid", "", "")
+            a.set("GS_ACT", act[0]); a.set("GS_DIAL", act[1]); a.set("GS_VMUSER", act[2])
+        elif mode == "vmsave":            # vmsave <user> <file without .wav> <caller>
+            user, f = args[1], args[2]; caller = digits(args[3]) if len(args) > 3 else ""
+            path = f + ".wav"
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            secs = max(0, (size - 44) // 16000)
+            if secs < 2:
+                try: os.remove(path)
+                except OSError: pass
+            else:
+                cust = con.execute("SELECT * FROM customers WHERE sip_user=?", (user,)).fetchone()
+                cur = con.execute("INSERT INTO voicemails (sip_user, company_id, caller, file, secs, created_at) VALUES (?,?,?,?,?,?)",
+                                  (user, cust["company_id"] if cust and "company_id" in cust.keys() else None, caller, path, secs, iso(now())))
+                con.commit()
+                if cust: notify_site("voicemail", {"id": cur.lastrowid, "email": cust["email"], "did": cust["did"] or "", "ext": cust["ext"] or "",
+                                                   "caller": caller, "secs": secs, "created_at": iso(now())})
         elif mode == "charge":            # charge <callid> <answered-seconds>
             cid = int(args[1] or 0); secs = int(float(args[2] or 0)) if len(args) > 2 and args[2] else 0
             if cid:
@@ -500,6 +725,130 @@ def api_route(method, path, q, body):
             con.commit(); write_pjsip(con)
             c = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
             return dict(cust_json(con, c), picked=(num == want))
+        # ---------------- business accounts ----------------
+        if p == ["companies"] and method == "GET":
+            rows = con.execute("SELECT * FROM companies WHERE owner_email=? ORDER BY id DESC" if q.get("owner_email") else "SELECT * FROM companies ORDER BY id DESC LIMIT 500",
+                               (q["owner_email"].strip().lower(),) if q.get("owner_email") else ()).fetchall()
+            return {"companies": [company_json(con, c) for c in rows]}
+        if p == ["companies", "provision"] and method == "POST":
+            # after payment: company + owner as extension 101 + main number (chosen, or same area code) + 911 address
+            email = (body.get("owner_email") or "").strip().lower(); name = (body.get("name") or "").strip()[:80]; ref = str(body.get("ref", ""))[:80]
+            if "@" not in email or not name: raise ApiError(400, "owner_email and name required")
+            if ref:
+                done = con.execute("SELECT * FROM companies WHERE sub_ref=?", (ref,)).fetchone()
+                if done and co_main_did(con, done): return dict(company_json(con, done), already=True)
+            co = con.execute("SELECT * FROM companies WHERE sub_ref=?", (ref,)).fetchone() if ref else None
+            if not co:
+                cur = con.execute("INSERT INTO companies (name, owner_email, period_anchor, created_at, sub_ref, ivr_json, hours_json) VALUES (?,?,?,?,?,?,?)",
+                                  (name, email, now().date().isoformat(), iso(now()), ref or None, "{}", "{}"))
+                cid = cur.lastrowid
+                owner = new_member(con, cid, email, body.get("owner_name") or "Main", "101")
+                con.execute("UPDATE companies SET main_user=? WHERE id=?", (owner, cid))
+                for x in (body.get("extensions") or [])[:50]:
+                    if "@" in (x.get("email") or ""): new_member(con, cid, x["email"], x.get("name"), next_ext(con, cid))
+                con.commit()
+                co = company(con, cid)
+            buy_for(con, co["main_user"], body.get("phone_number"), body.get("area_code"), body.get("e911") or {})
+            con.commit(); write_pjsip(con)
+            return company_json(con, company(con, co["id"]))
+        if p and p[0] == "companies" and len(p) >= 2 and p[1].isdigit():
+            co = company(con, int(p[1]))
+            if not co: raise ApiError(404, "no such company")
+            cid = co["id"]; sub = p[2] if len(p) > 2 else ""
+            if sub == "" and method == "GET": return company_json(con, co)
+            if sub == "extensions" and method == "POST" and len(p) == 3:
+                email = (body.get("email") or "").strip().lower()
+                if "@" not in email: raise ApiError(400, "email required")
+                if con.execute("SELECT 1 FROM customers WHERE company_id=? AND email=? AND status<>'canceled'", (cid, email)).fetchone(): raise ApiError(409, "that email already has an extension")
+                ext = str(body.get("ext") or "") or next_ext(con, cid)
+                if not re.fullmatch(r"[1-8]\d\d", ext) or con.execute("SELECT 1 FROM customers WHERE company_id=? AND ext=? AND status<>'canceled'", (cid, ext)).fetchone():
+                    raise ApiError(409, "extension number taken or invalid (101-899)")
+                user = new_member(con, cid, email, body.get("name"), ext)
+                con.commit()
+                if body.get("buy_number"):
+                    main = con.execute("SELECT * FROM customers WHERE sip_user=?", (co["main_user"],)).fetchone()
+                    buy_for(con, user, body.get("phone_number"), body.get("area_code") or (main["did"] or "")[1:4], json.loads(main["e911_json"] or "{}") if main else {})
+                con.commit(); write_pjsip(con)
+                return company_json(con, company(con, cid))
+            if sub == "extensions" and len(p) == 5 and method == "POST":
+                m = con.execute("SELECT * FROM customers WHERE company_id=? AND sip_user=?", (cid, p[3])).fetchone()
+                if not m: raise ApiError(404, "no such extension")
+                if p[4] == "remove":
+                    if m["sip_user"] == co["main_user"]: raise ApiError(409, "the main line can't be removed")
+                    if m["did"]: release_number(con, m, "extension removed")
+                    con.execute("UPDATE customers SET status='canceled', note='extension removed' WHERE sip_user=?", (m["sip_user"],))
+                elif p[4] == "number":                      # give an extension its own direct number
+                    if m["did"]: raise ApiError(409, "this extension already has a number")
+                    main = con.execute("SELECT * FROM customers WHERE sip_user=?", (co["main_user"],)).fetchone()
+                    con.commit()
+                    buy_for(con, m["sip_user"], body.get("phone_number"), body.get("area_code") or ((main["did"] or "")[1:4] if main else ""), json.loads((main["e911_json"] if main else None) or "{}"))
+                elif p[4] == "update":
+                    if "name" in body: con.execute("UPDATE customers SET display_name=? WHERE sip_user=?", (str(body["name"])[:60], m["sip_user"]))
+                    if "vm_on" in body: con.execute("UPDATE customers SET vm_on=? WHERE sip_user=?", (1 if body["vm_on"] else 0, m["sip_user"]))
+                    if body.get("ext") and body["ext"] != m["ext"]:
+                        if not re.fullmatch(r"[1-8]\d\d", str(body["ext"])) or con.execute("SELECT 1 FROM customers WHERE company_id=? AND ext=? AND status<>'canceled'", (cid, str(body["ext"]))).fetchone():
+                            raise ApiError(409, "extension number taken or invalid (101-899)")
+                        con.execute("UPDATE customers SET ext=? WHERE sip_user=?", (str(body["ext"]), m["sip_user"]))
+                else: raise ApiError(404, "not found")
+                con.commit(); write_pjsip(con)
+                return company_json(con, company(con, cid))
+            if sub == "ivr" and method == "POST":
+                ivr = {"enabled": bool(body.get("enabled")), "options": {}, "timeout": body.get("timeout") or None}
+                for k, v in (body.get("options") or {}).items():
+                    if re.fullmatch(r"[0-9]", str(k)) and isinstance(v, dict) and v.get("type") in ("ext", "group", "vm", "repeat"):
+                        ivr["options"][str(k)] = {"label": str(v.get("label", ""))[:40], "type": v["type"], "target": v.get("target")}
+                con.execute("UPDATE companies SET ivr_json=? WHERE id=?", (json.dumps(ivr), cid))
+                text = (body.get("greeting_text") or "").strip() or default_greeting(co, ivr)
+                if ivr["enabled"]: save_greeting(con, co, "main", text, body.get("lang", "en"))
+                con.commit()
+                return company_json(con, company(con, cid))
+            if sub == "hours" and method == "POST":
+                h = {"enabled": bool(body.get("enabled")), "tz": str(body.get("tz") or "America/Chicago")[:40], "days": {}}
+                for d in DAYS:
+                    v = (body.get("days") or {}).get(d)
+                    if isinstance(v, list) and len(v) == 2 and all(re.fullmatch(r"\d\d:\d\d", str(x)) for x in v): h["days"][d] = [str(v[0]), str(v[1])]
+                con.execute("UPDATE companies SET hours_json=? WHERE id=?", (json.dumps(h), cid))
+                if h["enabled"]:
+                    txt = (body.get("closed_text") or "").strip() or f"Thank you for calling {co['name']}. We are closed right now. Please leave a message after the tone and we will call you back."
+                    save_greeting(con, co, "closed", txt, body.get("lang", "en"))
+                con.commit()
+                return company_json(con, company(con, cid))
+            if sub == "topup" and method == "POST":
+                mins = int(body.get("minutes", 0)); tref = str(body.get("ref", ""))[:80]
+                if not 0 < mins <= 100000: raise ApiError(400, "bad minutes")
+                if not (tref and con.execute("SELECT 1 FROM topups WHERE ref=?", (tref,)).fetchone()):
+                    con.execute("INSERT INTO topups (sip_user, company_id, minutes, period_start, created_at, ref) VALUES (?,?,?,?,?,?)",
+                                (co["main_user"], cid, mins, company_usage(con, co)["period_start"], iso(now()), tref))
+                    event(con, co["main_user"], "topup", f"company {cid}: {mins}")
+                con.commit()
+                return company_json(con, company(con, cid))
+            if sub == "status" and method == "POST":       # pause / unpause the whole company (e.g. unpaid)
+                st = body.get("status"); note = str(body.get("note", ""))[:200]
+                if st not in ("active", "suspended", "canceled"): raise ApiError(400, "bad status")
+                con.execute("UPDATE companies SET status=?, note=?, paused_at=? WHERE id=?", (st, note, iso(now()) if st == "suspended" else None, cid))
+                for m in co_members(con, cid):
+                    if st == "active" and m["status"] == "suspended" and not (m["note"] or "").startswith(("unpaid", "company")): continue   # keep robocall/admin pauses
+                    con.execute("UPDATE customers SET status=?, note=? WHERE sip_user=?", (st, ("company " + note) if st != "active" else None, m["sip_user"]))
+                con.commit(); write_pjsip(con)
+                return company_json(con, company(con, cid))
+            if sub == "renew" and method == "POST":        # monthly payment received: fresh pool
+                con.execute("UPDATE companies SET period_anchor=? WHERE id=?", (now().date().isoformat(), cid)); con.commit()
+                return company_json(con, company(con, cid))
+            raise ApiError(404, "not found")
+        # ---------------- voicemail ----------------
+        if p and p[0] == "voicemails" and len(p) >= 2 and p[1].isdigit():
+            v = con.execute("SELECT * FROM voicemails WHERE id=?", (int(p[1]),)).fetchone()
+            if not v: raise ApiError(404, "no such voicemail")
+            if len(p) == 3 and p[2] == "audio" and method == "GET":
+                try: return ("raw", open(v["file"], "rb").read(), "audio/wav")
+                except OSError: raise ApiError(404, "audio gone")
+            if len(p) == 3 and p[2] == "heard" and method == "POST":
+                con.execute("UPDATE voicemails SET heard=1 WHERE id=?", (v["id"],)); con.commit(); return {"ok": True}
+            if len(p) == 3 and p[2] == "delete" and method == "POST":
+                try: os.remove(v["file"])
+                except OSError: pass
+                con.execute("DELETE FROM voicemails WHERE id=?", (v["id"],)); con.commit(); return {"ok": True}
+            return {k: v[k] for k in v.keys() if k != "file"}
         if p == ["alerts"]:
             return {"events": [dict(r) for r in con.execute("SELECT * FROM events WHERE kind IN ('auto_suspend','blocked_out','blocked_in','unknown_in','text_unknown','e911_failed','release_failed','released') ORDER BY id DESC LIMIT 200")]}
         if len(p) >= 2 and p[0] == "customers":
@@ -510,6 +859,9 @@ def api_route(method, path, q, body):
                 d = cust_json(con, c)
                 d["recent_calls"] = [dict(r) for r in con.execute("SELECT direction, peer, started_at, billsec, minutes, result FROM calls WHERE sip_user=? ORDER BY id DESC LIMIT 50", (u,))]
                 d["texts"] = [dict(r) for r in con.execute("SELECT id, peer, body, received_at FROM texts WHERE sip_user=? ORDER BY id DESC LIMIT 50", (u,))]
+                d["voicemails"] = [dict(r) for r in con.execute("SELECT id, caller, secs, created_at, heard FROM voicemails WHERE sip_user=? ORDER BY id DESC LIMIT 50", (u,))]
+                co = co_of(con, c)
+                if co: d["company"] = {"id": co["id"], "name": co["name"], "owner": co["owner_email"] == c["email"], "ext": c["ext"], "main_did": co_main_did(con, co)}
                 return d
             if sub == "credentials" and method == "GET":     # for the app, after the website verified the signed-in owner
                 return {"sip_user": u, "sip_pass": c["sip_pass"], "sip_server": C["sip_domain"], "did": c["did"]}
@@ -578,6 +930,9 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}") if n else {}
             res, code = api_route(method, u.path, q, body), 200
+            if isinstance(res, tuple) and res and res[0] == "raw":
+                self.send_response(200); self.send_header("Content-Type", res[2]); self.send_header("Content-Length", str(len(res[1]))); self.end_headers(); self.wfile.write(res[1])
+                return
         except ApiError as e: res, code = {"error": e.msg}, e.code
         except (ValueError, KeyError) as e: res, code = {"error": "bad request: " + str(e)}, 400
         except Exception as e: res, code = {"error": "server error"}, 500; sys.stderr.write("api error %r\n" % e)
