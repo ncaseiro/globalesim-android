@@ -31,6 +31,8 @@ DEFAULTS = {
     # Master shutoff for outgoing calls (all lines together). Tripping it pauses outgoing calls only and emails you.
     # Telnyx list prices (USD), used for cost estimates in the admin panel
     "rates": {"in": 0.0032, "out": 0.005, "number": 1.0, "e911": 1.5, "channel_tiers": [[10, 12.0], [40, 11.0], [200, 9.0], [1000000, 8.0]]},
+    # a number taken off a line goes to our pool (no new Telnyx charge) and rests this many days before a new customer gets it
+    "pool_rest_days": 30,
     "guard": {"out_minutes_hour": 900, "out_minutes_day": 6000, "out_calls_10min": 150, "concurrent": 40, "new_lines_day": 25},
     "low_balance": 20,                 # email when the Telnyx balance drops below this (USD)
     "alert_kinds": ["auto_suspend", "guard_trip", "e911_failed", "release_failed", "low_balance", "line_flood"],
@@ -85,7 +87,7 @@ def db():
         created_at TEXT, heard INTEGER DEFAULT 0);
     CREATE INDEX IF NOT EXISTS vm_user ON voicemails(sip_user, id);
     CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT);
-    CREATE TABLE IF NOT EXISTS stock (number TEXT PRIMARY KEY, phone_id TEXT, bought_at TEXT, note TEXT);
+    CREATE TABLE IF NOT EXISTS stock (number TEXT PRIMARY KEY, phone_id TEXT, bought_at TEXT, note TEXT, available_at TEXT, prev_email TEXT);
     CREATE UNIQUE INDEX IF NOT EXISTS customers_did ON customers(did) WHERE did IS NOT NULL AND did <> '';
     """)
     cols = {r[1] for r in con.execute("PRAGMA table_info(customers)")}
@@ -98,6 +100,9 @@ def db():
     cc = {r[1] for r in con.execute("PRAGMA table_info(companies)")}
     for col, typ in (("comp", "INTEGER DEFAULT 0"), ("voice", "TEXT DEFAULT ''"), ("rec_main", "INTEGER DEFAULT 0"), ("rec_closed", "INTEGER DEFAULT 0"), ("prov_token", "TEXT"), ("billing", "TEXT DEFAULT 'paypal'"), ("admin_note", "TEXT")):
         if col not in cc: con.execute(f"ALTER TABLE companies ADD COLUMN {col} {typ}")
+    sc = {r[1] for r in con.execute("PRAGMA table_info(stock)")}
+    for col in ("available_at", "prev_email"):
+        if col not in sc: con.execute(f"ALTER TABLE stock ADD COLUMN {col} TEXT")
     con.execute("UPDATE companies SET billing='free' WHERE comp=1 AND (billing IS NULL OR billing='paypal')")
     if "company_id" not in {r[1] for r in con.execute("PRAGMA table_info(topups)")}:
         con.execute("ALTER TABLE topups ADD COLUMN company_id INTEGER")
@@ -471,15 +476,17 @@ def telnyx_buy(num, area_code="", taken=()):
     raise ApiError(409, "no number available in that area code — try another")
 
 def get_number(con, want, area, taken):
-    """A number for a new line: the picked one or one from the same area code — from our stock first (ready now, already paid)."""
+    """A number for a new line: the picked one or one from the same area code — from our pool first (ready now, already paid).
+    Pool numbers still resting after a previous owner are only used when picked by number."""
     ac = digits(area)[:3] or (want[1:4] if want else "")
+    ready = "SELECT * FROM stock WHERE number LIKE ? AND COALESCE(available_at,'')<=? ORDER BY bought_at LIMIT 1"
     st = con.execute("SELECT * FROM stock WHERE number=?", (want,)).fetchone() if want else None
     if not st and not want and ac:
-        st = con.execute("SELECT * FROM stock WHERE number LIKE ? ORDER BY bought_at LIMIT 1", ("1" + ac + "%",)).fetchone()
+        st = con.execute(ready, ("1" + ac + "%", iso(now()))).fetchone()
     if not st:
         try: return telnyx_buy(want, area, taken)
-        except ApiError:                              # picked number gone and none to buy: a stock number in the same area code
-            st = con.execute("SELECT * FROM stock WHERE number LIKE ? ORDER BY bought_at LIMIT 1", ("1" + ac + "%",)).fetchone() if ac else None
+        except ApiError:                              # picked number gone and none to buy: a pool number in the same area code
+            st = con.execute(ready, ("1" + ac + "%", iso(now()))).fetchone() if ac else None
             if not st: raise
     con.execute("DELETE FROM stock WHERE number=?", (st["number"],))
     return st["number"], st["phone_id"]
@@ -555,11 +562,32 @@ def telnyx_e911(phone_id, a):
     telnyx("POST", f"/phone_numbers/{phone_id}/actions/enable_emergency", {"emergency_enabled": True, "emergency_address_id": str(aid)})
     return str(aid)
 
+def e911_off(phone_id, address_id=""):
+    """Turn 911 off on a number (it must never send help to the previous owner's address)."""
+    try: telnyx("PATCH", f"/phone_numbers/{phone_id}/voice", {"emergency": {"emergency_enabled": False}}); return True
+    except ApiError:
+        if not address_id: raise
+    telnyx("POST", f"/phone_numbers/{phone_id}/actions/enable_emergency", {"emergency_enabled": False, "emergency_address_id": str(address_id)})
+    return True
+
+def to_pool(con, c, why):
+    """Take the number off a line and keep it in our pool: Telnyx bills by the month, so returning it saves nothing.
+    911 is switched off; the number rests pool_rest_days before a new customer is offered it."""
+    if not c["did"]: return True
+    if c["phone_id"] and C["telnyx_api_key"] and c["e911"]:
+        try: e911_off(c["phone_id"], c["e911_address_id"] or "")
+        except ApiError as e: event(con, c["sip_user"], "e911_failed", "could not turn 911 off on " + c["did"] + ": " + e.msg[:150])
+    rest = now() + dt.timedelta(days=int(C.get("pool_rest_days", 30)))
+    con.execute("INSERT OR REPLACE INTO stock (number, phone_id, bought_at, note, available_at, prev_email) VALUES (?,?,?,?,?,?)",
+                (c["did"], c["phone_id"] or "", iso(now()), why[:80], iso(rest), c["email"]))
+    con.execute("UPDATE customers SET did=NULL, phone_id=NULL, number_id=NULL, e911=0, e911_address_id=NULL WHERE sip_user=? AND did=?", (c["sip_user"], c["did"]))
+    event(con, c["sip_user"], "pooled", f"{c['did']} {why}")
+    return True
+
 def release_number(con, c, why):
-    if c["phone_id"] and C["telnyx_api_key"]:
-        try: telnyx("DELETE", f"/phone_numbers/{c['phone_id']}")
-        except ApiError as e: event(con, c["sip_user"], "release_failed", e.msg[:200]); return False
-    con.execute("UPDATE customers SET did=NULL, phone_id=NULL, e911=0, status='canceled', note=? WHERE sip_user=?", (why, c["sip_user"]))
+    """Line closes: its number goes to our pool (see to_pool), the line is canceled."""
+    to_pool(con, c, why)
+    con.execute("UPDATE customers SET status='canceled', note=? WHERE sip_user=?", (why, c["sip_user"]))
     event(con, c["sip_user"], "released", f"{c['did']} {why}")
     return True
 
@@ -1111,7 +1139,7 @@ def api_route(method, path, q, body):
             if q.get("ends_with"): params["filter[phone_number][ends_with]"] = digits(q["ends_with"])
             # our own stock first: ready at once and already paid for
             ac, has = digits(q.get("area_code"))[:3], digits(q.get("contains"))
-            mine = [r["number"] for r in con.execute("SELECT number FROM stock ORDER BY number") if (not ac or r["number"][1:4] == ac) and (not has or has in r["number"][1:])]
+            mine = [r["number"] for r in con.execute("SELECT number FROM stock WHERE COALESCE(available_at,'')<=? ORDER BY number", (iso(now()),)) if (not ac or r["number"][1:4] == ac) and (not has or has in r["number"][1:])]
             mine = [n for n in mine if not con.execute("SELECT 1 FROM customers WHERE did=?", (n,)).fetchone()]
             try: r = telnyx("GET", "/available_phone_numbers?" + urllib.parse.urlencode(params))
             except ApiError:
@@ -1143,7 +1171,7 @@ def api_route(method, path, q, body):
             nums = telnyx_all("/phone_numbers")
             try: billing = {v.get("id"): v.get("usage_payment_method") for v in telnyx_all("/phone_numbers/voice")}
             except ApiError: billing = {}
-            stock = {r["number"] for r in con.execute("SELECT number FROM stock")}
+            stockrows = {r["number"]: r for r in con.execute("SELECT * FROM stock")}; stock = set(stockrows)
             out = []
             for n in nums:
                 d = digits(n.get("phone_number")); c = con.execute("SELECT * FROM customers WHERE did=?", (d,)).fetchone()
@@ -1153,7 +1181,9 @@ def api_route(method, path, q, body):
                             "purchased_at": (n.get("purchased_at") or n.get("created_at") or "")[:10],
                             "use": "customer" if c else ("stock" if d in stock else "other"),
                             "email": c["email"] if c else "", "sip_user": c["sip_user"] if c else "", "line_status": c["status"] if c else "",
-                            "company": co["name"] if co else "", "ext": (c["ext"] or "") if c else ""})
+                            "company": co["name"] if co else "", "ext": (c["ext"] or "") if c else "",
+                            "available_at": (stockrows[d]["available_at"] or "") if d in stockrows else "", "prev_email": (stockrows[d]["prev_email"] or "") if d in stockrows else "",
+                            "pool_note": (stockrows[d]["note"] or "") if d in stockrows else ""})
             return {"numbers": out}
         if len(p) == 4 and p[:2] == ["telnyx", "numbers"] and p[3] == "billing" and method == "POST":
             m = str(body.get("method") or "")
@@ -1178,6 +1208,9 @@ def api_route(method, path, q, body):
             con.execute("INSERT INTO stock (number, phone_id, bought_at, note) VALUES (?,?,?,?)", (num, pid, iso(now()), (body.get("note") or "")[:80]))
             event(con, "admin", "stock_buy", num); con.commit()
             return {"ok": True, "number": num}
+        if len(p) == 4 and p[:2] == ["telnyx", "stock"] and p[3] == "ready" and method == "POST":
+            con.execute("UPDATE stock SET available_at=? WHERE number=?", (iso(now()), digits(p[2]))); event(con, "admin", "stock_ready", digits(p[2])); con.commit()
+            return {"ok": True}
         if len(p) == 4 and p[:2] == ["telnyx", "stock"] and p[3] == "release" and method == "POST":
             st = con.execute("SELECT * FROM stock WHERE number=?", (digits(p[2]),)).fetchone()
             if not st: raise ApiError(404, "not in stock")
@@ -1506,9 +1539,21 @@ def api_route(method, path, q, body):
                 return {"sip_user": u + "-web", "sip_pass": c["web_pass"], "domain": C["sip_domain"], "wss": f"wss://{C['sip_domain']}/ws", "expires": c["web_exp"]}
             if sub == "credentials" and method == "GET":     # for the app, after the website verified the signed-in owner
                 return {"sip_user": u, "sip_pass": c["sip_pass"], "sip_server": C["sip_domain"], "did": c["did"]}
-            if sub == "number" and method == "POST":           # admin: give this line a number (from stock first, else buy) + 911
-                if c["did"]: raise ApiError(409, "this line already has a number")
-                buy_for(con, u, body.get("phone_number"), body.get("area_code"), body.get("e911") or {})
+            if sub == "number" and method == "POST":           # admin: give this line a number (pool first, else buy) + 911; change=true swaps it
+                old = dict(c) if c["did"] else None
+                if old and not body.get("change"): raise ApiError(409, "this line already has a number")
+                a911 = body.get("e911") or {}
+                if not a911.get("street") and c["e911_json"]: a911 = json.loads(c["e911_json"])     # keep the address on file
+                if old:
+                    want = digits(body.get("phone_number")); want = ("1" + want) if len(want) == 10 else want
+                    if want and want == old["did"]: raise ApiError(400, "that is already this line's number")
+                    con.execute("UPDATE customers SET did=NULL, e911=0, e911_address_id=NULL WHERE sip_user=?", (u,))
+                try:
+                    buy_for(con, u, body.get("phone_number"), body.get("area_code"), a911)
+                except ApiError:
+                    if old: con.execute("UPDATE customers SET did=?, e911=?, e911_address_id=? WHERE sip_user=?", (old["did"], old["e911"], old["e911_address_id"], u))
+                    raise
+                if old: to_pool(con, old, "number changed")        # old number (and its 911) off the line, into the pool
                 con.commit(); write_pjsip(con)
             elif sub == "plan" and method == "POST":           # new/renewed paid month
                 plan = body.get("plan", c["plan"])
