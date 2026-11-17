@@ -89,10 +89,11 @@ def db():
     for col, typ in (("phone_id", "TEXT"), ("e911", "INTEGER DEFAULT 0"), ("e911_address_id", "TEXT"), ("e911_json", "TEXT"),
                      ("paused_at", "TEXT"), ("sub_ref", "TEXT"), ("company_id", "INTEGER"), ("ext", "TEXT"), ("display_name", "TEXT"),
                      ("vm_on", "INTEGER DEFAULT 1"), ("web_pass", "TEXT"), ("web_exp", "TEXT"),
-                     ("fwd_mode", "TEXT DEFAULT ''"), ("fwd_to", "TEXT"), ("dnd", "INTEGER DEFAULT 0")):
+                     ("fwd_mode", "TEXT DEFAULT ''"), ("fwd_to", "TEXT"), ("dnd", "INTEGER DEFAULT 0"),
+                     ("desk_pass", "TEXT"), ("desk_brand", "TEXT"), ("desk_mac", "TEXT")):
         if col not in cols: con.execute(f"ALTER TABLE customers ADD COLUMN {col} {typ}")
     cc = {r[1] for r in con.execute("PRAGMA table_info(companies)")}
-    for col, typ in (("comp", "INTEGER DEFAULT 0"), ("voice", "TEXT DEFAULT ''"), ("rec_main", "INTEGER DEFAULT 0"), ("rec_closed", "INTEGER DEFAULT 0")):
+    for col, typ in (("comp", "INTEGER DEFAULT 0"), ("voice", "TEXT DEFAULT ''"), ("rec_main", "INTEGER DEFAULT 0"), ("rec_closed", "INTEGER DEFAULT 0"), ("prov_token", "TEXT")):
         if col not in cc: con.execute(f"ALTER TABLE companies ADD COLUMN {col} {typ}")
     if "company_id" not in {r[1] for r in con.execute("PRAGMA table_info(topups)")}:
         con.execute("ALTER TABLE topups ADD COLUMN company_id INTEGER")
@@ -141,16 +142,55 @@ def parse_nanp(x):
     if len(d) == 10: d = "1" + d
     return d if re.fullmatch(r"1[2-9]\d{2}[2-9]\d{6}", d) and not re.match(r"1(900|976)", d) else ""
 
+# ---- desk phone automatic setup: the phone downloads its settings from /prov/<company token>/<file> ----
+def mac_norm(m): return re.sub(r"[^0-9a-f]", "", (m or "").lower())
+
+def prov_config(brand, c, name):
+    host = C["sip_domain"]; user = c["sip_user"] + "-desk"; pw = c["desk_pass"]; label = (name or f"Ext {c['ext'] or ''}")[:20]
+    if brand == "yealink":
+        return "\n".join(["#!version:1.0.0.1", "account.1.enable = 1", f"account.1.label = {label}", f"account.1.display_name = {label}",
+            f"account.1.auth_name = {user}", f"account.1.user_name = {user}", f"account.1.password = {pw}",
+            f"account.1.sip_server.1.address = {host}", "account.1.sip_server.1.port = 5061", "account.1.sip_server.1.transport_type = 2",
+            "account.1.sip_server.1.expires = 300", "account.1.srtp_encryption = 1", "account.1.nat.udp_update_enable = 1",
+            "account.1.dtmf.type = 1", "local_time.time_zone = -6", "local_time.time_zone_name = United States-Central Time", ""]), "text/plain"
+    if brand == "grandstream":
+        x = {"P271": "1", "P270": label, "P47": f"{host}:5061", "P35": user, "P36": user, "P34": pw, "P3": label, "P130": "2", "P183": "1", "P52": "2", "P63": "1"}
+        return ('<?xml version="1.0" encoding="UTF-8"?>\n<gs_provision version="1">\n<config version="1">\n'
+                + "".join(f"<{k}>{v}</{k}>\n" for k, v in x.items()) + "</config>\n</gs_provision>\n"), "application/xml"
+    if brand == "mitel":
+        return "\n".join([f"sip line1 auth name: {user}", f"sip line1 user name: {user}", f"sip line1 password: {pw}",
+            f"sip line1 display name: {label}", f"sip line1 screen name: {label}", f"sip line1 proxy ip: {host}", "sip line1 proxy port: 5061",
+            f"sip line1 registrar ip: {host}", "sip line1 registrar port: 5061", "sip line1 transport protocol: 4", "sip srtp mode: 1",
+            "sip registration period: 300", "time zone name: US-Central", ""]), "text/plain"
+    return "", "text/plain"
+
+def prov_lookup(token, fname):
+    """Which extension's phone is asking? Only phones whose MAC the owner entered get a configuration."""
+    with db() as con:
+        co = con.execute("SELECT * FROM companies WHERE prov_token=? AND status='active'", (token,)).fetchone()
+        if not co: return None
+        name = re.sub(r"\.(cfg|xml)$", "", fname.lower())
+        if name.startswith("cfg") and len(name) == 15: name = name[3:]          # Grandstream asks for cfg<mac>.xml
+        mac = mac_norm(name)
+        if len(mac) != 12: return None
+        c = con.execute("SELECT * FROM customers WHERE company_id=? AND desk_mac=? AND status='active' AND desk_pass IS NOT NULL", (co["id"], mac)).fetchone()
+        if not c: return None
+        event(con, c["sip_user"], "desk_prov", f"{c['desk_brand']} {mac}"); con.commit()
+        return prov_config(c["desk_brand"] or "", c, c["display_name"])
+
 def base_user(ep):
-    return ep[:-4] if ep and ep.endswith("-web") else ep
+    for suf in ("-web", "-desk"):
+        if ep and ep.endswith(suf): return ep[:-len(suf)]
+    return ep
 
 def dials(con, users):
     """Dial string ringing each line's phone app and, if signed in, its computer browser too."""
     out = []
     for u in users:
         out.append(f"PJSIP/{u}")
-        r = con.execute("SELECT web_exp FROM customers WHERE sip_user=?", (u,)).fetchone()
+        r = con.execute("SELECT web_exp, desk_pass FROM customers WHERE sip_user=?", (u,)).fetchone()
         if r and r["web_exp"] and r["web_exp"] > iso(now()): out.append(f"PJSIP/{u}-web")
+        if r and r["desk_pass"]: out.append(f"PJSIP/{u}-desk")
     return "&".join(out)
 
 def company_usage(con, co, t=None):
@@ -280,6 +320,43 @@ password={c['sip_pass']}
 [{u}]
 type=aor
 max_contacts=2
+remove_existing=yes
+qualify_frequency=60""")
+    # desk phones (Yealink, Grandstream, Mitel, Poly…): "<user>-desk", own strong password, works over UDP/TCP/TLS,
+    # encrypted audio when the phone offers it, one phone per extension
+    for c in con.execute("SELECT * FROM customers WHERE status='active' AND desk_pass IS NOT NULL AND desk_pass<>''"):
+        u = c["sip_user"]; w = u + "-desk"
+        cid_num = c["did"] or co_main_did(con, co_of(con, c)) or "0"
+        out.append(f"""
+[{w}]
+type=endpoint
+context=from-customer
+message_context=gs-messages
+allow_transfer=yes
+moh_suggest=default
+disallow=all
+allow=g722,ulaw,alaw
+auth={w}-auth
+aors={w}
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+dtmf_mode=rfc4733
+device_state_busy_at=1
+media_encryption=sdes
+media_encryption_optimistic=yes
+callerid=<{cid_num}>
+
+[{w}-auth]
+type=auth
+auth_type=userpass
+username={w}
+password={c['desk_pass']}
+
+[{w}]
+type=aor
+max_contacts=1
 remove_existing=yes
 qualify_frequency=60""")
     # computer browser logins (WebRTC): "<user>-web", a separate password that expires (24 h, renewed while used)
@@ -495,6 +572,7 @@ def notify_site(kind, data):
 
 def member_json(con, m):
     d = {k: m[k] for k in ("sip_user", "email", "did", "ext", "display_name", "status", "note", "created_at", "plan")}
+    d["desk_on"] = bool(m["desk_pass"]); d["desk_brand"] = m["desk_brand"] or ""
     d["vm_new"] = con.execute("SELECT COUNT(*) FROM voicemails WHERE sip_user=? AND heard=0", (m["sip_user"],)).fetchone()[0]
     ps = period_start(company(con, m["company_id"])["period_anchor"]).isoformat()
     d["used"] = con.execute("SELECT COALESCE(SUM(minutes),0) FROM calls WHERE sip_user=? AND started_at>=?", (m["sip_user"], ps)).fetchone()[0]
@@ -1191,6 +1269,26 @@ def api_route(method, path, q, body):
                 co = co_of(con, c)
                 if co: d["company"] = {"id": co["id"], "name": co["name"], "owner": co["owner_email"] == c["email"], "ext": c["ext"], "main_did": co_main_did(con, co)}
                 return d
+            if sub == "desk":                                    # desk phone login + automatic setup
+                if method == "POST":
+                    on = bool(body.get("on", True))
+                    brand = str(body.get("brand") or c["desk_brand"] or "")
+                    if brand not in ("", "yealink", "grandstream", "mitel", "other"): raise ApiError(400, "unknown brand")
+                    mac = mac_norm(body.get("mac")) if "mac" in body else (c["desk_mac"] or "")
+                    if mac and len(mac) != 12: raise ApiError(400, "the MAC address has 12 letters/digits, e.g. 80:5E:C0:12:34:56")
+                    if mac and con.execute("SELECT 1 FROM customers WHERE desk_mac=? AND sip_user<>?", (mac, u)).fetchone(): raise ApiError(409, "that phone is already set up on another extension")
+                    pw = (c["desk_pass"] if c["desk_pass"] and not body.get("new_password") else secrets.token_urlsafe(15).replace("-", "x").replace("_", "y")) if on else None
+                    con.execute("UPDATE customers SET desk_pass=?, desk_brand=?, desk_mac=? WHERE sip_user=?", (pw, brand if on else None, mac if on else None, u))
+                    co = co_of(con, c)
+                    if co and not co["prov_token"]: con.execute("UPDATE companies SET prov_token=? WHERE id=?", (secrets.token_urlsafe(12), co["id"]))
+                    event(con, u, "desk", "on" if on else "off"); con.commit(); write_pjsip(con)
+                    c = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
+                co = co_of(con, c)
+                ext_file = {"yealink": "{mac}.cfg", "grandstream": "cfg{mac}.xml", "mitel": "{mac}.cfg"}.get(c["desk_brand"] or "", "")
+                return {"on": bool(c["desk_pass"]), "server": C["sip_domain"], "username": u + "-desk", "password": c["desk_pass"] or "",
+                        "ports": {"udp": 5060, "tcp": 5060, "tls": 5061}, "brand": c["desk_brand"] or "", "mac": c["desk_mac"] or "",
+                        "prov_url": f"https://{C['sip_domain']}/prov/{co['prov_token']}/" if co and co["prov_token"] else "", "prov_file": ext_file,
+                        "registered": bool(subprocess.run(["asterisk", "-rx", f"pjsip show aor {u}-desk"], capture_output=True, text=True, timeout=5).stdout.count("Contact:  " + u + "-desk/")) if c["desk_pass"] else False}
             if sub == "forward" and method == "POST":         # call forwarding + do not disturb
                 mode = str(body.get("mode") or ""); to = digits(str(body.get("to") or ""))
                 if mode not in ("", "always", "busy", "noanswer", "busy_noanswer"): raise ApiError(400, "bad mode")
@@ -1263,6 +1361,13 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *a): sys.stderr.write("api %s %s\n" % (self.address_string(), fmt % a))
     def _go(self, method):
         try:
+            if method == "GET" and self.path.startswith("/prov/"):
+                parts = self.path.split("?")[0].split("/")
+                res = prov_lookup(parts[2], parts[3]) if len(parts) == 4 else None
+                body_b = (res[0] if res and res[0] else "not found\n").encode()
+                self.send_response(200 if res and res[0] else 404); self.send_header("Content-Type", res[1] if res else "text/plain")
+                self.send_header("Content-Length", str(len(body_b))); self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(body_b)
+                return
             if method == "POST" and self.path.startswith("/api/sms/in/"):   # Telnyx webhook (secret in the URL)
                 n = int(self.headers.get("Content-Length") or 0); raw = self.rfile.read(min(n, 200000)) if n else b"{}"
                 tokp = self.path.rsplit("/", 1)[-1].split("?")[0]

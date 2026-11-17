@@ -606,6 +606,9 @@ $API_DOMAIN {
     handle /ws {
         reverse_proxy 127.0.0.1:8088
     }
+    handle /prov/* {
+        reverse_proxy 127.0.0.1:8090
+    }
     respond "GlobaleSIM Voice" 200
 }
 EOF
