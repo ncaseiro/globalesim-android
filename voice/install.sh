@@ -383,7 +383,8 @@ exten => _X.,1,Playback(ss-noservice)
  same => n,Hangup()
 EOF
 # switch off modules we don't use (and that log errors on Ubuntu)
-for m in res_config_ldap.so res_geolocation.so res_phoneprov.so res_pjsip_phoneprov_provider.so chan_iax2.so chan_skinny.so chan_mgcp.so chan_unistim.so; do
+# chan_sip (old SIP driver) must stay off: it grabs browser connections on /ws and rejects them
+for m in chan_sip.so res_config_ldap.so res_geolocation.so res_phoneprov.so res_pjsip_phoneprov_provider.so chan_iax2.so chan_skinny.so chan_mgcp.so chan_unistim.so; do
   grep -q "^noload => $m" modules.conf || echo "noload => $m" >> modules.conf
 done
 chown -R asterisk:asterisk /etc/asterisk; chmod 640 /etc/asterisk/pjsip.conf
