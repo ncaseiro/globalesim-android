@@ -93,11 +93,12 @@ def db():
                      ("paused_at", "TEXT"), ("sub_ref", "TEXT"), ("company_id", "INTEGER"), ("ext", "TEXT"), ("display_name", "TEXT"),
                      ("vm_on", "INTEGER DEFAULT 1"), ("web_pass", "TEXT"), ("web_exp", "TEXT"),
                      ("fwd_mode", "TEXT DEFAULT ''"), ("fwd_to", "TEXT"), ("dnd", "INTEGER DEFAULT 0"),
-                     ("desk_pass", "TEXT"), ("desk_brand", "TEXT"), ("desk_mac", "TEXT")):
+                     ("desk_pass", "TEXT"), ("desk_brand", "TEXT"), ("desk_mac", "TEXT"), ("billing", "TEXT DEFAULT 'paypal'"), ("admin_note", "TEXT")):
         if col not in cols: con.execute(f"ALTER TABLE customers ADD COLUMN {col} {typ}")
     cc = {r[1] for r in con.execute("PRAGMA table_info(companies)")}
-    for col, typ in (("comp", "INTEGER DEFAULT 0"), ("voice", "TEXT DEFAULT ''"), ("rec_main", "INTEGER DEFAULT 0"), ("rec_closed", "INTEGER DEFAULT 0"), ("prov_token", "TEXT")):
+    for col, typ in (("comp", "INTEGER DEFAULT 0"), ("voice", "TEXT DEFAULT ''"), ("rec_main", "INTEGER DEFAULT 0"), ("rec_closed", "INTEGER DEFAULT 0"), ("prov_token", "TEXT"), ("billing", "TEXT DEFAULT 'paypal'"), ("admin_note", "TEXT")):
         if col not in cc: con.execute(f"ALTER TABLE companies ADD COLUMN {col} {typ}")
+    con.execute("UPDATE companies SET billing='free' WHERE comp=1 AND (billing IS NULL OR billing='paypal')")
     if "company_id" not in {r[1] for r in con.execute("PRAGMA table_info(topups)")}:
         con.execute("ALTER TABLE topups ADD COLUMN company_id INTEGER")
     return con
@@ -534,7 +535,7 @@ def line_costs(con):
         mi = {r["direction"]: r["m"] for r in con.execute("SELECT direction, COALESCE(SUM(minutes),0) m FROM calls WHERE sip_user=? AND started_at>=? GROUP BY direction", (c["sip_user"], ps))}
         cost = mi.get("in", 0) * R["in"] + mi.get("out", 0) * R["out"] + (R["number"] if c["did"] else 0) + (R["e911"] if c["e911"] else 0)
         lines.append({"sip_user": c["sip_user"], "email": c["email"], "did": c["did"] or "", "plan": c["plan"], "status": c["status"], "company_id": c["company_id"],
-                      "ext": c["ext"] or "", "since": ps, "min_in": mi.get("in", 0), "min_out": mi.get("out", 0), "cost": round(cost, 2)})
+                      "ext": c["ext"] or "", "since": ps, "billing": c["billing"] or "paypal", "min_in": mi.get("in", 0), "min_out": mi.get("out", 0), "cost": round(cost, 2)})
     cos = {}
     for l in lines:
         if l["company_id"]:
@@ -1227,6 +1228,7 @@ def api_route(method, path, q, body):
             u = c["sip_user"]
             con.execute("UPDATE customers SET plan=?, period_anchor=?, sub_ref=?, status='active', note=NULL, paused_at=NULL WHERE sip_user=?",
                         (plan, now().date().isoformat(), ref or None, u))
+            if body.get("billing") in ("paypal", "invoice", "free"): con.execute("UPDATE customers SET billing=? WHERE sip_user=?", (body["billing"], u))
             con.commit()
             want = digits(body.get("phone_number")); want = ("1" + want) if len(want) == 10 else want
             taken = {r[0] for r in con.execute("SELECT did FROM customers WHERE did IS NOT NULL")}
@@ -1289,8 +1291,9 @@ def api_route(method, path, q, body):
                 if done and co_main_did(con, done): return dict(company_json(con, done), already=True)
             co = con.execute("SELECT * FROM companies WHERE sub_ref=?", (ref,)).fetchone() if ref else None
             if not co:
-                cur = con.execute("INSERT INTO companies (name, owner_email, period_anchor, created_at, sub_ref, ivr_json, hours_json) VALUES (?,?,?,?,?,?,?)",
-                                  (name, email, now().date().isoformat(), iso(now()), ref or None, "{}", "{}"))
+                bm = body.get("billing") if body.get("billing") in ("paypal", "invoice", "free") else "paypal"
+                cur = con.execute("INSERT INTO companies (name, owner_email, period_anchor, created_at, sub_ref, ivr_json, hours_json, billing, comp) VALUES (?,?,?,?,?,?,?,?,?)",
+                                  (name, email, now().date().isoformat(), iso(now()), ref or None, "{}", "{}", bm, 1 if bm == "free" else 0))
                 cid = cur.lastrowid
                 owner = new_member(con, cid, email, body.get("owner_name") or "Main", "101")
                 con.execute("UPDATE companies SET main_user=? WHERE id=?", (owner, cid))
@@ -1374,6 +1377,15 @@ def api_route(method, path, q, body):
                                 (co["main_user"], cid, mins, company_usage(con, co)["period_start"], iso(now()), tref))
                     event(con, co["main_user"], "topup", f"company {cid}: {mins}")
                 con.commit()
+                return company_json(con, company(con, cid))
+            if sub == "billing" and method == "POST":      # admin: paypal | invoice | free (free = complimentary)
+                bm = str(body.get("billing") or "")
+                if bm not in ("paypal", "invoice", "free"): raise ApiError(400, "billing must be paypal, invoice or free")
+                con.execute("UPDATE companies SET billing=?, comp=? WHERE id=?", (bm, 1 if bm == "free" else 0, cid))
+                event(con, co["main_user"] or "", "billing", f"company {cid} {bm}"); con.commit()
+                return company_json(con, company(con, cid))
+            if sub == "note" and method == "POST":
+                con.execute("UPDATE companies SET admin_note=? WHERE id=?", (str(body.get("note") or "")[:1000], cid)); con.commit()
                 return company_json(con, company(con, cid))
             if sub == "status" and method == "POST":       # pause / unpause the whole company (e.g. unpaid)
                 st = body.get("status"); note = str(body.get("note", ""))[:200]
@@ -1494,17 +1506,10 @@ def api_route(method, path, q, body):
                 return {"sip_user": u + "-web", "sip_pass": c["web_pass"], "domain": C["sip_domain"], "wss": f"wss://{C['sip_domain']}/ws", "expires": c["web_exp"]}
             if sub == "credentials" and method == "GET":     # for the app, after the website verified the signed-in owner
                 return {"sip_user": u, "sip_pass": c["sip_pass"], "sip_server": C["sip_domain"], "did": c["did"]}
-            if sub == "number" and method == "POST":
-                if c["did"]: raise ApiError(409, "customer already has a number")
-                num = digits(body.get("phone_number"))
-                if len(num) == 10: num = "1" + num
-                if not re.fullmatch(r"1\d{10}", num): raise ApiError(400, "phone_number must be a US number")
-                nid = ""
-                if body.get("buy", True):
-                    r = telnyx("POST", "/number_orders", {"phone_numbers": [{"phone_number": "+" + num}], "connection_id": C["telnyx_connection_id"]})
-                    nid = ((r.get("data") or {}).get("id")) or ""
-                con.execute("UPDATE customers SET did=?, number_id=? WHERE sip_user=?", (num, nid, u))
-                event(con, u, "number", num); con.commit(); write_pjsip(con)
+            if sub == "number" and method == "POST":           # admin: give this line a number (from stock first, else buy) + 911
+                if c["did"]: raise ApiError(409, "this line already has a number")
+                buy_for(con, u, body.get("phone_number"), body.get("area_code"), body.get("e911") or {})
+                con.commit(); write_pjsip(con)
             elif sub == "plan" and method == "POST":           # new/renewed paid month
                 plan = body.get("plan", c["plan"])
                 if plan not in C["plans"]: raise ApiError(400, "unknown plan")
@@ -1520,6 +1525,17 @@ def api_route(method, path, q, body):
                 con.execute("INSERT INTO topups (sip_user, minutes, period_start, created_at, ref) VALUES (?,?,?,?,?)",
                             (u, mins, usage(con, c)["period_start"], iso(now()), str(body.get("ref", ""))[:80]))
                 event(con, u, "topup", str(mins))
+            elif sub == "billing" and method == "POST":        # admin: how this line pays — paypal | invoice | free
+                bm = str(body.get("billing") or "")
+                if bm not in ("paypal", "invoice", "free"): raise ApiError(400, "billing must be paypal, invoice or free")
+                con.execute("UPDATE customers SET billing=? WHERE sip_user=?", (bm, u)); event(con, u, "billing", bm)
+            elif sub == "e911" and method == "POST":           # admin: (re)register the 911 address of this line's number
+                a = body.get("e911") or {}
+                if not c["phone_id"] or not a.get("street") or not a.get("zip"): raise ApiError(400, "needs a number and a full address")
+                aid = telnyx_e911(c["phone_id"], a)
+                con.execute("UPDATE customers SET e911=1, e911_address_id=?, e911_json=? WHERE sip_user=?", (aid, json.dumps(a), u)); event(con, u, "e911", "address set by admin")
+            elif sub == "note" and method == "POST":
+                con.execute("UPDATE customers SET admin_note=? WHERE sip_user=?", (str(body.get("note") or "")[:1000], u))
             elif sub == "release" and method == "POST":
                 release_number(con, c, str(body.get("note", "released by admin"))[:200]); con.commit(); write_pjsip(con)
             elif sub == "status" and method == "POST":
