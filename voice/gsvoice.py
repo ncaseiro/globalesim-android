@@ -191,14 +191,14 @@ def telnyx_phone_id(num):
         time.sleep(2)
     return ""
 
-def telnyx_buy(num, area_code=""):
+def telnyx_buy(num, area_code="", taken=()):
     """Buy num (11 digits); if it's gone, take another from the same area code. Returns (num, phone_id)."""
     tried, candidates = set(), [num] if num else []
     if not candidates or area_code:
         try: candidates += [digits(x) for x in telnyx_search(area_code or num[1:4], limit=5)]
         except ApiError: pass
     for n in candidates:
-        if not n or n in tried: continue
+        if not n or n in tried or n in taken: continue
         tried.add(n)
         try:
             r = telnyx("POST", "/number_orders", {"phone_numbers": [{"phone_number": "+" + n}], "connection_id": C["telnyx_connection_id"]})
@@ -342,7 +342,14 @@ def api_route(method, path, q, body):
                 done = con.execute("SELECT * FROM customers WHERE sub_ref=?", (ref,)).fetchone()
                 if done and done["did"]: return dict(cust_json(con, done), already=True)
             c = con.execute("SELECT * FROM customers WHERE email=? AND status<>'canceled' ORDER BY created_at DESC LIMIT 1", (email,)).fetchone()
-            if c and c["did"]: raise ApiError(409, "this account already has a line")
+            if c and c["did"]:
+                if not (c["status"] == "suspended" and (c["note"] or "").startswith("unpaid")): raise ApiError(409, "this account already has a line")
+                # restarted subscription on a paused line: same number, fresh month
+                con.execute("UPDATE customers SET plan=?, period_anchor=?, sub_ref=?, status='active', note=NULL, paused_at=NULL WHERE sip_user=?",
+                            (plan, now().date().isoformat(), ref or None, c["sip_user"]))
+                event(con, c["sip_user"], "restarted", plan); con.commit(); write_pjsip(con)
+                c = con.execute("SELECT * FROM customers WHERE sip_user=?", (c["sip_user"],)).fetchone()
+                return dict(cust_json(con, c), picked=True)
             if not c:
                 user = "c" + secrets.token_hex(5)
                 con.execute("INSERT INTO customers (sip_user, sip_pass, email, plan, period_anchor, created_at) VALUES (?,?,?,?,?,?)",
@@ -354,7 +361,8 @@ def api_route(method, path, q, body):
                         (plan, now().date().isoformat(), ref or None, u))
             con.commit()
             want = digits(body.get("phone_number")); want = ("1" + want) if len(want) == 10 else want
-            num, pid = telnyx_buy(want, digits(body.get("area_code")))
+            taken = {r[0] for r in con.execute("SELECT did FROM customers WHERE did IS NOT NULL")}
+            num, pid = telnyx_buy(want, digits(body.get("area_code")), taken)
             con.execute("UPDATE customers SET did=?, phone_id=?, number_id=? WHERE sip_user=?", (num, pid, pid, u))
             event(con, u, "number", num + (" (picked)" if num == want else f" (wanted {want or 'any'})"))
             a911 = body.get("e911") or {}
