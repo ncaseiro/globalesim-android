@@ -385,7 +385,8 @@ EOF
 # switch off modules we don't use (and that log errors on Ubuntu)
 # chan_sip (old SIP driver) must stay off: it grabs browser connections on /ws and rejects them
 for m in chan_sip.so res_config_ldap.so res_geolocation.so res_phoneprov.so res_pjsip_phoneprov_provider.so chan_iax2.so chan_skinny.so chan_mgcp.so chan_unistim.so; do
-  grep -q "^noload => $m" modules.conf || echo "noload => $m" >> modules.conf
+  sed -i "/^noload => ${m//./\\.}\$/d" modules.conf                       # old copies (some landed outside [modules])
+  sed -i "/^\[modules\]/a noload => $m" modules.conf                     # must be inside [modules] to count
 done
 chown -R asterisk:asterisk /etc/asterisk; chmod 640 /etc/asterisk/pjsip.conf
 
