@@ -258,10 +258,13 @@ exten => s,1,AGI(gs-agi.py,charge,\${ARG1},\${ANSWEREDTIME})
 ; Checked by gsvoice before every call: active account, minutes left, max 5 calls / 10 min,
 ; 100 / day, one call at a time; the call is cut off when the minutes run out.
 [from-customer]
-exten => 911,1,GotoIf(\$[\${E911_ON} = 1]?go)
+; 911: only lines whose 911 address is registered at Telnyx; caller ID = their own number (so the address shows)
+exten => 911,1,AGI(gs-agi.py,e911,\${CHANNEL(endpoint)})
+ same => n,GotoIf(\$["\${GS_OK}" = "1"]?go)
  same => n,Playback(ss-noservice)
  same => n,Hangup()
- same => n(go),Dial(PJSIP/911@carrier,120)
+ same => n(go),Set(CALLERID(all)=<\${GS_CID}>)
+ same => n,Dial(PJSIP/911@carrier,120)
  same => n,Hangup()
 exten => _NXXNXXXXXX,1,Goto(from-customer,1\${EXTEN},1)
 exten => _+1NXXNXXXXXX,1,Goto(from-customer,\${EXTEN:1},1)
@@ -378,6 +381,7 @@ c.update({"sip_domain": dom, "telnyx_api_key": key, "telnyx_connection_id": conn
 json.dump(c, open(p, "w"), indent=2)
 EOF
 chown -R asterisk:asterisk /opt/gsvoice /var/lib/gsvoice /etc/gsvoice; chmod 640 "$GSJ"; chmod 750 /etc/gsvoice
+echo '41 5 * * * asterisk /usr/bin/python3 /opt/gsvoice/gsvoice.py daily >/dev/null 2>&1' > /etc/cron.d/gsvoice-daily   # releases numbers unpaid 30+ days
 cat > /etc/systemd/system/gsvoice-api.service <<EOF
 [Unit]
 Description=GlobaleSIM Voice customer API

@@ -60,6 +60,10 @@ def db():
     CREATE INDEX IF NOT EXISTS calls_user_time ON calls(sip_user, started_at);
     CREATE UNIQUE INDEX IF NOT EXISTS customers_did ON customers(did) WHERE did IS NOT NULL AND did <> '';
     """)
+    cols = {r[1] for r in con.execute("PRAGMA table_info(customers)")}
+    for col, typ in (("phone_id", "TEXT"), ("e911", "INTEGER DEFAULT 0"), ("e911_address_id", "TEXT"), ("e911_json", "TEXT"),
+                     ("paused_at", "TEXT"), ("sub_ref", "TEXT")):
+        if col not in cols: con.execute(f"ALTER TABLE customers ADD COLUMN {col} {typ}")
     return con
 
 # ---------------------------------------------------------------- minutes & limits
@@ -172,6 +176,67 @@ def telnyx(method, path, body=None):
     except urllib.error.HTTPError as e:
         raise ApiError(502, "telnyx: " + e.read().decode(errors="replace")[:400])
 
+def telnyx_search(area_code="", contains="", limit=10):
+    params = {"filter[country_code]": "US", "filter[features][]": "voice", "filter[limit]": str(limit)}
+    if area_code: params["filter[national_destination_code]"] = digits(area_code)[:3]
+    if contains: params["filter[phone_number][contains]"] = digits(contains)
+    r = telnyx("GET", "/available_phone_numbers?" + urllib.parse.urlencode(params))
+    return [n.get("phone_number") for n in r.get("data", []) if n.get("phone_number")]
+
+def telnyx_phone_id(num):
+    for _ in range(12):                       # number orders finish in a few seconds
+        r = telnyx("GET", "/phone_numbers?" + urllib.parse.urlencode({"filter[phone_number]": "+" + num}))
+        d = r.get("data") or []
+        if d and d[0].get("id"): return d[0]["id"]
+        time.sleep(2)
+    return ""
+
+def telnyx_buy(num, area_code=""):
+    """Buy num (11 digits); if it's gone, take another from the same area code. Returns (num, phone_id)."""
+    tried, candidates = set(), [num] if num else []
+    if not candidates or area_code:
+        try: candidates += [digits(x) for x in telnyx_search(area_code or num[1:4], limit=5)]
+        except ApiError: pass
+    for n in candidates:
+        if not n or n in tried: continue
+        tried.add(n)
+        try:
+            r = telnyx("POST", "/number_orders", {"phone_numbers": [{"phone_number": "+" + n}], "connection_id": C["telnyx_connection_id"]})
+        except ApiError:
+            continue
+        if ((r.get("data") or {}).get("status") or "") in ("failure", "failed"): continue
+        pid = telnyx_phone_id(n)
+        if pid: return n, pid
+    raise ApiError(409, "no number available in that area code — try another")
+
+def telnyx_e911(phone_id, a):
+    """a = {name, street, unit, city, state, zip}. Returns address id (911 enabled) or raises ApiError."""
+    first, _, last = (a.get("name") or "").strip().partition(" ")
+    r = telnyx("POST", "/addresses", {"first_name": first or "Customer", "last_name": last or first or "Customer",
+                                       "business_name": a.get("name") or "GlobaleSIM customer", "street_address": a.get("street", ""),
+                                       "extended_address": a.get("unit", ""), "locality": a.get("city", ""), "administrative_area": a.get("state", ""),
+                                       "postal_code": a.get("zip", ""), "country_code": "US"})
+    aid = (r.get("data") or {}).get("id")
+    if not aid: raise ApiError(502, "telnyx: address not created")
+    telnyx("POST", f"/phone_numbers/{phone_id}/actions/enable_emergency", {"emergency_enabled": True, "emergency_address_id": str(aid)})
+    return str(aid)
+
+def release_number(con, c, why):
+    if c["phone_id"] and C["telnyx_api_key"]:
+        try: telnyx("DELETE", f"/phone_numbers/{c['phone_id']}")
+        except ApiError as e: event(con, c["sip_user"], "release_failed", e.msg[:200]); return False
+    con.execute("UPDATE customers SET did=NULL, phone_id=NULL, e911=0, status='canceled', note=? WHERE sip_user=?", (why, c["sip_user"]))
+    event(con, c["sip_user"], "released", f"{c['did']} {why}")
+    return True
+
+def daily_main():
+    """Cron: release numbers of lines unpaid for more than 30 days."""
+    with _lock, db() as con:
+        cutoff = iso(now() - dt.timedelta(days=30))
+        for c in con.execute("SELECT * FROM customers WHERE status='suspended' AND note LIKE 'unpaid%' AND paused_at IS NOT NULL AND paused_at < ?", (cutoff,)).fetchall():
+            release_number(con, c, "released after 30 days unpaid")
+        con.commit(); write_pjsip(con)
+
 # ---------------------------------------------------------------- AGI
 class Agi:
     def __init__(self):
@@ -199,6 +264,12 @@ def agi_main(args):
                 a.set("GS_CALLID", str(cur.lastrowid)); a.set("GS_CID", "+" + cust["did"]); a.set("GS_MAXMS", str(int(maxsec * 1000)))
             else:
                 event(con, user, "blocked_out", f"{reason} {dest}")
+        elif mode == "e911":              # e911 <endpoint>
+            cust = con.execute("SELECT * FROM customers WHERE sip_user=?", (args[1],)).fetchone()
+            ok = bool(cust and cust["e911"] and cust["did"])
+            a.set("GS_OK", "1" if ok else "0")
+            if ok: a.set("GS_CID", "+" + cust["did"])
+            event(con, args[1], "e911_call", "routed" if ok else "no 911 address")
         elif mode == "in":                # in <exten> <to-header> <caller>
             did = digits(args[2]) or digits(args[1]); caller = digits(args[3]) if len(args) > 3 else ""
             cust = con.execute("SELECT * FROM customers WHERE did=? AND status='active'", (did,)).fetchone()
@@ -263,8 +334,42 @@ def api_route(method, path, q, body):
             event(con, user, "created", plan); con.commit(); write_pjsip(con)
             c = con.execute("SELECT * FROM customers WHERE sip_user=?", (user,)).fetchone()
             return dict(cust_json(con, c), sip_pass=pw, sip_server=C["sip_domain"])
+        if p == ["provision"] and method == "POST":
+            # one step after payment: customer (by email) + number (chosen, or same area code) + plan + 911 address
+            email = (body.get("email") or "").strip().lower(); plan = body.get("plan", "num300"); ref = str(body.get("ref", ""))[:80]
+            if "@" not in email or plan not in C["plans"]: raise ApiError(400, "email and plan required")
+            if ref:
+                done = con.execute("SELECT * FROM customers WHERE sub_ref=?", (ref,)).fetchone()
+                if done and done["did"]: return dict(cust_json(con, done), already=True)
+            c = con.execute("SELECT * FROM customers WHERE email=? AND status<>'canceled' ORDER BY created_at DESC LIMIT 1", (email,)).fetchone()
+            if c and c["did"]: raise ApiError(409, "this account already has a line")
+            if not c:
+                user = "c" + secrets.token_hex(5)
+                con.execute("INSERT INTO customers (sip_user, sip_pass, email, plan, period_anchor, created_at) VALUES (?,?,?,?,?,?)",
+                            (user, secrets.token_urlsafe(18), email, plan, now().date().isoformat(), iso(now())))
+                event(con, user, "created", plan)
+                c = con.execute("SELECT * FROM customers WHERE sip_user=?", (user,)).fetchone()
+            u = c["sip_user"]
+            con.execute("UPDATE customers SET plan=?, period_anchor=?, sub_ref=?, status='active', note=NULL, paused_at=NULL WHERE sip_user=?",
+                        (plan, now().date().isoformat(), ref or None, u))
+            con.commit()
+            want = digits(body.get("phone_number")); want = ("1" + want) if len(want) == 10 else want
+            num, pid = telnyx_buy(want, digits(body.get("area_code")))
+            con.execute("UPDATE customers SET did=?, phone_id=?, number_id=? WHERE sip_user=?", (num, pid, pid, u))
+            event(con, u, "number", num + (" (picked)" if num == want else f" (wanted {want or 'any'})"))
+            a911 = body.get("e911") or {}
+            if a911.get("street") and a911.get("zip"):
+                con.execute("UPDATE customers SET e911_json=? WHERE sip_user=?", (json.dumps(a911), u))
+                try:
+                    aid = telnyx_e911(pid, a911)
+                    con.execute("UPDATE customers SET e911=1, e911_address_id=? WHERE sip_user=?", (aid, u))
+                except ApiError as e:
+                    event(con, u, "e911_failed", e.msg[:200])
+            con.commit(); write_pjsip(con)
+            c = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
+            return dict(cust_json(con, c), picked=(num == want))
         if p == ["alerts"]:
-            return {"events": [dict(r) for r in con.execute("SELECT * FROM events WHERE kind IN ('auto_suspend','blocked_out','blocked_in') ORDER BY id DESC LIMIT 200")]}
+            return {"events": [dict(r) for r in con.execute("SELECT * FROM events WHERE kind IN ('auto_suspend','blocked_out','blocked_in','e911_failed','release_failed','released') ORDER BY id DESC LIMIT 200")]}
         if len(p) >= 2 and p[0] == "customers":
             c = con.execute("SELECT * FROM customers WHERE sip_user=?", (p[1],)).fetchone()
             if not c: raise ApiError(404, "no such customer")
@@ -289,18 +394,25 @@ def api_route(method, path, q, body):
             elif sub == "plan" and method == "POST":           # new/renewed paid month
                 plan = body.get("plan", c["plan"])
                 if plan not in C["plans"]: raise ApiError(400, "unknown plan")
-                con.execute("UPDATE customers SET plan=?, period_anchor=?, status=CASE WHEN status='canceled' THEN 'active' ELSE status END WHERE sip_user=?", (plan, now().date().isoformat(), u))
+                # renewal paid: fresh minutes; a line paused for non-payment comes back on (admin/robocall pauses stay)
+                con.execute("UPDATE customers SET plan=?, period_anchor=?, status=CASE WHEN status='suspended' AND note LIKE 'unpaid%' THEN 'active' ELSE status END, "
+                            "paused_at=CASE WHEN status='suspended' AND note LIKE 'unpaid%' THEN NULL ELSE paused_at END, "
+                            "note=CASE WHEN status='suspended' AND note LIKE 'unpaid%' THEN NULL ELSE note END WHERE sip_user=?", (plan, now().date().isoformat(), u))
                 event(con, u, "plan", plan); con.commit(); write_pjsip(con)
             elif sub == "topup" and method == "POST":
-                mins = int(body.get("minutes", C["topup_minutes"]))
+                mins = int(body.get("minutes", C["topup_minutes"])); tref = str(body.get("ref", ""))[:80]
+                if tref and con.execute("SELECT 1 FROM topups WHERE ref=?", (tref,)).fetchone(): return cust_json(con, c)
                 if not 0 < mins <= 5000: raise ApiError(400, "bad minutes")
                 con.execute("INSERT INTO topups (sip_user, minutes, period_start, created_at, ref) VALUES (?,?,?,?,?)",
                             (u, mins, usage(con, c)["period_start"], iso(now()), str(body.get("ref", ""))[:80]))
                 event(con, u, "topup", str(mins))
+            elif sub == "release" and method == "POST":
+                release_number(con, c, str(body.get("note", "released by admin"))[:200]); con.commit(); write_pjsip(con)
             elif sub == "status" and method == "POST":
                 st = body.get("status")
                 if st not in ("active", "suspended", "canceled"): raise ApiError(400, "bad status")
-                con.execute("UPDATE customers SET status=?, note=? WHERE sip_user=?", (st, str(body.get("note", ""))[:200], u))
+                con.execute("UPDATE customers SET status=?, note=?, paused_at=? WHERE sip_user=?",
+                            (st, str(body.get("note", ""))[:200], iso(now()) if st == "suspended" else None, u))
                 event(con, u, "status", st); con.commit(); write_pjsip(con)
             else:
                 raise ApiError(404, "not found")
@@ -335,6 +447,7 @@ def api_main():
 if __name__ == "__main__":
     if sys.argv[1:2] == ["api"]: api_main()
     elif sys.argv[1:2] == ["agi"]: agi_main(sys.argv[2:])
+    elif sys.argv[1:2] == ["daily"]: daily_main()
     elif sys.argv[1:2] == ["regen"]:
         with db() as con: write_pjsip(con)
     else: print(__doc__)
