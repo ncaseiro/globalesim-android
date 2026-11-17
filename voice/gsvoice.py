@@ -178,6 +178,28 @@ def prov_lookup(token, fname):
         event(con, c["sip_user"], "desk_prov", f"{c['desk_brand']} {mac}"); con.commit()
         return prov_config(c["desk_brand"] or "", c, c["display_name"])
 
+def ast_rx(cmd):
+    """Run one Asterisk console command (read-only status questions)."""
+    try: return subprocess.run(list(C.get("asterisk_cmd") or ["asterisk"]) + ["-rx", cmd], capture_output=True, text=True, timeout=5).stdout
+    except Exception: return ""
+
+_pres = {"t": 0.0, "on": set(), "busy": set()}
+def presence():
+    """Who is signed in (app, computer or desk phone) and who is on a call — cached a few seconds."""
+    if time.time() - _pres["t"] > 4:
+        on = set(base_user(a) for a in re.findall(r"Contact:\s+([A-Za-z0-9_-]+)/sip:", ast_rx("pjsip show contacts")))
+        busy = set(base_user(c) for c in re.findall(r"^PJSIP/([A-Za-z0-9_-]+)-[0-9a-f]{8}!", ast_rx("core show channels concise"), re.M))
+        _pres.update(t=time.time(), on=on, busy=busy)
+    return _pres
+
+def team_json(con, co, me=None):
+    pr = presence(); out = []
+    for m in con.execute("SELECT * FROM customers WHERE company_id=? AND status='active' ORDER BY ext", (co["id"],)):
+        u = m["sip_user"]
+        st = "busy" if u in pr["busy"] else ("dnd" if m["dnd"] else ("available" if u in pr["on"] else "offline"))
+        out.append({"ext": m["ext"], "name": m["display_name"] or "", "state": st, "me": u == me, "desk": bool(m["desk_pass"])})
+    return out
+
 def base_user(ep):
     for suf in ("-web", "-desk"):
         if ep and ep.endswith(suf): return ep[:-len(suf)]
@@ -951,6 +973,8 @@ def agi_main(args):
                 if ok:
                     cur = con.execute("INSERT INTO calls (sip_user, direction, peer, started_at, billsec, result) VALUES (?,?,?,?,0,?)", (cust["sip_user"], "out", num, iso(now()), mode))
                     a.set("GS_OK", "1"); a.set("GS_NUM", num); a.set("GS_XCALL", str(cur.lastrowid)); a.set("GS_XMAX", str(max(60, int(maxsec))))
+                    # the carrier only accepts our own numbers as caller ID (the original caller's number is refused)
+                    a.set("GS_CID", "+" + ((co_main_did(con, co) if co else "") or cust["did"] or ""))
                 else:
                     event(con, cust["sip_user"], "blocked_out", f"{mode} {num} {reason}")
             if cust: event(con, cust["sip_user"], mode, f"to {t or '?'}")
@@ -1288,7 +1312,10 @@ def api_route(method, path, q, body):
                 return {"on": bool(c["desk_pass"]), "server": C["sip_domain"], "username": u + "-desk", "password": c["desk_pass"] or "",
                         "ports": {"udp": 5060, "tcp": 5060, "tls": 5061}, "brand": c["desk_brand"] or "", "mac": c["desk_mac"] or "",
                         "prov_url": f"https://{C['sip_domain']}/prov/{co['prov_token']}/" if co and co["prov_token"] else "", "prov_file": ext_file,
-                        "registered": bool(subprocess.run(["asterisk", "-rx", f"pjsip show aor {u}-desk"], capture_output=True, text=True, timeout=5).stdout.count("Contact:  " + u + "-desk/")) if c["desk_pass"] else False}
+                        "registered": bool(ast_rx(f"pjsip show aor {u}-desk").count("Contact:  " + u + "-desk/")) if c["desk_pass"] else False}
+            if sub == "team" and method == "GET":              # the company's extensions and who is free right now
+                co = co_of(con, c)
+                return {"team": team_json(con, co, u) if co else []}
             if sub == "forward" and method == "POST":         # call forwarding + do not disturb
                 mode = str(body.get("mode") or ""); to = digits(str(body.get("to") or ""))
                 if mode not in ("", "always", "busy", "noanswer", "busy_noanswer"): raise ApiError(400, "bad mode")
