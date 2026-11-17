@@ -254,6 +254,10 @@ exten => _.,1,Set(GS_TO=\${PJSIP_HEADER(read,To)})
 exten => s,1,AGI(gs-agi.py,charge,\${ARG1},\${ANSWEREDTIME})
  same => n,Return()
 
+; Text messages sent FROM the app: not offered (receive-only line) — drop them
+[gs-messages]
+exten => _.,1,Hangup()
+
 ; Calls made by paying customers from the GlobaleSIM app
 ; Checked by gsvoice before every call: active account, minutes left, max 5 calls / 10 min,
 ; 100 / day, one call at a time; the call is cut off when the minutes run out.
@@ -372,12 +376,28 @@ cat > "$AGIDIR/gs-agi.py" <<'EOF'
 import sys; sys.path.insert(0, "/opt/gsvoice"); import gsvoice; gsvoice.agi_main(sys.argv[1:])
 EOF
 chmod 755 "$AGIDIR/gs-agi.py"
-python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" <<'EOF'
+# Asterisk manager (local only): lets gsvoice hand incoming texts to the app
+AMI_SECRET=$(jget ami_secret); [ -n "$AMI_SECRET" ] || AMI_SECRET=$(openssl rand -hex 16)
+cat > /etc/asterisk/manager.conf <<EOF
+[general]
+enabled = yes
+bindaddr = 127.0.0.1
+port = 5038
+
+[gsvoice]
+secret = $AMI_SECRET
+deny = 0.0.0.0/0.0.0.0
+permit = 127.0.0.1/255.255.255.255
+read = system
+write = message
+EOF
+chown asterisk:asterisk /etc/asterisk/manager.conf; chmod 640 /etc/asterisk/manager.conf
+python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" "$AMI_SECRET" <<'EOF'
 import json, sys
-p, dom, key, conn, tok, did, test = sys.argv[1:8]
+p, dom, key, conn, tok, did, test, ami = sys.argv[1:9]
 try: c = json.load(open(p))
 except Exception: c = {}
-c.update({"sip_domain": dom, "telnyx_api_key": key, "telnyx_connection_id": conn, "api_token": tok, "company_did": did, "test_user": test})
+c.update({"sip_domain": dom, "telnyx_api_key": key, "telnyx_connection_id": conn, "api_token": tok, "company_did": did, "test_user": test, "ami_secret": ami})
 json.dump(c, open(p, "w"), indent=2)
 EOF
 chown -R asterisk:asterisk /opt/gsvoice /var/lib/gsvoice /etc/gsvoice; chmod 640 "$GSJ"; chmod 750 /etc/gsvoice
@@ -418,6 +438,12 @@ systemctl restart gsvoice-api caddy
 say "6/6 Starting Asterisk"
 systemctl enable asterisk >/dev/null 2>&1
 systemctl restart asterisk
+# Receive-only texting: Telnyx messaging profile → https://$API_DOMAIN/api/sms/in/… and every number attached
+if [ -n "$TX_KEY" ]; then
+  GSVOICE_CONF="$GSJ" python3 /opt/gsvoice/gsvoice.py sms-setup || true
+  chown asterisk:asterisk "$GSJ"; chmod 640 "$GSJ"
+  systemctl restart gsvoice-api
+fi
 sleep 6
 asterisk -rx "logger reload" >/dev/null || true
 if [ -n "$DL_USER" ]; then asterisk -rx "pjsip show registrations" | grep -E "carrier-reg" || true; fi

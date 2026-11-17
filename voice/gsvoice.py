@@ -24,6 +24,9 @@ DEFAULTS = {
     "limits": {"new_calls_per_10min": 5, "calls_per_day": 100, "new_account_days": 7, "new_account_minutes": 100,
                "robocall_window_min": 30, "robocall_calls": 8, "robocall_short_sec": 15, "robocall_short_calls": 6},
     "reload_cmd": ["asterisk", "-rx", "module reload res_pjsip.so"],
+    # receive-only texting: Telnyx → webhook /api/sms/in/<sms_hook_token> → Asterisk (AMI MessageSend) → the app
+    "sms_hook_token": "", "messaging_profile_id": "",
+    "ami_host": "127.0.0.1", "ami_port": 5038, "ami_user": "gsvoice", "ami_secret": "",
 }
 
 def conf():
@@ -58,6 +61,9 @@ def db():
         started_at TEXT, billsec INTEGER, minutes INTEGER DEFAULT 0, result TEXT);
     CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, sip_user TEXT, ts TEXT, kind TEXT, detail TEXT);
     CREATE INDEX IF NOT EXISTS calls_user_time ON calls(sip_user, started_at);
+    CREATE TABLE IF NOT EXISTS texts (id INTEGER PRIMARY KEY, sip_user TEXT, did TEXT, peer TEXT, body TEXT, media INTEGER DEFAULT 0,
+        received_at TEXT, delivered INTEGER DEFAULT 0, tries INTEGER DEFAULT 0, tx_id TEXT UNIQUE);
+    CREATE INDEX IF NOT EXISTS texts_user ON texts(sip_user, id);
     CREATE UNIQUE INDEX IF NOT EXISTS customers_did ON customers(did) WHERE did IS NOT NULL AND did <> '';
     """)
     cols = {r[1] for r in con.execute("PRAGMA table_info(customers)")}
@@ -132,6 +138,7 @@ def write_pjsip(con):
 [{u}]
 type=endpoint
 context=from-customer
+message_context=gs-messages
 disallow=all
 allow=ulaw,alaw,g722
 auth={u}-auth
@@ -236,6 +243,112 @@ def daily_main():
         for c in con.execute("SELECT * FROM customers WHERE status='suspended' AND note LIKE 'unpaid%' AND paused_at IS NOT NULL AND paused_at < ?", (cutoff,)).fetchall():
             release_number(con, c, "released after 30 days unpaid")
         con.commit(); write_pjsip(con)
+
+# ---------------------------------------------------------------- texts (receive only)
+import base64, socket
+
+def ami_message(sip_user, peer, body):
+    """Hand a text to the customer's app through Asterisk (SIP MESSAGE). True if Asterisk accepted it."""
+    if not C["ami_secret"]: return False
+    try:
+        with socket.create_connection((C["ami_host"], int(C["ami_port"])), timeout=5) as sk:
+            f = sk.makefile("rwb")
+            f.readline()                                           # banner
+            def act(lines):
+                f.write(("".join(f"{k}: {v}\r\n" for k, v in lines) + "\r\n").encode()); f.flush()
+                resp = {}
+                while True:
+                    ln = f.readline().decode(errors="replace").strip()
+                    if not ln: break
+                    k, _, v = ln.partition(":"); resp[k.strip()] = v.strip()
+                return resp
+            if act([("Action", "Login"), ("Username", C["ami_user"]), ("Secret", C["ami_secret"]), ("Events", "off")]).get("Response") != "Success": return False
+            frm = f'"{fmt_num(peer)}" <sip:+{peer}@{C["sip_domain"]}>' if peer else f'<sip:unknown@{C["sip_domain"]}>'
+            r = act([("Action", "MessageSend"), ("To", f"pjsip:{sip_user}"), ("From", frm),
+                     ("Base64Body", base64.b64encode(body.encode()).decode())])
+            act([("Action", "Logoff")])
+            return r.get("Response") == "Success"
+    except OSError:
+        return False
+
+def fmt_num(d):
+    d = digits(d)
+    if len(d) == 11 and d[0] == "1": d = d[1:]
+    return f"({d[:3]}) {d[3:6]}-{d[6:]}" if len(d) == 10 else d
+
+def sms_in(payload):
+    """Telnyx 'message.received' → store, then push to the app if it's online."""
+    to = digits(((payload.get("to") or [{}])[0] or {}).get("phone_number", ""))
+    frm = digits((payload.get("from") or {}).get("phone_number", ""))
+    text = (payload.get("text") or "").strip()[:1600]
+    media = len(payload.get("media") or [])
+    if media and not text: text = "[photo or file — not shown]"
+    elif media: text += "\n[photo or file — not shown]"
+    with _lock, db() as con:
+        cust = con.execute("SELECT * FROM customers WHERE did=? AND status<>'canceled'", (to,)).fetchone()
+        user = cust["sip_user"] if cust else (C["test_user"] if C["company_did"] and to == digits(C["company_did"]) else "")
+        if not user: event(con, "", "text_unknown", f"to={to} from={frm}"); con.commit(); return
+        if con.execute("SELECT COUNT(*) FROM texts WHERE sip_user=? AND received_at > ?", (user, iso(now() - dt.timedelta(days=1)))).fetchone()[0] >= 300:
+            return                                                # flood guard
+        try:
+            cur = con.execute("INSERT INTO texts (sip_user, did, peer, body, media, received_at, tx_id) VALUES (?,?,?,?,?,?,?)",
+                              (user, to, frm, text, media, iso(now()), str(payload.get("id") or secrets.token_hex(8))))
+        except sqlite3.IntegrityError:
+            return                                                # Telnyx retry of a text we already have
+        con.commit(); tid = cur.lastrowid
+        active = (cust is None) or cust["status"] == "active"
+    if active and ami_message(user, frm, text):
+        with _lock, db() as con: con.execute("UPDATE texts SET delivered=1 WHERE id=?", (tid,)); con.commit()
+
+def sms_retry_loop():
+    """Every minute: re-send texts the app missed while offline (last 24 h, up to 30 tries)."""
+    while True:
+        time.sleep(60)
+        try:
+            with _lock, db() as con:
+                rows = con.execute("SELECT t.* FROM texts t JOIN customers c ON c.sip_user=t.sip_user WHERE t.delivered=0 AND t.tries<30 AND c.status='active' AND t.received_at > ? ORDER BY t.id LIMIT 50",
+                                   (iso(now() - dt.timedelta(days=1)),)).fetchall()
+                if C["test_user"]:
+                    rows += con.execute("SELECT * FROM texts WHERE sip_user=? AND delivered=0 AND tries<30 AND received_at > ? LIMIT 20", (C["test_user"], iso(now() - dt.timedelta(days=1)))).fetchall()
+            for t in rows:
+                ok = ami_message(t["sip_user"], t["peer"], t["body"])
+                with _lock, db() as con: con.execute("UPDATE texts SET delivered=?, tries=tries+1 WHERE id=?", (1 if ok else 0, t["id"])); con.commit()
+        except Exception as e:
+            sys.stderr.write("sms retry %r\n" % e)
+
+def sms_attach(phone_id):
+    if C["messaging_profile_id"] and phone_id:
+        try: telnyx("PATCH", f"/phone_numbers/{phone_id}/messaging", {"messaging_profile_id": C["messaging_profile_id"]}); return True
+        except ApiError as e: sys.stderr.write("sms attach %s: %s\n" % (phone_id, e.msg))
+    return False
+
+def sms_setup(conf_path):
+    """Installer step: create/refresh the Telnyx messaging profile (receive only) and attach every number."""
+    c = json.load(open(conf_path))
+    if not c.get("sms_hook_token"): c["sms_hook_token"] = secrets.token_urlsafe(24)
+    hook = f"https://{C['sip_domain']}/api/sms/in/{c['sms_hook_token']}"
+    C["sms_hook_token"] = c["sms_hook_token"]
+    body = {"webhook_url": hook, "webhook_api_version": "2", "enabled": True}
+    pid = c.get("messaging_profile_id", "")
+    try:
+        if pid: telnyx("PATCH", f"/messaging_profiles/{pid}", body)
+        else:
+            r = telnyx("POST", "/messaging_profiles", dict(body, name="GlobaleSIM Phone (receive only)", whitelisted_destinations=["US"]))
+            pid = (r.get("data") or {}).get("id", "")
+    except ApiError as e:
+        print("  texting: Telnyx messaging profile failed:", e.msg); json.dump(c, open(conf_path, "w"), indent=2); return
+    c["messaging_profile_id"] = pid; C["messaging_profile_id"] = pid
+    json.dump(c, open(conf_path, "w"), indent=2)
+    n = 0
+    with db() as con:
+        nums = [(r["phone_id"], r["did"]) for r in con.execute("SELECT phone_id, did FROM customers WHERE did IS NOT NULL AND did<>''")]
+    if C["company_did"]: nums.append(("", digits(C["company_did"])))
+    for pidn, did in nums:
+        if not pidn:
+            try: pidn = ((telnyx("GET", "/phone_numbers?" + urllib.parse.urlencode({"filter[phone_number]": "+" + did})).get("data") or [{}])[0] or {}).get("id", "")
+            except ApiError: pidn = ""
+        n += sms_attach(pidn)
+    print(f"  texting: receive-only profile {pid}, {n} number(s) attached")
 
 # ---------------------------------------------------------------- AGI
 class Agi:
@@ -374,6 +487,7 @@ def api_route(method, path, q, body):
             taken = {r[0] for r in con.execute("SELECT did FROM customers WHERE did IS NOT NULL")}
             num, pid = telnyx_buy(want, digits(body.get("area_code")), taken)
             con.execute("UPDATE customers SET did=?, phone_id=?, number_id=? WHERE sip_user=?", (num, pid, pid, u))
+            sms_attach(pid)                                   # receive texts on the new number
             event(con, u, "number", num + (" (picked)" if num == want else f" (wanted {want or 'any'})"))
             a911 = body.get("e911") or {}
             if a911.get("street") and a911.get("zip"):
@@ -387,7 +501,7 @@ def api_route(method, path, q, body):
             c = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
             return dict(cust_json(con, c), picked=(num == want))
         if p == ["alerts"]:
-            return {"events": [dict(r) for r in con.execute("SELECT * FROM events WHERE kind IN ('auto_suspend','blocked_out','blocked_in','unknown_in','e911_failed','release_failed','released') ORDER BY id DESC LIMIT 200")]}
+            return {"events": [dict(r) for r in con.execute("SELECT * FROM events WHERE kind IN ('auto_suspend','blocked_out','blocked_in','unknown_in','text_unknown','e911_failed','release_failed','released') ORDER BY id DESC LIMIT 200")]}
         if len(p) >= 2 and p[0] == "customers":
             c = con.execute("SELECT * FROM customers WHERE sip_user=?", (p[1],)).fetchone()
             if not c: raise ApiError(404, "no such customer")
@@ -395,6 +509,7 @@ def api_route(method, path, q, body):
             if sub == "" and method == "GET":
                 d = cust_json(con, c)
                 d["recent_calls"] = [dict(r) for r in con.execute("SELECT direction, peer, started_at, billsec, minutes, result FROM calls WHERE sip_user=? ORDER BY id DESC LIMIT 50", (u,))]
+                d["texts"] = [dict(r) for r in con.execute("SELECT id, peer, body, received_at FROM texts WHERE sip_user=? ORDER BY id DESC LIMIT 50", (u,))]
                 return d
             if sub == "credentials" and method == "GET":     # for the app, after the website verified the signed-in owner
                 return {"sip_user": u, "sip_pass": c["sip_pass"], "sip_server": C["sip_domain"], "did": c["did"]}
@@ -443,6 +558,19 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *a): sys.stderr.write("api %s %s\n" % (self.address_string(), fmt % a))
     def _go(self, method):
         try:
+            if method == "POST" and self.path.startswith("/api/sms/in/"):   # Telnyx webhook (secret in the URL)
+                n = int(self.headers.get("Content-Length") or 0); raw = self.rfile.read(min(n, 200000)) if n else b"{}"
+                tokp = self.path.rsplit("/", 1)[-1].split("?")[0]
+                if C["sms_hook_token"] and hmac.compare_digest(tokp, C["sms_hook_token"]):
+                    try:
+                        d = (json.loads(raw or b"{}").get("data") or {})
+                        if d.get("event_type") == "message.received": sms_in(d.get("payload") or {})
+                    except Exception as e: sys.stderr.write("sms in %r\n" % e)
+                    res, code = {"ok": True}, 200
+                else: res, code = {"error": "not found"}, 404
+                b = json.dumps(res).encode()
+                self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+                return
             tok = self.headers.get("Authorization", "")
             if not C["api_token"] or not hmac.compare_digest(tok, "Bearer " + C["api_token"]): raise ApiError(401, "unauthorized")
             u = urllib.parse.urlparse(self.path)
@@ -460,12 +588,14 @@ class Handler(BaseHTTPRequestHandler):
 
 def api_main():
     with db() as con: write_pjsip(con)
+    threading.Thread(target=sms_retry_loop, daemon=True).start()
     ThreadingHTTPServer((C["api_listen"], int(C["api_port"])), Handler).serve_forever()
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["api"]: api_main()
     elif sys.argv[1:2] == ["agi"]: agi_main(sys.argv[2:])
     elif sys.argv[1:2] == ["daily"]: daily_main()
+    elif sys.argv[1:2] == ["sms-setup"]: sms_setup(os.environ.get("GSVOICE_CONF", "/etc/gsvoice/gsvoice.json"))
     elif sys.argv[1:2] == ["regen"]:
         with db() as con: write_pjsip(con)
     else: print(__doc__)
