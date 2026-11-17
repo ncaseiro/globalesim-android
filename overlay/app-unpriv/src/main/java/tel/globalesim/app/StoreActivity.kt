@@ -1,5 +1,6 @@
 package tel.globalesim.app
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ClipData
@@ -10,6 +11,8 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.app.NotificationManager
 import android.provider.Settings
 import android.telephony.euicc.EuiccManager
 import android.view.View
@@ -64,6 +67,17 @@ class StoreActivity : Activity() {
             userAgentString = "$userAgentString GlobaleSIMApp/1"
         }
         web.addJavascriptInterface(Bridge(), "GlobaleSIM")
+        // GlobaleSIM Phone: native calling engine, reports to the page as window.gsVoiceEvent(json)
+        runCatching { VoiceManager.init(this) }
+        VoiceManager.listener = { js ->
+            runOnUiThread {
+                web.evaluateJavascript("window.gsVoiceEvent && window.gsVoiceEvent($js)", null)
+                if (js.contains("\"ended\":true") && !VoiceManager.inCall()) showOverLock(false)
+            }
+        }
+        // keep the line signed in while the app is closed (rings like a normal phone)
+        VoiceService.start(this)
+        handleCallIntent(intent)
         web.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val u = request.url
@@ -82,7 +96,60 @@ class StoreActivity : Activity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
+        handleCallIntent(intent)
         if (intent.data != null) web.loadUrl(urlFor(intent))
+    }
+
+    override fun onResume() { super.onResume(); VoiceManager.uiVisible = true }
+    override fun onPause() { VoiceManager.uiVisible = false; super.onPause() }
+
+    /** Opened from the incoming-call notification: show over the lock screen, answer if asked. */
+    private var answerAfterMic = false
+    private fun handleCallIntent(i: Intent?) {
+        if (i?.getBooleanExtra(CallNotif.EXTRA_INCOMING, false) != true) return
+        showOverLock(true)
+        if (i.getBooleanExtra(CallNotif.EXTRA_ANSWER, false)) {
+            i.removeExtra(CallNotif.EXTRA_ANSWER)
+            if (hasMic()) VoiceManager.answer() else { answerAfterMic = true; askMic() }
+        }
+    }
+    private fun showOverLock(on: Boolean) {
+        if (Build.VERSION.SDK_INT >= 27) { setShowWhenLocked(on); setTurnScreenOn(on) }
+    }
+
+    // ---- what the phone must allow so calls ring when the app is closed ----
+    private fun notifOk() = Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+    private fun overlayOk() = Settings.canDrawOverlays(this)
+    private fun batteryOk() = getSystemService(PowerManager::class.java)?.isIgnoringBatteryOptimizations(packageName) ?: true
+    private fun fullScreenOk() = Build.VERSION.SDK_INT < 34 || (getSystemService(NotificationManager::class.java)?.canUseFullScreenIntent() ?: true)
+
+    override fun onDestroy() {
+        VoiceManager.listener = null
+        super.onDestroy()
+    }
+
+    private val MIC_REQUEST = 7
+    private val NOTIF_REQUEST = 8
+    private fun hasMic() = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    private fun askMic() {
+        val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= 31) perms += Manifest.permission.BLUETOOTH_CONNECT
+        requestPermissions(perms.toTypedArray(), MIC_REQUEST)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == MIC_REQUEST) {
+            if (answerAfterMic) { answerAfterMic = false; if (hasMic()) VoiceManager.answer() }
+            val js = JSONObject().put("type", "perm").put("mic", hasMic()).toString()
+            web.evaluateJavascript("window.gsVoiceEvent && window.gsVoiceEvent($js)", null)
+        }
+        if (requestCode == NOTIF_REQUEST) {
+            VoiceService.start(this)
+            val js = JSONObject().put("type", "bg").toString()
+            web.evaluateJavascript("window.gsVoiceEvent && window.gsVoiceEvent($js)", null)
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -103,6 +170,7 @@ class StoreActivity : Activity() {
     /** globalesim://order/<token> → store order page */
     private fun urlFor(i: Intent?): String {
         val d = i?.data ?: return STORE_URL
+        if (d.scheme == "globalesim" && d.host == "phone") return if (i.getBooleanExtra("gs_texts", false)) "$STORE_URL?phone&texts=1" else "$STORE_URL?phone"
         if (d.scheme == "globalesim" && d.host == "order") {
             val token = d.lastPathSegment ?: ""
             if (Regex("^[a-f0-9]{32}$").matches(token)) return "$STORE_URL?order=$token"
@@ -143,7 +211,10 @@ class StoreActivity : Activity() {
             .put("esim", phoneHasEsim())
             .put("android", Build.VERSION.SDK_INT)
             .put("model", "${Build.MANUFACTURER} ${Build.MODEL}")
-            .put("app", 3)
+            .put("app", 5)
+            .put("voice", true)
+            .put("voiceBg", true)
+            .put("mic", hasMic())
             .put("cardManager", true)
             .toString()
 
@@ -221,6 +292,59 @@ class StoreActivity : Activity() {
                 }
             }
         }
+
+        // ---------------- GlobaleSIM Phone ----------------
+        /** Asks for the microphone if needed; returns true when calls can use it. */
+        @JavascriptInterface
+        fun voiceReady(): Boolean {
+            if (hasMic()) return true
+            runOnUiThread { askMic() }
+            return false
+        }
+        @JavascriptInterface fun voiceLogin(json: String) = VoiceManager.login(json)
+
+        /** What's still missing for calls to ring with the app closed: {"notif":bool,"battery":bool,"fullscreen":bool} */
+        @JavascriptInterface
+        fun voiceBackground(): String = JSONObject()
+            .put("notif", notifOk()).put("overlay", overlayOk()).put("battery", batteryOk()).put("fullscreen", fullScreenOk()).toString()
+
+        /** Ask for the next missing one (notifications → battery → full-screen calls). */
+        @SuppressLint("BatteryLife")
+        @JavascriptInterface
+        fun voiceFixBackground() {
+            runOnUiThread {
+                try {
+                    when {
+                        !notifOk() -> requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), NOTIF_REQUEST)
+                        !overlayOk() -> startActivity(
+                            Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                        !batteryOk() -> startActivity(
+                            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                        !fullScreenOk() && Build.VERSION.SDK_INT >= 34 -> startActivity(
+                            Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:$packageName")))
+                    }
+                } catch (e: Exception) {
+                    startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+                }
+            }
+        }
+        @JavascriptInterface fun voiceLogout() = VoiceManager.logout()
+        @JavascriptInterface fun voiceState(): String = VoiceManager.snapshot()
+        @JavascriptInterface
+        fun voiceCall(number: String) {
+            if (!hasMic()) { runOnUiThread { askMic() }; return }
+            VoiceManager.call(number)
+        }
+        @JavascriptInterface
+        fun voiceAnswer() {
+            if (!hasMic()) { runOnUiThread { askMic() }; return }
+            VoiceManager.answer()
+        }
+        @JavascriptInterface fun voiceDecline() = VoiceManager.decline()
+        @JavascriptInterface fun voiceHangup() = VoiceManager.hangup()
+        @JavascriptInterface fun voiceDtmf(d: String) = VoiceManager.dtmf(d)
+        @JavascriptInterface fun voiceMute(on: Boolean) = VoiceManager.mute(on)
+        @JavascriptInterface fun voiceSpeaker(on: Boolean) = VoiceManager.speaker(on)
 
         @JavascriptInterface
         fun openExternal(url: String) {
