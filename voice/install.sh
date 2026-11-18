@@ -257,7 +257,7 @@ exten => _.,1,Set(GS_TO=\${PJSIP_HEADER(read,To)})
  same => n,GotoIf(\$["\${GS_MODE}" = "closed"]?gs-closed,s,1)
  same => n,GotoIf(\$["\${GS_DND}" = "1"]?gs-vm,s,1)
  same => n,GotoIf(\$["\${GS_FWD}" = "always"]?gs-fwd,s,1)
- same => n,Dial(\${GS_DIALS},25,L(\${GS_MAXMS}))
+ same => n,Dial(\${GS_DIALS},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID})))
  same => n,GotoIf(\$[\${REGEX("^(\${GS_FWDON})\$" \${DIALSTATUS})}]?gs-fwd,s,1)
  same => n,Goto(gs-vm,s,1)
 
@@ -288,7 +288,7 @@ exten => s,1,GotoIf(\$["\${GS_ACT}" = "repeat"]?gs-ivr,s,menu)
  same => n,GotoIf(\$["\${GS_ACT}" = "dial"]?dial)
  same => n,Playback(pbx-invalid)
  same => n,Goto(gs-ivr,s,menu)
- same => n(dial),Dial(\${GS_DIAL},25,L(\${GS_MAXMS}))
+ same => n(dial),Dial(\${GS_DIAL},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID})))
  same => n,Goto(gs-vm,s,1)
 
 ; Outside business hours: closed greeting, then voicemail
@@ -315,6 +315,15 @@ exten => s,1,GotoIf(\$["\${GS_VMUSER}" = ""]?none)
 
 [gs-vmsave]
 exten => s,1,AGI(gs-agi.py,vmsave,\${ARG1},\${ARG2},\${ARG3})
+ same => n,Return()
+
+; Call quality: on the customer's own leg (their device <-> this server) — jitter, packet loss and delay, saved with the call
+[gs-qos]
+exten => s,1,AGI(gs-agi.py,qos,\${ARG1},\${CHANNEL(rtcp,all)},\${CHANNEL(pjsip,remote_addr)},\${CHANNEL(endpoint)})
+ same => n,Return()
+; incoming calls: each device that rings gets the same handler (b() runs on the dialed channel)
+[gs-qospre]
+exten => s,1,Set(CHANNEL(hangup_handler_push)=gs-qos,s,1(\${ARG1}))
  same => n,Return()
 
 ; After every customer call: charge the minutes (rounded up) and run the robocall check
@@ -412,6 +421,7 @@ exten => _1NXXNXXXXXX,1,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n,GotoIf(\$[\${GROUP_COUNT(\${GS_CO}@gsco)} > \${GS_COMAX}]?blocked)
  same => n(go),Set(CALLERID(all)=<\${GS_CID}>)
  same => n,Set(CHANNEL(hangup_handler_push)=gs-charge,s,1(\${GS_CALLID}))
+ same => n,Set(CHANNEL(hangup_handler_push)=gs-qos,s,1(\${GS_CALLID}))
  same => n,Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60,L(\${GS_MAXMS})U(gs-outans^s^1^\${GS_CALLID}^\${GS_MAXSEC}))
  same => n,Hangup()
  same => n(blocked),Playback(ss-noservice)

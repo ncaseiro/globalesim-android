@@ -97,6 +97,9 @@ def db():
                      ("fwd_mode", "TEXT DEFAULT ''"), ("fwd_to", "TEXT"), ("dnd", "INTEGER DEFAULT 0"),
                      ("desk_pass", "TEXT"), ("desk_brand", "TEXT"), ("desk_mac", "TEXT"), ("billing", "TEXT DEFAULT 'paypal'"), ("admin_note", "TEXT")):
         if col not in cols: con.execute(f"ALTER TABLE customers ADD COLUMN {col} {typ}")
+    kc = {r[1] for r in con.execute("PRAGMA table_info(calls)")}
+    for col, typ in (("q_jitter", "REAL"), ("q_loss", "REAL"), ("q_rtt", "REAL"), ("q_mos", "REAL"), ("q_pkts", "INTEGER"), ("q_ip", "TEXT"), ("q_dev", "TEXT")):
+        if col not in kc: con.execute(f"ALTER TABLE calls ADD COLUMN {col} {typ}")
     cc = {r[1] for r in con.execute("PRAGMA table_info(companies)")}
     for col, typ in (("comp", "INTEGER DEFAULT 0"), ("voice", "TEXT DEFAULT ''"), ("rec_main", "INTEGER DEFAULT 0"), ("rec_closed", "INTEGER DEFAULT 0"), ("prov_token", "TEXT"), ("billing", "TEXT DEFAULT 'paypal'"), ("admin_note", "TEXT")):
         if col not in cc: con.execute(f"ALTER TABLE companies ADD COLUMN {col} {typ}")
@@ -208,6 +211,23 @@ def team_json(con, co, me=None):
         st = "busy" if u in pr["busy"] else ("dnd" if m["dnd"] else ("available" if u in pr["on"] else "offline"))
         out.append({"ext": m["ext"], "name": m["display_name"] or "", "state": st, "me": u == me, "desk": bool(m["desk_pass"])})
     return out
+
+def qos_parse(rtcp):
+    """Asterisk CHANNEL(rtcp,all) string -> (jitter ms, loss %, round-trip ms, packets, MOS 1-4.5) or None if no audio flowed.
+    The leg measured is the customer's device <-> our server, so it shows their internet, not the carrier's."""
+    kv = dict(x.split("=", 1) for x in (rtcp or "").split(";") if "=" in x)
+    f = lambda k: float(kv.get(k) or 0)
+    rx, tx, lp, rlp = f("rxcount"), f("txcount"), max(0.0, f("lp")), max(0.0, f("rlp"))
+    if rx + tx < 50: return None                                  # under ~1 second of audio: nothing to judge
+    loss = max(lp / (rx + lp) if rx + lp else 0, rlp / (tx + rlp) if tx + rlp else 0) * 100
+    jit = max(f("rxjitter"), f("txjitter")) * 1000; rtt = f("rtt") * 1000
+    eff = rtt / 2 + 2 * jit + 10                                  # simplified ITU E-model
+    r = (93.2 - eff / 40 if eff < 160 else 93.2 - (eff - 120) / 10) - 95 * loss / (loss + 10)   # packet-loss impairment (G.711 with concealment)
+    r = max(0, min(100, r)); mos = 1 + 0.035 * r + 7e-6 * r * (r - 60) * (100 - r)
+    return round(jit, 1), round(loss, 2), round(rtt, 1), int(rx + tx), round(max(1.0, min(4.5, mos)), 2)
+
+def qos_grade(mos):
+    return "good" if mos >= 4.0 else "fair" if mos >= 3.6 else "poor"
 
 def base_user(ep):
     for suf in ("-web", "-desk"):
@@ -1122,6 +1142,16 @@ def agi_main(args):
                 con.commit()
                 if cust: notify_site("voicemail", {"id": cur.lastrowid, "email": cust["email"], "did": cust["did"] or "", "ext": cust["ext"] or "",
                                                    "caller": caller, "secs": secs, "created_at": iso(now())})
+        elif mode == "qos":               # qos <callid> <CHANNEL(rtcp,all)> <remote addr> <endpoint>  (hangup handler on the customer's leg)
+            cid = int(args[1] or 0) if len(args) > 1 and (args[1] or "").isdigit() else 0
+            q = qos_parse(args[2] if len(args) > 2 else "")
+            if cid and q:
+                ip = re.sub(r":\d+$", "", (args[3] if len(args) > 3 else "").strip("[] ")).strip("[]")[:45]
+                ep = args[4] if len(args) > 4 else ""
+                dev = "computer" if ep.endswith("-web") else "desk phone" if ep.endswith("-desk") else "app"
+                # several devices may ring: keep the leg that carried the most audio
+                con.execute("UPDATE calls SET q_jitter=?, q_loss=?, q_rtt=?, q_pkts=?, q_mos=?, q_ip=?, q_dev=? WHERE id=? AND COALESCE(q_pkts,0) < ?",
+                            (q[0], q[1], q[2], q[3], q[4], ip, dev, cid, q[3]))
         elif mode == "charge":            # charge <callid> <answered-seconds>
             cid = int(args[1] or 0); secs = int(float(args[2] or 0)) if len(args) > 2 and args[2] else 0
             if len(args) > 4 and args[3].isdigit() and args[4].isdigit():      # answered by the menu / voicemail (or the carrier leg)
@@ -1241,6 +1271,28 @@ def api_route(method, path, q, body):
             if st["phone_id"]: telnyx("DELETE", f"/phone_numbers/{st['phone_id']}")
             con.execute("DELETE FROM stock WHERE number=?", (st["number"],)); event(con, "admin", "stock_release", st["number"]); con.commit()
             return {"ok": True}
+        if p == ["quality"] and method == "GET":                    # admin: call quality of the last N days
+            days = max(1, min(90, int(q.get("days") or 7))); since = (dt.datetime.now() - dt.timedelta(days=days)).isoformat(timespec="seconds")
+            rows = con.execute("""SELECT k.id, k.sip_user, k.direction, k.peer, k.started_at, k.billsec, k.q_jitter, k.q_loss, k.q_rtt, k.q_mos, k.q_ip, k.q_dev,
+                                  c.email, c.ext, c.display_name, c.company_id FROM calls k LEFT JOIN customers c ON c.sip_user=k.sip_user
+                                  WHERE k.started_at>=? AND k.q_mos IS NOT NULL ORDER BY k.id DESC""", (since,)).fetchall()
+            calls = [dict(r, grade=qos_grade(r["q_mos"])) for r in rows]
+            def summ(lst):
+                n = len(lst)
+                if not n: return {"calls": 0}
+                return {"calls": n, "mos": round(sum(x["q_mos"] for x in lst) / n, 2), "jitter": round(sum(x["q_jitter"] for x in lst) / n, 1),
+                        "loss": round(sum(x["q_loss"] for x in lst) / n, 2), "rtt": round(sum(x["q_rtt"] for x in lst) / n, 1),
+                        "good": sum(1 for x in lst if x["grade"] == "good"), "fair": sum(1 for x in lst if x["grade"] == "fair"), "poor": sum(1 for x in lst if x["grade"] == "poor")}
+            by_line, by_dev = {}, {}
+            for x in calls:
+                by_line.setdefault(x["sip_user"], []).append(x); by_dev.setdefault(x["q_dev"] or "app", []).append(x)
+            lines = []
+            for u, lst in by_line.items():
+                d = summ(lst); d.update({"sip_user": u, "email": lst[0]["email"], "ext": lst[0]["ext"], "name": lst[0]["display_name"], "last_ip": lst[0]["q_ip"]}); lines.append(d)
+            lines.sort(key=lambda d: d["mos"])
+            measured = con.execute("SELECT COUNT(*) FROM calls WHERE started_at>=? AND billsec>0", (since,)).fetchone()[0]
+            return {"days": days, "overall": summ(calls), "answered_calls": measured, "lines": lines,
+                    "devices": {k: summ(v) for k, v in by_dev.items()}, "worst": sorted(calls, key=lambda x: x["q_mos"])[:25]}
         if p == ["telnyx", "costs"] and method == "GET":
             lines, cos = line_costs(con)
             return {"lines": lines, "companies": cos, "rates": C["rates"]}
@@ -1507,7 +1559,7 @@ def api_route(method, path, q, body):
             u = c["sip_user"]; sub = p[2] if len(p) > 2 else ""
             if sub == "" and method == "GET":
                 d = cust_json(con, c)
-                d["recent_calls"] = [dict(r) for r in con.execute("SELECT direction, peer, started_at, billsec, minutes, result FROM calls WHERE sip_user=? ORDER BY id DESC LIMIT 50", (u,))]
+                d["recent_calls"] = [dict(r) for r in con.execute("SELECT direction, peer, started_at, billsec, minutes, result, q_mos, q_jitter, q_loss, q_rtt, q_dev FROM calls WHERE sip_user=? ORDER BY id DESC LIMIT 50", (u,))]
                 d["texts"] = [dict(r) for r in con.execute("SELECT id, peer, body, received_at FROM texts WHERE sip_user=? ORDER BY id DESC LIMIT 50", (u,))]
                 d["voicemails"] = [dict(r) for r in con.execute("SELECT id, caller, secs, created_at, heard FROM voicemails WHERE sip_user=? ORDER BY id DESC LIMIT 50", (u,))]
                 co = co_of(con, c)
