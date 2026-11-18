@@ -375,6 +375,10 @@ def write_moh(con):
 def dept_list(con, cid):
     return [{"id": d["id"], "name": d["name"], "exts": json.loads(d["exts"] or "[]")} for d in
             con.execute("SELECT * FROM departments WHERE company_id=? ORDER BY name", (cid,))]
+def dept_tag(name):
+    """Department name as sent to the phones (X-GS-Dept header): plain characters only."""
+    return re.sub(r"[^A-Za-z0-9 &'-]", "", name or "")[:40]
+
 def dept_members(con, co, dept_id, free_first=True):
     """Active lines in a department. Members already on a call are skipped (they can't take another), unless everyone is busy."""
     d = con.execute("SELECT * FROM departments WHERE id=? AND company_id=?", (int(dept_id), co["id"])).fetchone()
@@ -1158,13 +1162,13 @@ def agi_main(args):
         elif mode == "ivr":               # ivr <company id> <digit | 3-digit ext | t>
             co = company(con, int(args[1] or 0)); key = args[2] if len(args) > 2 else ""
             ivr = json.loads(co["ivr_json"] or "{}") if co else {}
-            a.set("GS_DEPT", "")
+            a.set("GS_DEPT", ""); a.set("GS_DEPTNAME", "")
             def resolve(opt):
                 typ = (opt or {}).get("type"); tg = (opt or {}).get("target")
                 if typ == "dept":                         # a department: everyone free in it rings at once
                     d, ms = dept_members(con, co, tg or 0)
                     if d and ms:
-                        a.set("GS_DEPT", str(d["id"]))
+                        a.set("GS_DEPT", str(d["id"])); a.set("GS_DEPTNAME", dept_tag(d["name"]))
                         return "dial", dials(con, [m["sip_user"] for m in ms]), ms[0]["sip_user"]
                     typ, tg = "ext", None                 # empty department: the main line
                 exts = tg if isinstance(tg, list) else ([tg] if tg else [])
@@ -1200,7 +1204,7 @@ def agi_main(args):
                 d, ms = dept_members(con, co, target[1:])
                 if ms:
                     a.set("GS_OK", "1"); a.set("GS_DIALS", dials(con, [m["sip_user"] for m in ms])); a.set("GS_VMUSER", ms[0]["sip_user"] if ms[0]["vm_on"] else "")
-                    a.set("GS_XEXT" if mode == "xfer" else "GS_FWDEXT", "1"); a.set("GS_DEPT", str(d["id"]))
+                    a.set("GS_XEXT" if mode == "xfer" else "GS_FWDEXT", "1"); a.set("GS_DEPT", str(d["id"])); a.set("GS_DEPTNAME", dept_tag(d["name"]))
             elif cust and co and re.fullmatch(r"[1-8]\d\d", t):          # to an extension of the same company: free
                 tgt = con.execute("SELECT * FROM customers WHERE company_id=? AND ext=? AND status='active'", (co["id"], t)).fetchone()
                 if tgt:

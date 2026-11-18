@@ -288,7 +288,7 @@ exten => s,1,GotoIf(\$["\${GS_ACT}" = "repeat"]?gs-ivr,s,menu)
  same => n,GotoIf(\$["\${GS_ACT}" = "dial"]?dial)
  same => n,Playback(pbx-invalid)
  same => n,Goto(gs-ivr,s,menu)
- same => n(dial),Dial(\${GS_DIAL},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID}))U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
+ same => n(dial),Dial(\${GS_DIAL},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID}^\${GS_DEPTNAME}))U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
  same => n,Goto(gs-vm,s,1)
 
 ; Outside business hours: closed greeting, then voicemail
@@ -324,6 +324,7 @@ exten => s,1,AGI(gs-agi.py,qos,\${ARG1},\${CHANNEL(rtcp,all)},\${CHANNEL(pjsip,r
 ; incoming calls: each device that rings gets the same handler (b() runs on the dialed channel)
 [gs-qospre]
 exten => s,1,Set(CHANNEL(hangup_handler_push)=gs-qos,s,1(\${ARG1}))
+ same => n,ExecIf(\$["\${ARG2}" != ""]?Set(PJSIP_HEADER(add,X-GS-Dept)=\${ARG2}))
  same => n,Return()
 
 ; After every customer call: charge the minutes (rounded up) and run the robocall check
@@ -345,6 +346,7 @@ exten => _+X.,1,Goto(gs-transfer,\${EXTEN:1},1)
 exten => _X.,1,Goto(gs-xfer-go,\${EXTEN},1)
 exten => _D.,1,Goto(gs-xfer-go,\${EXTEN},1)
 [gs-xfer-go]
+exten => h,1,NoOp(transfer leg ended)
 exten => _.,1,AGI(gs-agi.py,xfer,\${BLINDTRANSFER},\${EXTEN})
  same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok)
  same => n,Playback(pbx-invalid)
@@ -353,7 +355,7 @@ exten => _.,1,AGI(gs-agi.py,xfer,\${BLINDTRANSFER},\${EXTEN})
  same => n,Set(CALLERID(num)=\${GS_CID})
  same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
  same => n,Hangup()
- same => n(ext),Dial(\${GS_DIALS},25,U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
+ same => n(ext),Dial(\${GS_DIALS},25,b(gs-qospre^s^1(\${GS_CALLID}^\${GS_DEPTNAME}))U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
  same => n,Goto(gs-vm,s,1)
 
 ; Who answered an incoming call (and for which department) — shown in the office app's history
