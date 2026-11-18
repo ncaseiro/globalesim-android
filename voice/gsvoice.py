@@ -35,7 +35,7 @@ DEFAULTS = {
     "pool_rest_days": 30,
     "guard": {"out_minutes_hour": 900, "out_minutes_day": 6000, "out_calls_10min": 150, "concurrent": 40, "new_lines_day": 25},
     "low_balance": 20,                 # email when the Telnyx balance drops below this (USD)
-    "alert_kinds": ["auto_suspend", "guard_trip", "e911_failed", "release_failed", "low_balance", "line_flood"],
+    "alert_kinds": ["auto_suspend", "guard_trip", "e911_failed", "release_failed", "low_balance", "line_flood", "backup_failed"],
     "topup_minutes": 300,
     "limits": {"new_calls_per_10min": 5, "calls_per_day": 100, "new_account_days": 7, "new_account_minutes": 100,
                "robocall_window_min": 30, "robocall_calls": 8, "robocall_short_sec": 15, "robocall_short_calls": 6},
@@ -195,6 +195,19 @@ def ast_rx(cmd):
     """Run one Asterisk console command (read-only status questions)."""
     try: return subprocess.run(list(C.get("asterisk_cmd") or ["asterisk"]) + ["-rx", cmd], capture_output=True, text=True, timeout=5).stdout
     except Exception: return ""
+
+_ping = {"t": 0.0, "r": None}
+def ping():
+    """Public health check for the outside watchdog — no customer data, no secrets. Cached 15 s."""
+    if time.time() - _ping["t"] > 15 or _ping["r"] is None:
+        up = "System uptime" in ast_rx("core show uptime seconds")
+        regs = ast_rx("pjsip show registrations") if up else ""
+        trunk = None if "carrier-reg" not in regs else bool(re.search(r"carrier-reg\S*\s+\S+\s+Registered", regs))
+        try:
+            with db() as con: con.execute("SELECT 1").fetchone(); dbok = True
+        except Exception: dbok = False
+        _ping.update(t=time.time(), r={"ok": up and dbok and trunk is not False, "asterisk": up, "trunk": trunk, "db": dbok, "at": iso(now())})
+    return _ping["r"]
 
 _pres = {"t": 0.0, "on": set(), "busy": set()}
 def presence():
@@ -897,12 +910,14 @@ def alert_loop():
 
 ALERT_TITLES = {"auto_suspend": "ALERT: a line was paused for robocall-like calling", "guard_trip": "ALERT: all outgoing calls paused (master shutoff)",
                 "e911_failed": "ALERT: a 911 address was not accepted", "release_failed": "ALERT: a number could not be released",
-                "low_balance": "ALERT: Telnyx balance is low", "line_flood": "ALERT: unusual number of new lines"}
+                "low_balance": "ALERT: Telnyx balance is low", "line_flood": "ALERT: unusual number of new lines",
+                "backup_failed": "ALERT: a backup number could not be changed at Telnyx"}
 ALERT_HELP = {"auto_suspend": "The line can't call out until you activate it in /shop-admin → Phone lines. Check its recent calls first.",
               "guard_trip": "Incoming calls still work. If this was real traffic, raise the limits; if not, find the line in /shop-admin and pause it. Turn outgoing calls back on in /shop-admin → Phone lines.",
               "e911_failed": "Fix the customer's 911 address (contact them), then retry.",
               "low_balance": "Add funds at Telnyx, or calls and number purchases will stop.",
-              "line_flood": "Many new lines in 24 hours. Check that they are real customers."}
+              "line_flood": "Many new lines in 24 hours. Check that they are real customers.",
+              "backup_failed": "Open the number in the Telnyx portal → Voice → Call forwarding and set it by hand. A pooled number must have forwarding OFF."}
 
 def report_main():
     """Daily security report → emailed to the owner by the website."""
@@ -1742,6 +1757,11 @@ class Handler(BaseHTTPRequestHandler):
                 else: res, code = {"error": "not found"}, 404
                 b = json.dumps(res).encode()
                 self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+                return
+            if method == "GET" and self.path.split("?")[0] == "/api/ping":   # outside watchdog (no secret needed)
+                res = ping(); code = 200 if res["ok"] else 503
+                b = json.dumps(res).encode()
+                self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
                 return
             tok = self.headers.get("Authorization", "")
             if not C["api_token"] or not hmac.compare_digest(tok, "Bearer " + C["api_token"]): raise ApiError(401, "unauthorized")
