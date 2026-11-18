@@ -1366,6 +1366,22 @@ def api_route(method, path, q, body):
             con.execute("INSERT INTO stock (number, phone_id, bought_at, note) VALUES (?,?,?,?)", (num, pid, iso(now()), (body.get("note") or "")[:80]))
             event(con, "admin", "stock_buy", num); con.commit()
             return {"ok": True, "number": num}
+        if p == ["stock"] and method == "GET":                       # the pool, quick (no Telnyx call): ready numbers first
+            return {"stock": [dict(r) for r in con.execute("SELECT number, available_at, note FROM stock ORDER BY COALESCE(available_at,'') > ?, number", (iso(now()),))],
+                    "now": iso(now())}
+        if len(p) == 4 and p[:2] == ["telnyx", "stock"] and p[3] == "adopt" and method == "POST":   # a number bought in the Telnyx portal -> our pool
+            num = digits(p[2]); num = ("1" + num) if len(num) == 10 else num
+            if not re.fullmatch(r"1\d{10}", num): raise ApiError(400, "bad number")
+            if con.execute("SELECT 1 FROM customers WHERE did=? UNION SELECT 1 FROM stock WHERE number=?", (num, num)).fetchone(): raise ApiError(409, "that number is already in use or in the pool")
+            pid = telnyx_phone_id(num)
+            if not pid: raise ApiError(404, f"{num} was not found in your Telnyx account")
+            if C["telnyx_connection_id"]:                    # make sure its calls come to this server
+                telnyx("PATCH", f"/phone_numbers/{pid}", {"connection_id": C["telnyx_connection_id"]})
+            try: sms_attach(pid)
+            except Exception: pass
+            con.execute("INSERT INTO stock (number, phone_id, bought_at, note, available_at) VALUES (?,?,?,?,?)", (num, pid, iso(now()), "added from Telnyx portal", iso(now())))
+            event(con, "admin", "stock_adopt", num); con.commit()
+            return {"ok": True, "number": num}
         if len(p) == 4 and p[:2] == ["telnyx", "stock"] and p[3] == "ready" and method == "POST":
             con.execute("UPDATE stock SET available_at=? WHERE number=?", (iso(now()), digits(p[2]))); event(con, "admin", "stock_ready", digits(p[2])); con.commit()
             return {"ok": True}
@@ -1787,6 +1803,9 @@ def api_route(method, path, q, body):
                 if old and not body.get("change"): raise ApiError(409, "this line already has a number")
                 a911 = body.get("e911") or {}
                 if not a911.get("street") and c["e911_json"]: a911 = json.loads(c["e911_json"])     # keep the address on file
+                if not a911.get("street") and c["company_id"]:          # an extension's direct number: the company's 911 address
+                    cm = con.execute("SELECT e911_json FROM customers WHERE sip_user=(SELECT main_user FROM companies WHERE id=?)", (c["company_id"],)).fetchone()
+                    if cm and cm["e911_json"]: a911 = json.loads(cm["e911_json"])
                 if old:
                     want = digits(body.get("phone_number")); want = ("1" + want) if len(want) == 10 else want
                     if want and want == old["did"]: raise ApiError(400, "that is already this line's number")
