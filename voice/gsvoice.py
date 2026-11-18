@@ -570,6 +570,13 @@ def line_costs(con):
             k["min_in"] += l["min_in"]; k["min_out"] += l["min_out"]; k["cost"] = round(k["cost"] + l["cost"], 2); k["lines"] += 1
     return lines, list(cos.values())
 
+def telnyx_phone_id(did):
+    """Telnyx id of one of our numbers, looked up by the number itself ('' if not in the account)."""
+    r = telnyx("GET", "/phone_numbers?filter[phone_number]=" + urllib.parse.quote("+" + digits(did)) + "&page[size]=1")
+    for n in r.get("data") or []:
+        if digits(n.get("phone_number")) == digits(did): return str(n.get("id"))
+    return ""
+
 def telnyx_e911(phone_id, a):
     """a = {name, street, unit, city, state, zip}. Returns address id (911 enabled) or raises ApiError."""
     first, _, last = (a.get("name") or "").strip().partition(" ")
@@ -1650,9 +1657,15 @@ def api_route(method, path, q, body):
                 bm = str(body.get("billing") or "")
                 if bm not in ("paypal", "invoice", "free"): raise ApiError(400, "billing must be paypal, invoice or free")
                 con.execute("UPDATE customers SET billing=? WHERE sip_user=?", (bm, u)); event(con, u, "billing", bm)
-            elif sub == "e911" and method == "POST":           # admin: (re)register the 911 address of this line's number
+            elif sub == "e911" and method == "POST":           # admin / customer: (re)register the 911 address of this line's number
                 a = body.get("e911") or {}
-                if not c["phone_id"] or not a.get("street") or not a.get("zip"): raise ApiError(400, "needs a number and a full address")
+                if not a.get("street") or not a.get("zip") or not a.get("city"): raise ApiError(400, "needs a full address (street, city, state, ZIP)")
+                if not c["did"]: raise ApiError(400, "this line has no phone number yet")
+                if not c["phone_id"]:                          # number added by hand / adopted: find its Telnyx id from the number
+                    pid = telnyx_phone_id(c["did"])
+                    if not pid: raise ApiError(404, f"number {c['did']} was not found in your Telnyx account")
+                    con.execute("UPDATE customers SET phone_id=?, number_id=COALESCE(number_id, ?) WHERE sip_user=?", (pid, pid, u))
+                    c = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
                 aid = telnyx_e911(c["phone_id"], a)
                 con.execute("UPDATE customers SET e911=1, e911_address_id=?, e911_json=? WHERE sip_user=?", (aid, json.dumps(a), u)); event(con, u, "e911", "address set by admin")
             elif sub == "email" and method == "POST":          # admin: change the sign-in email of a line (owner email too, if it runs a company)
