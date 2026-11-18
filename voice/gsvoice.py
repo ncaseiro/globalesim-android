@@ -697,6 +697,19 @@ def notify_site(kind, data):
     except Exception as e:
         sys.stderr.write("notify %s %r\n" % (kind, e))
 
+def notify_detached(kind, data):
+    """Send a site notification from a child process so the caller (an AGI on an emergency call) never waits for it."""
+    try:
+        if os.fork() != 0: return
+    except OSError:
+        return notify_site(kind, data)
+    try:
+        fd = os.open(os.devnull, os.O_RDWR)
+        for n in (0, 1, 2): os.dup2(fd, n)                 # let Asterisk see the AGI finish right away
+        os.setsid(); notify_site(kind, data)
+    finally:
+        os._exit(0)
+
 def member_json(con, m):
     d = {k: m[k] for k in ("sip_user", "email", "did", "ext", "display_name", "status", "note", "created_at", "plan")}
     d["desk_on"] = bool(m["desk_pass"]); d["desk_brand"] = m["desk_brand"] or ""
@@ -976,14 +989,25 @@ def agi_main(args):
                 a.set("GS_GMAX", str(C["guard"]["concurrent"])); a.set("GS_MAXSEC", str(max(60, int(maxsec))))
             else:
                 event(con, user, "blocked_out", f"{reason} {dest}")
-        elif mode == "e911":              # e911 <endpoint>
-            cust = con.execute("SELECT * FROM customers WHERE sip_user=?", (base_user(args[1]),)).fetchone()
-            if cust and not cust["did"] and co_of(con, cust):
-                cust = con.execute("SELECT * FROM customers WHERE sip_user=?", (co_of(con, cust)["main_user"],)).fetchone()
+        elif mode in ("e911", "e933"):    # e911|e933 <endpoint>  — 911 call, or the 933 address read-back test
+            orig = con.execute("SELECT * FROM customers WHERE sip_user=?", (base_user(args[1]),)).fetchone()
+            cust, co = orig, co_of(con, orig)
+            if cust and not cust["did"] and co:          # extension without its own number: the company's number and address
+                cust = con.execute("SELECT * FROM customers WHERE sip_user=?", (co["main_user"],)).fetchone()
             ok = bool(cust and cust["e911"] and cust["did"])
             a.set("GS_OK", "1" if ok else "0")
             if ok: a.set("GS_CID", "+" + cust["did"])
-            event(con, args[1], "e911_call", "routed" if ok else "no 911 address")
+            test = mode == "e933"
+            event(con, args[1], "e933_test" if test else "e911_call", "routed" if ok else "no 911 address")
+            if not test and orig is not None:            # Kari's Law: tell the company (and us) at once — never delays the call
+                addr = {}
+                try: addr = json.loads((cust["e911_json"] if cust else None) or "{}")
+                except Exception: pass
+                info = {"sip_user": orig["sip_user"], "email": orig["email"], "ext": orig["ext"] or "", "name": orig["display_name"] or "",
+                        "did": (cust["did"] if cust else "") or "", "routed": ok, "at": dt.datetime.now().isoformat(timespec="seconds"),
+                        "address": ", ".join(x for x in (addr.get("street"), addr.get("unit"), addr.get("city"), addr.get("state"), addr.get("zip")) if x),
+                        "company": co["name"] if co else "", "owner_email": co["owner_email"] if co else ""}
+                notify_detached("e911_call", info)
         elif mode == "in":                # in <exten> <to-header> <caller>
             # the dialed number = user part of the To URI (never the host/port digits), else the extension
             def num(x):
