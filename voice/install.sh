@@ -257,7 +257,7 @@ exten => _.,1,Set(GS_TO=\${PJSIP_HEADER(read,To)})
  same => n,GotoIf(\$["\${GS_MODE}" = "closed"]?gs-closed,s,1)
  same => n,GotoIf(\$["\${GS_DND}" = "1"]?gs-vm,s,1)
  same => n,GotoIf(\$["\${GS_FWD}" = "always"]?gs-fwd,s,1)
- same => n,Dial(\${GS_DIALS},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID})))
+ same => n,Dial(\${GS_DIALS},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID}))U(gs-ans^\${GS_CALLID}^))
  same => n,GotoIf(\$[\${REGEX("^(\${GS_FWDON})\$" \${DIALSTATUS})}]?gs-fwd,s,1)
  same => n,Goto(gs-vm,s,1)
 
@@ -288,7 +288,7 @@ exten => s,1,GotoIf(\$["\${GS_ACT}" = "repeat"]?gs-ivr,s,menu)
  same => n,GotoIf(\$["\${GS_ACT}" = "dial"]?dial)
  same => n,Playback(pbx-invalid)
  same => n,Goto(gs-ivr,s,menu)
- same => n(dial),Dial(\${GS_DIAL},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID})))
+ same => n(dial),Dial(\${GS_DIAL},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID}))U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
  same => n,Goto(gs-vm,s,1)
 
 ; Outside business hours: closed greeting, then voicemail
@@ -342,16 +342,24 @@ exten => s,1,Set(GS_ANS=\${EPOCH})
 ; "Transfer now" (blind transfer) from the app, computer or desk phone: same checks + billing as a normal call
 [gs-transfer]
 exten => _+X.,1,Goto(gs-transfer,\${EXTEN:1},1)
-exten => _X.,1,AGI(gs-agi.py,xfer,\${BLINDTRANSFER},\${EXTEN})
+exten => _X.,1,Goto(gs-xfer-go,\${EXTEN},1)
+exten => _D.,1,Goto(gs-xfer-go,\${EXTEN},1)
+[gs-xfer-go]
+exten => _.,1,AGI(gs-agi.py,xfer,\${BLINDTRANSFER},\${EXTEN})
  same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok)
  same => n,Playback(pbx-invalid)
  same => n,Hangup()
  same => n(ok),GotoIf(\$["\${GS_XEXT}" = "1"]?ext)
  same => n,Set(CALLERID(num)=\${GS_CID})
- same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,60,U(gs-outans^s^1^\${GS_XCALL}^\${GS_XMAX}))
+ same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
  same => n,Hangup()
- same => n(ext),Dial(\${GS_DIALS},25)
+ same => n(ext),Dial(\${GS_DIALS},25,U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
  same => n,Goto(gs-vm,s,1)
+
+; Who answered an incoming call (and for which department) — shown in the office app's history
+[gs-ans]
+exten => s,1,AGI(gs-agi.py,ans,\${ARG1},\${CHANNEL(endpoint)},\${ARG2})
+ same => n,Return()
 
 ; Call forwarding (always / busy / no answer) to an extension or an outside number
 [gs-fwd]
@@ -360,7 +368,7 @@ exten => s,1,AGI(gs-agi.py,fwd,\${GS_FWDUSER},\${CALLERID(num)})
  same => n,Goto(gs-vm,s,1)
  same => n(ok),GotoIf(\$["\${GS_FWDEXT}" = "1"]?ext)
  same => n,Set(CALLERID(num)=\${GS_CID})
- same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,30,U(gs-outans^s^1^\${GS_XCALL}^\${GS_XMAX}))
+ same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
  same => n,Goto(gs-vm,s,1)
  same => n(ext),Dial(\${GS_DIALS},25)
  same => n,Goto(gs-vm,s,1)
@@ -387,6 +395,17 @@ exten => _[1-8]XX,1,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n,Dial(\${GS_DIALS},25)
  same => n,GotoIf(\$[\${REGEX("^(\${GS_FWDON})\$" \${DIALSTATUS})}]?gs-fwd,s,1)
  same => n,Goto(gs-vm,s,1)
+; Call a whole department (D<id>, from the office app): everyone free in it rings
+exten => _D.,1,Set(__TRANSFER_CONTEXT=gs-transfer)
+ same => n,AGI(gs-agi.py,ext,\${CHANNEL(endpoint)},\${EXTEN})
+ same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok)
+ same => n,Playback(pbx-invalid)
+ same => n,Hangup()
+ same => n(ok),Set(CALLERID(name)=\${GS_CNAME})
+ same => n,Set(CALLERID(num)=\${GS_CNUM})
+ same => n,Dial(\${GS_DIALS},30)
+ same => n,Playback(vm-nobodyavail)
+ same => n,Hangup()
 ; 911: only lines whose 911 address is registered at Telnyx; caller ID = their own number (so the address shows)
 exten => 911,1,AGI(gs-agi.py,e911,\${CHANNEL(endpoint)})
  same => n,GotoIf(\$["\${GS_OK}" = "1"]?go)
@@ -410,7 +429,7 @@ exten => _+1NXXNXXXXXX,1,Goto(from-customer,\${EXTEN:1},1)
 exten => _1NXXNXXXXXX,1,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n,GotoIf(\$[\${REGEX("^(900|976)" \${EXTEN:1:3})}]?blocked)
  same => n,Set(GS_EP=\${CHANNEL(endpoint)})
- same => n,AGI(gs-agi.py,out,\${GS_EP},\${EXTEN})
+ same => n,AGI(gs-agi.py,out,\${GS_EP},\${EXTEN},\${PJSIP_HEADER(read,X-GS-CID)})
  same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok:blocked)
  same => n(ok),Set(GROUP(gsuser)=\${GS_BASE})
  same => n,GotoIf(\$[\${GROUP_COUNT(\${GS_BASE}@gsuser)} > 2]?blocked)
@@ -422,7 +441,7 @@ exten => _1NXXNXXXXXX,1,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n(go),Set(CALLERID(all)=<\${GS_CID}>)
  same => n,Set(CHANNEL(hangup_handler_push)=gs-charge,s,1(\${GS_CALLID}))
  same => n,Set(CHANNEL(hangup_handler_push)=gs-qos,s,1(\${GS_CALLID}))
- same => n,Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60,L(\${GS_MAXMS})U(gs-outans^s^1^\${GS_CALLID}^\${GS_MAXSEC}))
+ same => n,Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC}))
  same => n,Hangup()
  same => n(blocked),Playback(ss-noservice)
  same => n,Hangup()
@@ -556,8 +575,11 @@ cat > /etc/asterisk/musiconhold.conf <<EOF
 mode=files
 directory=moh
 random=yes
+#include "/var/lib/gsvoice/moh.conf"
 EOF
-chown asterisk:asterisk /etc/asterisk/musiconhold.conf
+[ -f /var/lib/gsvoice/moh.conf ] || echo "; company hold music — written by gsvoice" > /var/lib/gsvoice/moh.conf
+mkdir -p /var/lib/gsvoice/moh
+chown asterisk:asterisk /etc/asterisk/musiconhold.conf /var/lib/gsvoice/moh.conf /var/lib/gsvoice/moh
 
 # Asterisk's built-in web server, local only — Caddy passes browser calls (wss://…/ws) to it
 cat > /etc/asterisk/http.conf <<EOF
