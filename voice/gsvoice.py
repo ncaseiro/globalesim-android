@@ -95,7 +95,8 @@ def db():
                      ("paused_at", "TEXT"), ("sub_ref", "TEXT"), ("company_id", "INTEGER"), ("ext", "TEXT"), ("display_name", "TEXT"),
                      ("vm_on", "INTEGER DEFAULT 1"), ("web_pass", "TEXT"), ("web_exp", "TEXT"),
                      ("fwd_mode", "TEXT DEFAULT ''"), ("fwd_to", "TEXT"), ("dnd", "INTEGER DEFAULT 0"),
-                     ("desk_pass", "TEXT"), ("desk_brand", "TEXT"), ("desk_mac", "TEXT"), ("billing", "TEXT DEFAULT 'paypal'"), ("admin_note", "TEXT")):
+                     ("desk_pass", "TEXT"), ("desk_brand", "TEXT"), ("desk_mac", "TEXT"), ("billing", "TEXT DEFAULT 'paypal'"), ("admin_note", "TEXT"),
+                     ("backup_to", "TEXT")):
         if col not in cols: con.execute(f"ALTER TABLE customers ADD COLUMN {col} {typ}")
     kc = {r[1] for r in con.execute("PRAGMA table_info(calls)")}
     for col, typ in (("q_jitter", "REAL"), ("q_loss", "REAL"), ("q_rtt", "REAL"), ("q_mos", "REAL"), ("q_pkts", "INTEGER"), ("q_ip", "TEXT"), ("q_dev", "TEXT")):
@@ -469,13 +470,21 @@ def telnyx_search(area_code="", contains="", limit=10):
     r = telnyx("GET", "/available_phone_numbers?" + urllib.parse.urlencode(params))
     return [n.get("phone_number") for n in r.get("data", []) if n.get("phone_number")]
 
-def telnyx_phone_id(num):
-    for _ in range(12):                       # number orders finish in a few seconds
-        r = telnyx("GET", "/phone_numbers?" + urllib.parse.urlencode({"filter[phone_number]": "+" + num}))
-        d = r.get("data") or []
-        if d and d[0].get("id"): return d[0]["id"]
-        time.sleep(2)
+def telnyx_phone_id(did, tries=1):
+    """Telnyx id of one of our numbers, looked up by the number itself ('' if not in the account).
+    tries>1 right after buying: number orders take a few seconds to finish."""
+    for i in range(tries):
+        r = telnyx("GET", "/phone_numbers?filter[phone_number]=" + urllib.parse.quote("+" + digits(did)) + "&page[size]=1")
+        for n in r.get("data") or []:
+            if digits(n.get("phone_number")) == digits(did) and n.get("id"): return str(n.get("id"))
+        if i < tries - 1: time.sleep(2)
     return ""
+
+def telnyx_backup(phone_id, to):
+    """Backup number: Telnyx sends calls there by itself when our voice server can't be reached (on-failure).
+    to = 11 digits, or '' to turn it off."""
+    cf = {"call_forwarding_enabled": True, "forwards_to": "+" + to, "forwarding_type": "on-failure"} if to else {"call_forwarding_enabled": False}
+    telnyx("PATCH", f"/phone_numbers/{phone_id}/voice", {"call_forwarding": cf})
 
 def telnyx_buy(num, area_code="", taken=()):
     """Buy num (11 digits); if it's gone, take another from the same area code. Returns (num, phone_id)."""
@@ -491,7 +500,7 @@ def telnyx_buy(num, area_code="", taken=()):
         except ApiError:
             continue
         if ((r.get("data") or {}).get("status") or "") in ("failure", "failed"): continue
-        pid = telnyx_phone_id(n)
+        pid = telnyx_phone_id(n, tries=12)
         if pid: return n, pid
     raise ApiError(409, "no number available in that area code — try another")
 
@@ -570,13 +579,6 @@ def line_costs(con):
             k["min_in"] += l["min_in"]; k["min_out"] += l["min_out"]; k["cost"] = round(k["cost"] + l["cost"], 2); k["lines"] += 1
     return lines, list(cos.values())
 
-def telnyx_phone_id(did):
-    """Telnyx id of one of our numbers, looked up by the number itself ('' if not in the account)."""
-    r = telnyx("GET", "/phone_numbers?filter[phone_number]=" + urllib.parse.quote("+" + digits(did)) + "&page[size]=1")
-    for n in r.get("data") or []:
-        if digits(n.get("phone_number")) == digits(did): return str(n.get("id"))
-    return ""
-
 def telnyx_e911(phone_id, a):
     """a = {name, street, unit, city, state, zip}. Returns address id (911 enabled) or raises ApiError."""
     first, _, last = (a.get("name") or "").strip().partition(" ")
@@ -604,10 +606,13 @@ def to_pool(con, c, why):
     if c["phone_id"] and C["telnyx_api_key"] and c["e911"]:
         try: e911_off(c["phone_id"], c["e911_address_id"] or "")
         except ApiError as e: event(con, c["sip_user"], "e911_failed", "could not turn 911 off on " + c["did"] + ": " + e.msg[:150])
+    if c["phone_id"] and C["telnyx_api_key"] and c["backup_to"]:     # the next owner's calls must never ring this person's cell
+        try: telnyx_backup(c["phone_id"], "")
+        except ApiError as e: event(con, c["sip_user"], "backup_failed", "could not turn the backup number off on " + c["did"] + ": " + e.msg[:150])
     rest = now() + dt.timedelta(days=int(C.get("pool_rest_days", 30)))
     con.execute("INSERT OR REPLACE INTO stock (number, phone_id, bought_at, note, available_at, prev_email) VALUES (?,?,?,?,?,?)",
                 (c["did"], c["phone_id"] or "", iso(now()), why[:80], iso(rest), c["email"]))
-    con.execute("UPDATE customers SET did=NULL, phone_id=NULL, number_id=NULL, e911=0, e911_address_id=NULL WHERE sip_user=? AND did=?", (c["sip_user"], c["did"]))
+    con.execute("UPDATE customers SET did=NULL, phone_id=NULL, number_id=NULL, e911=0, e911_address_id=NULL, backup_to=NULL WHERE sip_user=? AND did=?", (c["sip_user"], c["did"]))
     event(con, c["sip_user"], "pooled", f"{c['did']} {why}")
     return True
 
@@ -1637,6 +1642,11 @@ def api_route(method, path, q, body):
                     if old: con.execute("UPDATE customers SET did=?, e911=?, e911_address_id=? WHERE sip_user=?", (old["did"], old["e911"], old["e911_address_id"], u))
                     raise
                 if old: to_pool(con, old, "number changed")        # old number (and its 911) off the line, into the pool
+                if old and old.get("backup_to"):                    # the backup number follows the line to its new number
+                    n = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
+                    try:
+                        if n["phone_id"]: telnyx_backup(n["phone_id"], old["backup_to"]); con.execute("UPDATE customers SET backup_to=? WHERE sip_user=?", (old["backup_to"], u))
+                    except ApiError as e: event(con, u, "backup_failed", e.msg[:150])
                 con.commit(); write_pjsip(con)
             elif sub == "plan" and method == "POST":           # new/renewed paid month
                 plan = body.get("plan", c["plan"])
@@ -1657,6 +1667,22 @@ def api_route(method, path, q, body):
                 bm = str(body.get("billing") or "")
                 if bm not in ("paypal", "invoice", "free"): raise ApiError(400, "billing must be paypal, invoice or free")
                 con.execute("UPDATE customers SET billing=? WHERE sip_user=?", (bm, u)); event(con, u, "billing", bm)
+            elif sub == "backup" and method == "POST":         # backup number: where calls go if our voice server is down
+                to = digits(str(body.get("to") or ""))
+                if to:
+                    to = parse_nanp(to)
+                    if not to: raise ApiError(400, "enter a US or Canada number")
+                    if to == (c["did"] or ""): raise ApiError(400, "the backup number must be a different phone")
+                    if con.execute("SELECT 1 FROM customers WHERE did=? AND status<>'canceled'", (to,)).fetchone() or to == digits(C["company_did"] or ""):
+                        raise ApiError(400, "use a phone outside GlobaleSIM, like a cell phone (a GlobaleSIM number would be down too)")
+                if not c["did"]: raise ApiError(400, "this line has no phone number yet")
+                if not c["phone_id"]:
+                    pid = telnyx_phone_id(c["did"])
+                    if not pid: raise ApiError(404, f"number {c['did']} was not found in your Telnyx account")
+                    con.execute("UPDATE customers SET phone_id=?, number_id=COALESCE(number_id, ?) WHERE sip_user=?", (pid, pid, u))
+                    c = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
+                telnyx_backup(c["phone_id"], to)
+                con.execute("UPDATE customers SET backup_to=? WHERE sip_user=?", (to or None, u)); event(con, u, "backup_set", to or "off")
             elif sub == "e911" and method == "POST":           # admin / customer: (re)register the 911 address of this line's number
                 a = body.get("e911") or {}
                 if not a.get("street") or not a.get("zip") or not a.get("city"): raise ApiError(400, "needs a full address (street, city, state, ZIP)")
