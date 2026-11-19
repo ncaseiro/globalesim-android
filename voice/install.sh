@@ -522,8 +522,8 @@ if [ -f /etc/ufw/before.rules ] && ! grep -q "globalesim-scanners" /etc/ufw/befo
   awk -v r="$RULES" '/^# End required lines/ && !d {print; print r; d=1; next} {print}' /etc/ufw/before.rules > /tmp/before.rules && cat /tmp/before.rules > /etc/ufw/before.rules
 fi
 ufw reload >/dev/null 2>&1 || true
-KEEP_IPS=$(grep -oP '^ignoreip\s*=\s*\K.*' /etc/fail2ban/jail.d/asterisk.local 2>/dev/null | tr ' ' '\n' | grep -v '^127.0.0.1/8$' | tr '\n' ' ')
-ADMIN_IP=$(echo "${SSH_CLIENT:-}" | awk '{print $1}')
+KEEP_IPS=$(grep -oP '^ignoreip\s*=\s*\K.*' /etc/fail2ban/jail.d/asterisk.local 2>/dev/null | tr ' ' '\n' | grep -v '^127.0.0.1/8$' | tr '\n' ' ' || true)
+ADMIN_IP=$(echo "${SSH_CLIENT:-}" | awk '{print $1}' || true)
 IGNORE_IPS=$(echo "127.0.0.1/8 $KEEP_IPS $ADMIN_IP" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
 # bans are permanent (bantime -1) and survive restarts: keep the ban database for 10 years; ipset keeps thousands of bans fast
 cat > /etc/fail2ban/fail2ban.local <<EOF
