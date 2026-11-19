@@ -167,7 +167,7 @@ def prov_config(brand, c, name):
             f"account.1.auth_name = {user}", f"account.1.user_name = {user}", f"account.1.password = {pw}",
             f"account.1.sip_server.1.address = {host}", "account.1.sip_server.1.port = 5061", "account.1.sip_server.1.transport_type = 2",
             "account.1.sip_server.1.expires = 300", "account.1.srtp_encryption = 1", "account.1.nat.udp_update_enable = 1",
-            "account.1.dtmf.type = 1", "local_time.time_zone = -6", "local_time.time_zone_name = United States-Central Time", ""]), "text/plain"
+            "account.1.dtmf.type = 1", "security.trust_certificates = 0", "local_time.time_zone = -6", "local_time.time_zone_name = United States-Central Time", ""]), "text/plain"
     if brand == "grandstream":
         x = {"P271": "1", "P270": label, "P47": f"{host}:5061", "P35": user, "P36": user, "P34": pw, "P3": label, "P130": "2", "P183": "1", "P52": "2", "P63": "1"}
         return ('<?xml version="1.0" encoding="UTF-8"?>\n<gs_provision version="1">\n<config version="1">\n'
