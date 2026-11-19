@@ -255,6 +255,7 @@ exten => _.,1,Set(GS_TO=\${PJSIP_HEADER(read,To)})
  same => n,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n,GotoIf(\$["\${GS_MODE}" = "ivr"]?gs-ivr,s,1)
  same => n,GotoIf(\$["\${GS_MODE}" = "closed"]?gs-closed,s,1)
+ same => n,GotoIf(\$["\${GS_MODE}" = "dept"]?gs-dept,s,1)
  same => n,GotoIf(\$["\${GS_DND}" = "1"]?gs-vm,s,1)
  same => n,GotoIf(\$["\${GS_FWD}" = "always"]?gs-fwd,s,1)
  same => n,Dial(\${GS_DIALS},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID}))U(gs-ans^\${GS_CALLID}^))
@@ -289,6 +290,11 @@ exten => s,1,GotoIf(\$["\${GS_ACT}" = "repeat"]?gs-ivr,s,menu)
  same => n,Playback(pbx-invalid)
  same => n,Goto(gs-ivr,s,menu)
  same => n(dial),Dial(\${GS_DIAL},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID}^\${GS_DEPTNAME}))U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
+ same => n,Goto(gs-vm,s,1)
+
+; A department's own direct number (e.g. the AI receptionist transfers here): everyone free in the department rings at once
+[gs-dept]
+exten => s,1,Dial(\${GS_DIAL},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID}^\${GS_DEPTNAME}))U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
  same => n,Goto(gs-vm,s,1)
 
 ; Outside business hours: closed greeting, then voicemail

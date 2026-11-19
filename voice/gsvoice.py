@@ -106,6 +106,9 @@ def db():
     cc = {r[1] for r in con.execute("PRAGMA table_info(companies)")}
     for col, typ in (("comp", "INTEGER DEFAULT 0"), ("voice", "TEXT DEFAULT ''"), ("rec_main", "INTEGER DEFAULT 0"), ("rec_closed", "INTEGER DEFAULT 0"), ("prov_token", "TEXT"), ("billing", "TEXT DEFAULT 'paypal'"), ("admin_note", "TEXT")):
         if col not in cc: con.execute(f"ALTER TABLE companies ADD COLUMN {col} {typ}")
+    dc = {r[1] for r in con.execute("PRAGMA table_info(departments)")}
+    for col in ("did", "phone_id"):
+        if col not in dc: con.execute(f"ALTER TABLE departments ADD COLUMN {col} TEXT")
     sc = {r[1] for r in con.execute("PRAGMA table_info(stock)")}
     for col in ("available_at", "prev_email"):
         if col not in sc: con.execute(f"ALTER TABLE stock ADD COLUMN {col} TEXT")
@@ -373,7 +376,7 @@ def write_moh(con):
 
 # ---------------------------------------------------------------- departments
 def dept_list(con, cid):
-    return [{"id": d["id"], "name": d["name"], "exts": json.loads(d["exts"] or "[]")} for d in
+    return [{"id": d["id"], "name": d["name"], "exts": json.loads(d["exts"] or "[]"), "did": d["did"] or ""} for d in
             con.execute("SELECT * FROM departments WHERE company_id=? ORDER BY name", (cid,))]
 def dept_tag(name):
     """Department name as sent to the phones (X-GS-Dept header): plain characters only."""
@@ -389,6 +392,25 @@ def dept_members(con, co, dept_id, free_first=True):
         busy = presence()["busy"]; free = [m for m in ms if m["sip_user"] not in busy]
         if free: ms = free
     return d, ms
+
+def dept_number(con, co, dept_id, number):
+    """Give a department its own direct number from the pool (calls to it ring the department straight away), or
+    take it off again (number="") — the number goes back to the pool, ready at once (nobody else ever had it)."""
+    d = con.execute("SELECT * FROM departments WHERE id=? AND company_id=?", (int(dept_id), co["id"])).fetchone()
+    if not d: raise ApiError(404, "no such department")
+    want = digits(number or "")
+    if want and len(want) == 10: want = "1" + want
+    if want == (d["did"] or ""): return
+    st = None
+    if want:
+        st = con.execute("SELECT * FROM stock WHERE number=? AND COALESCE(available_at,'')<=?", (want, iso(now()))).fetchone()
+        if not st: raise ApiError(409, "that number is not ready in the pool")
+    if d["did"]:
+        con.execute("INSERT OR REPLACE INTO stock (number, phone_id, bought_at, note, available_at, prev_email) VALUES (?,?,?,?,?,?)",
+                    (d["did"], d["phone_id"] or "", iso(now()), ("was " + d["name"] + " direct number")[:80], iso(now()), ""))
+    if st: con.execute("DELETE FROM stock WHERE number=?", (want,))
+    con.execute("UPDATE departments SET did=?, phone_id=? WHERE id=?", (want or None, (st["phone_id"] if st else None), d["id"]))
+    event(con, co["main_user"] or "", "dept_number", f"{d['name']} {want or 'removed'}")
 
 # ---------------------------------------------------------------- Asterisk config
 def write_pjsip(con):
@@ -1111,6 +1133,13 @@ def agi_main(args):
             to_raw = args[2] if len(args) > 2 else ""; caller = digits(args[3]) if len(args) > 3 else ""
             did = num(to_raw) or num(args[1]) or num("sip:" + args[1] + "@")
             cust = con.execute("SELECT * FROM customers WHERE did=? AND status='active'", (did,)).fetchone()
+            dnum = None
+            if not cust and did:                  # a department's own direct number: billed to the company's main line
+                dnum = con.execute("SELECT * FROM departments WHERE did=?", (did,)).fetchone()
+                dco = company(con, dnum["company_id"]) if dnum else None
+                if dco and dco["status"] == "active":
+                    cust = con.execute("SELECT * FROM customers WHERE sip_user=? AND status='active'", (dco["main_user"],)).fetchone()
+                if not cust: dnum = None
             if not cust and did:
                 other = con.execute("SELECT * FROM customers WHERE did=?", (did,)).fetchone()
                 if other: event(con, other["sip_user"], "blocked_in", f"line {other['status']} " + caller)
@@ -1125,7 +1154,20 @@ def agi_main(args):
                     set_forward_vars(a, cust)
                     a.set("GS_VMUSER", cust["sip_user"] if (cust["vm_on"] if "vm_on" in cust.keys() else 1) else "")
                     co = co_of(con, cust); mode = ""
-                    if co and co["main_user"] == cust["sip_user"] and co["status"] == "active":
+                    a.set("GS_DEPT", ""); a.set("GS_DEPTNAME", "")
+                    if dnum and co:
+                        a.set("GS_CO", str(co["id"]))
+                        if biz_closed(co):
+                            mode = "closed"
+                            g = greet_file(co["id"], "closed"); a.set("GS_GREET", g if os.path.exists(g + ".wav") else "")
+                        else:
+                            mode = "dept"
+                            d, ms = dept_members(con, co, dnum["id"])
+                            if d and ms:
+                                a.set("GS_DEPT", str(d["id"])); a.set("GS_DEPTNAME", dept_tag(d["name"])); a.set("GS_DIAL", dials(con, [m["sip_user"] for m in ms]))
+                            else: a.set("GS_DIAL", dials(con, [cust["sip_user"]]))   # nobody in the department: the main line
+                            con.execute("UPDATE calls SET dept=? WHERE id=?", (dept_tag(dnum["name"]), cur.lastrowid))
+                    elif co and co["main_user"] == cust["sip_user"] and co["status"] == "active":
                         if biz_closed(co):
                             mode = "closed"
                             g = greet_file(co["id"], "closed"); a.set("GS_GREET", g if os.path.exists(g + ".wav") else "")
@@ -1330,6 +1372,7 @@ def api_route(method, path, q, body):
             try: billing = {v.get("id"): v.get("usage_payment_method") for v in telnyx_all("/phone_numbers/voice")}
             except ApiError: billing = {}
             stockrows = {r["number"]: r for r in con.execute("SELECT * FROM stock")}; stock = set(stockrows)
+            deptrows = {r["did"]: r for r in con.execute("SELECT d.did, d.name, c.name AS co FROM departments d LEFT JOIN companies c ON c.id=d.company_id WHERE d.did IS NOT NULL")}
             out = []
             for n in nums:
                 d = digits(n.get("phone_number")); c = con.execute("SELECT * FROM customers WHERE did=?", (d,)).fetchone()
@@ -1337,9 +1380,10 @@ def api_route(method, path, q, body):
                 out.append({"id": n.get("id"), "number": d, "status": n.get("status"), "connection": n.get("connection_name") or "",
                             "billing": billing.get(n.get("id")) or "pay-per-minute", "e911": bool(n.get("emergency_enabled")),
                             "purchased_at": (n.get("purchased_at") or n.get("created_at") or "")[:10],
-                            "use": "customer" if c else ("stock" if d in stock else "other"),
+                            "use": "customer" if c else ("stock" if d in stock else ("department" if d in deptrows else "other")),
+                            "dept": deptrows[d]["name"] if d in deptrows else "",
                             "email": c["email"] if c else "", "sip_user": c["sip_user"] if c else "", "line_status": c["status"] if c else "",
-                            "company": co["name"] if co else "", "ext": (c["ext"] or "") if c else "",
+                            "company": co["name"] if co else ((deptrows[d]["co"] or "") if d in deptrows else ""), "ext": (c["ext"] or "") if c else "",
                             "available_at": (stockrows[d]["available_at"] or "") if d in stockrows else "", "prev_email": (stockrows[d]["prev_email"] or "") if d in stockrows else "",
                             "pool_note": (stockrows[d]["note"] or "") if d in stockrows else ""})
             return {"numbers": out}
@@ -1360,7 +1404,7 @@ def api_route(method, path, q, body):
         if p == ["telnyx", "stock"] and method == "POST":           # buy one number into stock
             want = digits(body.get("phone_number")); want = ("1" + want) if len(want) == 10 else want
             if not re.fullmatch(r"1\d{10}", want): raise ApiError(400, "phone_number required")
-            if con.execute("SELECT 1 FROM customers WHERE did=? UNION SELECT 1 FROM stock WHERE number=?", (want, want)).fetchone(): raise ApiError(409, "we already own that number")
+            if con.execute("SELECT 1 FROM customers WHERE did=? UNION SELECT 1 FROM stock WHERE number=? UNION SELECT 1 FROM departments WHERE did=?", (want, want, want)).fetchone(): raise ApiError(409, "we already own that number")
             num, pid = telnyx_buy(want, "", ())
             if num != want: raise ApiError(409, "that number was just taken")
             con.execute("INSERT INTO stock (number, phone_id, bought_at, note) VALUES (?,?,?,?)", (num, pid, iso(now()), (body.get("note") or "")[:80]))
@@ -1372,7 +1416,7 @@ def api_route(method, path, q, body):
         if len(p) == 4 and p[:2] == ["telnyx", "stock"] and p[3] == "adopt" and method == "POST":   # a number bought in the Telnyx portal -> our pool
             num = digits(p[2]); num = ("1" + num) if len(num) == 10 else num
             if not re.fullmatch(r"1\d{10}", num): raise ApiError(400, "bad number")
-            if con.execute("SELECT 1 FROM customers WHERE did=? UNION SELECT 1 FROM stock WHERE number=?", (num, num)).fetchone(): raise ApiError(409, "that number is already in use or in the pool")
+            if con.execute("SELECT 1 FROM customers WHERE did=? UNION SELECT 1 FROM stock WHERE number=? UNION SELECT 1 FROM departments WHERE did=?", (num, num, num)).fetchone(): raise ApiError(409, "that number is already in use or in the pool")
             pid = telnyx_phone_id(num)
             if not pid: raise ApiError(404, f"{num} was not found in your Telnyx account")
             if C["telnyx_connection_id"]:                    # make sure its calls come to this server
@@ -1538,6 +1582,9 @@ def api_route(method, path, q, body):
             if not co: raise ApiError(404, "no such company")
             cid = co["id"]; sub = p[2] if len(p) > 2 else ""
             if sub == "" and method == "GET": return company_json(con, co)
+            if sub == "departments" and len(p) == 5 and p[4] == "number" and p[3].isdigit() and method == "POST":   # admin: a department's direct number
+                dept_number(con, co, int(p[3]), str(body.get("number") or "")); con.commit()
+                return company_json(con, company(con, cid))
             if sub == "extensions" and method == "POST" and len(p) == 3:
                 email = (body.get("email") or "").strip().lower()
                 if "@" not in email: raise ApiError(400, "email required")
@@ -1657,6 +1704,8 @@ def api_route(method, path, q, body):
             if sub == "departments" and method == "POST":  # create / rename / set members / delete a department
                 did_ = int(body.get("id") or 0)
                 if body.get("delete") and did_:
+                    if con.execute("SELECT 1 FROM departments WHERE id=? AND company_id=? AND did IS NOT NULL", (did_, cid)).fetchone():
+                        dept_number(con, co, did_, "")              # its direct number goes back to the pool
                     con.execute("DELETE FROM departments WHERE id=? AND company_id=?", (did_, cid))
                 else:
                     name = re.sub(r"\s+", " ", str(body.get("name") or "")).strip()[:40]
