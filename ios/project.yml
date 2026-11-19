@@ -1,0 +1,22 @@
+name: GlobaleSIM
+options:
+  bundleIdPrefix: tel.globalesim
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+targets:
+  GlobaleSIM:
+    type: application
+    platform: iOS
+    sources: [GlobaleSIM]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: tel.globalesim.app
+        INFOPLIST_FILE: GlobaleSIM/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Automatic

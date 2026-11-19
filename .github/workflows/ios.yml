@@ -1,0 +1,69 @@
+name: Build GlobaleSIM iPhone app
+
+# Every push to the ios branch: check that the app builds (iPhone simulator, no Apple account needed).
+# When the four Apple secrets are added (see ios/README.md), it also signs the app and sends it to
+# TestFlight, so you can install it on your iPhone. Run by hand from the Actions tab too.
+on:
+  push:
+    branches: [ios]
+    paths: ['ios/**', '.github/workflows/ios.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      HAS_APPLE: ${{ secrets.APPSTORE_KEY_P8 != '' && secrets.APPLE_TEAM_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: brew install xcodegen
+
+      - name: Make the Xcode project
+        working-directory: ios
+        run: |
+          # build number = run number, so every TestFlight upload is new
+          sed -i '' "s/CURRENT_PROJECT_VERSION: \"1\"/CURRENT_PROJECT_VERSION: \"${GITHUB_RUN_NUMBER}\"/" project.yml
+          xcodegen generate
+
+      - name: Build for the iPhone simulator (check only)
+        working-directory: ios
+        run: |
+          xcodebuild -project GlobaleSIM.xcodeproj -scheme GlobaleSIM -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO build | tail -40
+          test ${PIPESTATUS[0]} -eq 0
+
+      - name: Sign and send to TestFlight
+        if: env.HAS_APPLE == 'true'
+        working-directory: ios
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          KEY_P8: ${{ secrets.APPSTORE_KEY_P8 }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.appstoreconnect/private_keys
+          KEY="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          printf '%s' "$KEY_P8" > "$KEY"
+          AUTH=(-allowProvisioningUpdates -authenticationKeyPath "$KEY" -authenticationKeyID "$KEY_ID" -authenticationKeyIssuerID "$ISSUER_ID")
+          xcodebuild -project GlobaleSIM.xcodeproj -scheme GlobaleSIM -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath build/GlobaleSIM.xcarchive \
+            DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGN_STYLE=Automatic "${AUTH[@]}" archive | tail -30
+          cat > build/export.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+          </dict></plist>
+          EOF
+          xcodebuild -exportArchive -archivePath build/GlobaleSIM.xcarchive -exportOptionsPlist build/export.plist \
+            -exportPath build/export "${AUTH[@]}" | tail -30
+          rm -f "$KEY"
+          echo "Sent to TestFlight — it shows up in App Store Connect after Apple processes it (5–30 minutes)."
