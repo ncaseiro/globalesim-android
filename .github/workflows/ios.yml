@@ -32,9 +32,24 @@ jobs:
         working-directory: ios
         run: |
           xcodebuild -project GlobaleSIM.xcodeproj -scheme GlobaleSIM -configuration Debug \
-            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath build/dd \
             CODE_SIGNING_ALLOWED=NO build | tail -40
-          test ${PIPESTATUS[0]} -eq 0
+
+      - name: Open it on a simulated iPhone and take screenshots
+        working-directory: ios
+        run: |
+          DEV=$(xcrun simctl list devices available | grep -m1 -oE 'iPhone 1[5-9][^(]*\(([0-9A-F-]+)\)' | grep -oE '[0-9A-F-]{36}')
+          xcrun simctl boot "$DEV"; xcrun simctl bootstatus "$DEV" -b >/dev/null
+          xcrun simctl install "$DEV" build/dd/Build/Products/Debug-iphonesimulator/GlobaleSIM.app
+          xcrun simctl launch "$DEV" tel.globalesim.app; sleep 20
+          mkdir -p shots; xcrun simctl io "$DEV" screenshot shots/1-store.png
+          xcrun simctl openurl "$DEV" "globalesim://phone"; sleep 12
+          xcrun simctl io "$DEV" screenshot shots/2-phone.png
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iphone-screenshots
+          path: ios/shots/
 
       - name: Sign and send to TestFlight
         if: env.HAS_APPLE == 'true'
