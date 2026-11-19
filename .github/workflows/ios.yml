@@ -9,6 +9,9 @@ on:
     paths: ['ios/**', '.github/workflows/ios.yml']
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15
@@ -50,6 +53,12 @@ jobs:
         with:
           name: iphone-screenshots
           path: ios/shots/
+
+      - name: Keep the screenshots on the ios-shots branch
+        run: |
+          cd ios/shots && git init -q && git checkout -q -b ios-shots && git add . \
+            && git -c user.name=ci -c user.email=ci@globalesim.tel commit -qm "screenshots ${GITHUB_SHA::7}" \
+            && git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ios-shots
 
       - name: Sign and send to TestFlight
         if: env.HAS_APPLE == 'true'
