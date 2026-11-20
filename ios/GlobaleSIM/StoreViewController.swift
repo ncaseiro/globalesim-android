@@ -15,6 +15,7 @@ import WebKit
 final class StoreViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
 
     static let storeURL = URL(string: "https://globalesim.tel/app.php")!
+    static weak var current: StoreViewController?
     static let storeHost = "globalesim.tel"
 
     private var web: WKWebView!
@@ -22,11 +23,13 @@ final class StoreViewController: UIViewController, WKNavigationDelegate, WKUIDel
     private let offline = UIStackView()
     private var progressObs: NSKeyValueObservation?
     private var pending: URL?
+    private weak var bridgeUCC: WKUserContentController?
 
     override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        Self.current = self
         view.backgroundColor = UIColor(red: 0x0E / 255, green: 0x1A / 255, blue: 0x2B / 255, alpha: 1)
 
         let cfg = WKWebViewConfiguration()
@@ -37,6 +40,7 @@ final class StoreViewController: UIViewController, WKNavigationDelegate, WKUIDel
         ucc.add(WeakHandler(self), name: "gs")
         ucc.addUserScript(WKUserScript(source: Self.bridgeJS(), injectionTime: .atDocumentStart, forMainFrameOnly: true))
         cfg.userContentController = ucc
+        bridgeUCC = ucc
 
         web = WKWebView(frame: .zero, configuration: cfg)
         web.navigationDelegate = self
@@ -80,9 +84,23 @@ final class StoreViewController: UIViewController, WKNavigationDelegate, WKUIDel
         if url.host == "order", let t = url.pathComponents.last, t.range(of: "^[a-f0-9]{32}$", options: .regularExpression) != nil {
             target = URL(string: "\(Self.storeURL.absoluteString)?order=\(t)")!
         } else if url.host == "phone" {
+            // already on the phone page: just sign in again (no reload, so an arriving call isn't lost)
+            if let cur = web?.url, Self.isStore(cur), cur.query?.contains("phone") == true { wake(); return }
             target = URL(string: "\(Self.storeURL.absoluteString)?phone")!
         }
         if web == nil { pending = target } else { web.load(URLRequest(url: target)) }
+    }
+
+    /// The in-app phone signs in again right away (after the background, or when a call alert arrives).
+    func wake() {
+        guard let web, Self.isStore(web.url) else { return }
+        web.evaluateJavaScript("window.GSWake && window.GSWake()", completionHandler: nil)
+    }
+
+    /// Apple gave this iPhone its push address: the phone page sends it to the voice server.
+    func pushToken(_ hex: String) {
+        guard let web, Self.isStore(web.url), hex.range(of: "^[0-9a-f]{64,200}$", options: .regularExpression) != nil else { return }
+        web.evaluateJavaScript("window.GSPushToken='\(hex)';window.dispatchEvent(new CustomEvent('gs-push',{detail:'\(hex)'}))", completionHandler: nil)
     }
 
     // MARK: the bridge
@@ -98,6 +116,7 @@ final class StoreViewController: UIViewController, WKNavigationDelegate, WKUIDel
             "mic": true,
             "cardManager": false,         // iPhones can't write plans onto a physical SIM card
             "esimLink": v.majorVersion > 17 || (v.majorVersion == 17 && v.minorVersion >= 4),
+            "pushToken": UserDefaults.standard.string(forKey: AppDelegate.tokenKey) ?? "",
         ]
         let json = String(data: try! JSONSerialization.data(withJSONObject: info), encoding: .utf8)!
         return """
@@ -197,6 +216,13 @@ final class StoreViewController: UIViewController, WKNavigationDelegate, WKUIDel
         a.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completionHandler(false) })
         a.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler(true) })
         present(a, animated: true)
+    }
+
+    func webView(_ w: WKWebView, didStartProvisionalNavigation n: WKNavigation!) {
+        if let ucc = bridgeUCC {   // keep the device info current (push address may have arrived since the last page)
+            ucc.removeAllUserScripts()
+            ucc.addUserScript(WKUserScript(source: Self.bridgeJS(), injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        }
     }
 
     func webView(_ w: WKWebView, didFinish n: WKNavigation!) {

@@ -18,5 +18,6 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: tel.globalesim.app
         INFOPLIST_FILE: GlobaleSIM/Info.plist
+        CODE_SIGN_ENTITLEMENTS: GlobaleSIM/GlobaleSIM.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_STYLE: Automatic
