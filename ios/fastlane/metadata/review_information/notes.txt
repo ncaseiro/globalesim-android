@@ -1,0 +1,4 @@
+Sign in: Account tab → enter appreview@globalesim.tel → "Email me a sign-in code" → enter the 6-digit code given in the Password field (no email is sent for this review account).
+The review account has a US phone line: open the Phone tab to make a call; call that number from another phone with the app closed to see the incoming-call notification (tap it to answer).
+Browsing and buying eSIM plans works without signing in. eSIM plans and the SIM card are used outside the app; payment is with PayPal in Safari.
+Support: support@globalesim.tel
