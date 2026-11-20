@@ -545,7 +545,9 @@ ufw reload >/dev/null 2>&1 || true
 KEEP_IPS=$(grep -oP '^ignoreip\s*=\s*\K.*' /etc/fail2ban/jail.d/asterisk.local 2>/dev/null | tr ' ' '\n' | grep -v '^127.0.0.1/8$' | tr '\n' ' ' || true)
 ADMIN_IP=$(echo "${SSH_CLIENT:-}" | awk '{print $1}' || true)
 IGNORE_IPS=$(echo "127.0.0.1/8 $KEEP_IPS $ADMIN_IP" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
-# bans are permanent (bantime -1) and survive restarts: keep the ban database for 10 years; ipset keeps thousands of bans fast
+# bans: 1 hour the first time, doubling for every repeat (2 h, 4 h, … up to 4 weeks) — a customer or employee who types
+# a wrong password, or an old login that keeps retrying, is back in an hour; real attackers stay out. The ban database is
+# kept for 10 years so repeat offenders are remembered; ipset keeps thousands of bans fast
 cat > /etc/fail2ban/fail2ban.local <<EOF
 [Definition]
 dbpurgeage = 3650d
@@ -558,9 +560,11 @@ backend  = polling
 filter   = asterisk
 logpath  = /var/log/asterisk/fail2ban
 banaction = iptables-ipset-proto6-allports
-maxretry = 3
-findtime = 3600
-bantime  = -1
+maxretry = 5
+findtime = 600
+bantime  = 3600
+bantime.increment = true
+bantime.maxtime = 4w
 ignoreip = $IGNORE_IPS
 EOF
 systemctl enable --now fail2ban >/dev/null 2>&1; systemctl restart fail2ban
