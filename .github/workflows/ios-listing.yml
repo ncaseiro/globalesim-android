@@ -1,0 +1,38 @@
+name: Update App Store listing (text + screenshots)
+
+# Sends ios/fastlane/metadata and ios/fastlane/screenshots to App Store Connect for version 1.0.
+# Never uploads a build and never submits for review — the person presses Submit in App Store Connect.
+on:
+  push:
+    branches: [ios]
+    paths: ['ios/fastlane/**', '.github/workflows/ios-listing.yml']
+  workflow_dispatch:
+
+jobs:
+  listing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with: { ruby-version: '3.3' }
+      - run: gem install fastlane --no-document
+      - name: Upload text and screenshots
+        working-directory: ios
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          KEY_P8: ${{ secrets.APPSTORE_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          KEY_ID=$(printf '%s' "$KEY_ID" | tr -d '[:space:]'); ISSUER_ID=$(printf '%s' "$ISSUER_ID" | tr -d '[:space:]')
+          python3 - <<'PY'
+          import json, os
+          json.dump({"key_id": os.environ["KEY_ID"].strip(), "issuer_id": os.environ["ISSUER_ID"].strip(),
+                     "key": os.environ["KEY_P8"].strip() + "\n", "in_house": False}, open("/tmp/asc.json", "w"))
+          PY
+          fastlane deliver --api_key_path /tmp/asc.json --app_identifier tel.globalesim.app --platform ios --app_version 1.0 \
+            --skip_binary_upload true --submit_for_review false --automatic_release false --force true \
+            --run_precheck_before_submit false --metadata_path ./fastlane/metadata --screenshots_path ./fastlane/screenshots \
+            --overwrite_screenshots true --skip_app_version_update false
+          rm -f /tmp/asc.json
