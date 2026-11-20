@@ -72,9 +72,14 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         if let url = URLContexts.first?.url { store?.open(deepLink: url) }
     }
 
-    // Back from the background: the web phone's connection was paused by iOS — sign in again at once.
+    private var wentAway: Date?
+    func sceneDidEnterBackground(_ scene: UIScene) { wentAway = Date() }
+
+    // Back from the background: the web phone was paused by iOS — start it fresh so calls have sound.
     func sceneDidBecomeActive(_ scene: UIScene) {
-        if let u = Self.pendingLink { store?.open(deepLink: u); Self.pendingLink = nil }
-        store?.wake()
+        if let u = Self.pendingLink { store?.open(deepLink: u); Self.pendingLink = nil; wentAway = nil; return }
+        let away = wentAway.map { Date().timeIntervalSince($0) } ?? 0
+        wentAway = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.store?.resumed(after: away) }
     }
 }

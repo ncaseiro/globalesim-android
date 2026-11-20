@@ -84,11 +84,23 @@ final class StoreViewController: UIViewController, WKNavigationDelegate, WKUIDel
         if url.host == "order", let t = url.pathComponents.last, t.range(of: "^[a-f0-9]{32}$", options: .regularExpression) != nil {
             target = URL(string: "\(Self.storeURL.absoluteString)?order=\(t)")!
         } else if url.host == "phone" {
-            // already on the phone page: just sign in again (no reload, so an arriving call isn't lost)
-            if let cur = web?.url, Self.isStore(cur), cur.query?.contains("phone") == true { wake(); return }
+            // fresh phone page: iOS leaves the paused web phone without microphone/speaker after the background
+            if Date().timeIntervalSince(lastPhoneLoad) < 3 { return }
+            lastPhoneLoad = Date()
             target = URL(string: "\(Self.storeURL.absoluteString)?phone")!
         }
         if web == nil { pending = target } else { web.load(URLRequest(url: target)) }
+    }
+
+    private var lastPhoneLoad = Date.distantPast
+
+    /// Back from the background: on the phone page, start it fresh (working audio); elsewhere just sign in again.
+    func resumed(after seconds: TimeInterval) {
+        guard let web, let cur = web.url, Self.isStore(cur) else { return }
+        if seconds > 3, cur.query?.contains("phone") == true {
+            if Date().timeIntervalSince(lastPhoneLoad) < 3 { return }
+            lastPhoneLoad = Date(); web.reload()
+        } else { wake() }
     }
 
     /// The in-app phone signs in again right away (after the background, or when a call alert arrives).
