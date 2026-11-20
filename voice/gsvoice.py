@@ -628,11 +628,22 @@ def telnyx(method, path, body=None):
     except urllib.error.HTTPError as e:
         raise ApiError(502, "telnyx: " + e.read().decode(errors="replace")[:400])
 
+def telnyx_available(params):
+    """Numbers Telnyx can sell us. No exact match (error 10031): ask again for the closest ones (best_effort);
+    still nothing: an empty list, not an error."""
+    try: return telnyx("GET", "/available_phone_numbers?" + urllib.parse.urlencode(params))
+    except ApiError as e:
+        if "10031" not in e.msg: raise
+    try: return telnyx("GET", "/available_phone_numbers?" + urllib.parse.urlencode({**params, "filter[best_effort]": "true"}))
+    except ApiError as e:
+        if "10031" in e.msg: return {"data": []}
+        raise
+
 def telnyx_search(area_code="", contains="", limit=10):
     params = {"filter[country_code]": "US", "filter[features][]": "voice", "filter[limit]": str(limit)}
     if area_code: params["filter[national_destination_code]"] = digits(area_code)[:3]
     if contains: params["filter[phone_number][contains]"] = digits(contains)
-    r = telnyx("GET", "/available_phone_numbers?" + urllib.parse.urlencode(params))
+    r = telnyx_available(params)
     return [n.get("phone_number") for n in r.get("data", []) if n.get("phone_number")]
 
 def telnyx_phone_id(did, tries=1):
@@ -1438,7 +1449,7 @@ def api_route(method, path, q, body):
             ac, has = digits(q.get("area_code"))[:3], digits(q.get("contains"))
             mine = [r["number"] for r in con.execute("SELECT number FROM stock WHERE COALESCE(available_at,'')<=? ORDER BY number", (iso(now()),)) if (not ac or r["number"][1:4] == ac) and (not has or has in r["number"][1:])]
             mine = [n for n in mine if not con.execute("SELECT 1 FROM customers WHERE did=?", (n,)).fetchone()]
-            try: r = telnyx("GET", "/available_phone_numbers?" + urllib.parse.urlencode(params))
+            try: r = telnyx_available(params)
             except ApiError:
                 if not mine: raise
                 r = {}
