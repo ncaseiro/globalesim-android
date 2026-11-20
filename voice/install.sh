@@ -258,6 +258,7 @@ exten => _.,1,Set(GS_TO=\${PJSIP_HEADER(read,To)})
  same => n,GotoIf(\$["\${GS_MODE}" = "dept"]?gs-dept,s,1)
  same => n,GotoIf(\$["\${GS_DND}" = "1"]?gs-vm,s,1)
  same => n,GotoIf(\$["\${GS_FWD}" = "always"]?gs-fwd,s,1)
+ same => n,Gosub(gs-pushwait,s,1(GS_DIALS))
  same => n,Dial(\${GS_DIALS},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID}))U(gs-ans^\${GS_CALLID}^))
  same => n,GotoIf(\$[\${REGEX("^(\${GS_FWDON})\$" \${DIALSTATUS})}]?gs-fwd,s,1)
  same => n,Goto(gs-vm,s,1)
@@ -289,12 +290,14 @@ exten => s,1,GotoIf(\$["\${GS_ACT}" = "repeat"]?gs-ivr,s,menu)
  same => n,GotoIf(\$["\${GS_ACT}" = "dial"]?dial)
  same => n,Playback(pbx-invalid)
  same => n,Goto(gs-ivr,s,menu)
- same => n(dial),Dial(\${GS_DIAL},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID}^\${GS_DEPTNAME}))U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
+ same => n(dial),Gosub(gs-pushwait,s,1(GS_DIAL))
+ same => n,Dial(\${GS_DIAL},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID}^\${GS_DEPTNAME}))U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
  same => n,Goto(gs-vm,s,1)
 
 ; A department's own direct number (e.g. the AI receptionist transfers here): everyone free in the department rings at once
 [gs-dept]
-exten => s,1,Dial(\${GS_DIAL},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID}^\${GS_DEPTNAME}))U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
+exten => s,1,Gosub(gs-pushwait,s,1(GS_DIAL))
+ same => n,Dial(\${GS_DIAL},25,L(\${GS_MAXMS})b(gs-qospre^s^1(\${GS_CALLID}^\${GS_DEPTNAME}))U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
  same => n,Goto(gs-vm,s,1)
 
 ; Outside business hours: closed greeting, then voicemail
@@ -361,8 +364,16 @@ exten => _.,1,AGI(gs-agi.py,xfer,\${BLINDTRANSFER},\${EXTEN})
  same => n,Set(CALLERID(num)=\${GS_CID})
  same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
  same => n,Hangup()
- same => n(ext),Dial(\${GS_DIALS},25,b(gs-qospre^s^1(\${GS_CALLID}^\${GS_DEPTNAME}))U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
+ same => n(ext),Gosub(gs-pushwait,s,1(GS_DIALS))
+ same => n,Dial(\${GS_DIALS},25,b(gs-qospre^s^1(\${GS_CALLID}^\${GS_DEPTNAME}))U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
  same => n,Goto(gs-vm,s,1)
+
+;  iPhone apps can't listen in the background: before ringing, wake them with a push and wait (<= 14 s) until they sign in.
+; Lines without an iPhone go straight through. ARG1 = the variable holding the dial string, rebuilt afterwards.
+[gs-pushwait]
+exten => s,1,GotoIf(\$["\${GS_DIALU}" = ""]?done)
+ same => n,AGI(gs-agi.py,pushwait,\${ARG1})
+ same => n(done),Return()
 
 ; Who answered an incoming call (and for which department) — shown in the office app's history
 [gs-ans]
@@ -378,7 +389,8 @@ exten => s,1,AGI(gs-agi.py,fwd,\${GS_FWDUSER},\${CALLERID(num)})
  same => n,Set(CALLERID(num)=\${GS_CID})
  same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
  same => n,Goto(gs-vm,s,1)
- same => n(ext),Dial(\${GS_DIALS},25)
+ same => n(ext),Gosub(gs-pushwait,s,1(GS_DIALS))
+ same => n,Dial(\${GS_DIALS},25)
  same => n,Goto(gs-vm,s,1)
 
 ; Text messages sent FROM the app: not offered (receive-only line) — drop them
@@ -400,6 +412,7 @@ exten => _[1-8]XX,1,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n,Set(GS_SKIPINTRO=0)
  same => n,GotoIf(\$["\${GS_DND}" = "1"]?gs-vm,s,1)
  same => n,GotoIf(\$["\${GS_FWD}" = "always"]?gs-fwd,s,1)
+ same => n,Gosub(gs-pushwait,s,1(GS_DIALS))
  same => n,Dial(\${GS_DIALS},25)
  same => n,GotoIf(\$[\${REGEX("^(\${GS_FWDON})\$" \${DIALSTATUS})}]?gs-fwd,s,1)
  same => n,Goto(gs-vm,s,1)
@@ -411,6 +424,7 @@ exten => _D.,1,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n,Hangup()
  same => n(ok),Set(CALLERID(name)=\${GS_CNAME})
  same => n,Set(CALLERID(num)=\${GS_CNUM})
+ same => n,Gosub(gs-pushwait,s,1(GS_DIALS))
  same => n,Dial(\${GS_DIALS},30)
  same => n,Playback(vm-nobodyavail)
  same => n,Hangup()

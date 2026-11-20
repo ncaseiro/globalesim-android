@@ -101,11 +101,14 @@ def db():
         if col not in cols: con.execute(f"ALTER TABLE customers ADD COLUMN {col} {typ}")
     kc = {r[1] for r in con.execute("PRAGMA table_info(calls)")}
     for col, typ in (("q_jitter", "REAL"), ("q_loss", "REAL"), ("q_rtt", "REAL"), ("q_mos", "REAL"), ("q_pkts", "INTEGER"), ("q_ip", "TEXT"), ("q_dev", "TEXT"),
-                     ("answered_by", "TEXT"), ("dept", "TEXT"), ("cid_used", "TEXT")):
+                     ("answered_by", "TEXT"), ("dept", "TEXT"), ("cid_used", "TEXT"), ("push", "TEXT")):
         if col not in kc: con.execute(f"ALTER TABLE calls ADD COLUMN {col} {typ}")
     cc = {r[1] for r in con.execute("PRAGMA table_info(companies)")}
     for col, typ in (("comp", "INTEGER DEFAULT 0"), ("voice", "TEXT DEFAULT ''"), ("rec_main", "INTEGER DEFAULT 0"), ("rec_closed", "INTEGER DEFAULT 0"), ("prov_token", "TEXT"), ("billing", "TEXT DEFAULT 'paypal'"), ("admin_note", "TEXT")):
         if col not in cc: con.execute(f"ALTER TABLE companies ADD COLUMN {col} {typ}")
+    cc = {r[1] for r in con.execute("PRAGMA table_info(customers)")}
+    for col in ("push_token", "push_platform", "push_at"):
+        if col not in cc: con.execute(f"ALTER TABLE customers ADD COLUMN {col} TEXT")
     dc = {r[1] for r in con.execute("PRAGMA table_info(departments)")}
     for col in ("did", "phone_id"):
         if col not in dc: con.execute(f"ALTER TABLE departments ADD COLUMN {col} TEXT")
@@ -253,8 +256,12 @@ def base_user(ep):
         if ep and ep.endswith(suf): return ep[:-len(suf)]
     return ep
 
+_DIALU = []     # the lines the last dial string rings (an AGI run passes them on as GS_DIALU for the iPhone wake-up)
+
 def dials(con, users):
     """Dial string ringing each line's phone app and, if signed in, its computer browser too."""
+    global _DIALU
+    _DIALU = list(users)
     out = []
     for u in users:
         out.append(f"PJSIP/{u}")
@@ -411,6 +418,86 @@ def dept_number(con, co, dept_id, number):
     if st: con.execute("DELETE FROM stock WHERE number=?", (want,))
     con.execute("UPDATE departments SET did=?, phone_id=? WHERE id=?", (want or None, (st["phone_id"] if st else None), d["id"]))
     event(con, co["main_user"] or "", "dept_number", f"{d['name']} {want or 'removed'}")
+
+# ---------------------------------------------------------------- iPhone call notifications (Apple push, APNs)
+# gsvoice.json "apns": {"key_file": "/etc/gsvoice/apns.p8", "key_id": "...", "team_id": "...", "topic": "tel.globalesim.app",
+#                       "host": "api.push.apple.com"}.  No extra Python packages: openssl signs, curl speaks HTTP/2.
+_APNS_JWT = [0, ""]
+
+def _b64u(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+def apns_jwt():
+    ap = C.get("apns") or {}
+    if _APNS_JWT[1] and time.time() - _APNS_JWT[0] < 40 * 60: return _APNS_JWT[1]
+    head = _b64u(json.dumps({"alg": "ES256", "kid": ap["key_id"]}).encode())
+    body = _b64u(json.dumps({"iss": ap["team_id"], "iat": int(time.time())}).encode())
+    der = subprocess.run(["openssl", "dgst", "-sha256", "-sign", ap["key_file"]], input=f"{head}.{body}".encode(),
+                         capture_output=True, timeout=10, check=True).stdout
+    # DER ECDSA signature → raw r||s (64 bytes) for JWT
+    i = 2 + (1 if der[1] & 0x80 else 0)
+    def intpart(j):
+        n = der[j + 1]; v = der[j + 2:j + 2 + n]; return v[-32:].rjust(32, b"\0"), j + 2 + n
+    r, i = intpart(i); s_, _ = intpart(i)
+    tok = f"{head}.{body}.{_b64u(r + s_)}"
+    _APNS_JWT[0] = time.time(); _APNS_JWT[1] = tok
+    return tok
+
+def apns_ready():
+    ap = C.get("apns") or {}
+    return bool(ap.get("key_file") and ap.get("key_id") and ap.get("team_id") and os.path.exists(ap["key_file"]))
+
+def apns_send_many(items):
+    """items: [(token, payload dict, collapse id)] — sent in parallel, waits at most ~5 s. Returns {token: http status}."""
+    if not items or not apns_ready(): return {}
+    ap = C["apns"]; jwt = apns_jwt(); host = ap.get("host", "api.push.apple.com"); procs = []
+    for tok, payload, coll in items:
+        cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--http2", "-m", "5",
+               "-H", f"authorization: bearer {jwt}", "-H", f"apns-topic: {ap.get('topic', 'tel.globalesim.app')}",
+               "-H", "apns-push-type: alert", "-H", "apns-priority: 10", "-H", f"apns-expiration: {int(time.time()) + 40}",
+               "-H", f"apns-collapse-id: {coll}", "-d", json.dumps(payload), f"{ap.get('base', 'https://' + host)}/3/device/{tok}"]
+        procs.append((tok, subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)))
+    out = {}
+    for tok, pr in procs:
+        try: out[tok] = int((pr.communicate(timeout=7)[0] or b"0").decode() or 0)
+        except Exception: pr.kill(); out[tok] = 0
+    return out
+
+def call_push_payload(caller, callid, title="Incoming call", tail="tap to answer"):
+    who = fmt_num(caller) if caller else "Unknown caller"
+    return {"aps": {"alert": {"title": title, "body": f"{who} · {tail}" if tail else who}, "sound": "ring.wav",
+                    "interruption-level": "time-sensitive", "thread-id": "calls"},
+            "url": "globalesim://phone", "call": str(callid)}
+
+def pushwait_main(a, args):
+    """Before a ring: wake the iPhone apps of the lines about to ring, wait (≤ 14 s) until one of them has signed in again,
+    then set the dial string again so it includes them.  Lines without an iPhone: nothing happens, no delay."""
+    var = args[1] if len(args) > 1 and re.fullmatch(r"GS_[A-Z]+", args[1] or "") else "GS_DIALS"
+    users = [u for u in a.cmd("GET VARIABLE GS_DIALU").partition("(")[2].rstrip(")").split(",") if u]
+    caller = a.cmd("GET VARIABLE CALLERID(num)").partition("(")[2].rstrip(")")
+    callid = a.cmd("GET VARIABLE GS_CALLID").partition("(")[2].rstrip(")") or "0"
+    if not users or not apns_ready(): return
+    with db() as con:
+        rows = con.execute(f"SELECT sip_user, push_token FROM customers WHERE status='active' AND push_token IS NOT NULL AND push_token<>'' AND sip_user IN ({','.join('?' * len(users))})", users).fetchall()
+    if not rows: return
+    a.cmd("EXEC Ringing")
+    t0 = time.time()
+    res = apns_send_many([(r["push_token"], call_push_payload(caller, callid), f"call-{callid}") for r in rows])
+    gone = [t for t, st in res.items() if st in (400, 410)]
+    if gone:
+        with db() as con: con.executemany("UPDATE customers SET push_token=NULL WHERE push_token=?", [(t,) for t in gone]); con.commit()
+    woke = [r["sip_user"] for r in rows if res.get(r["push_token"]) == 200]
+    if woke:
+        while time.time() - t0 < 14:
+            fresh = False
+            for u in woke:
+                cl = a.cmd(f"GET FULL VARIABLE ${{PJSIP_AOR({u}-web,contact)}}").partition("(")[2].rstrip(")")
+                for c in [x for x in cl.split(",") if x]:
+                    ex = a.cmd(f"GET FULL VARIABLE ${{PJSIP_CONTACT({c},expiration_time)}}").partition("(")[2].rstrip(")")
+                    if ex.isdigit() and int(ex) - 300 >= t0 - 3: fresh = True      # registered after the push (expires 300 s)
+            if fresh: break
+            time.sleep(0.5)
+    with db() as con: a.set(var, dials(con, users))
+    with db() as con: con.execute("UPDATE calls SET push=? WHERE id=?", (",".join(woke), int(callid) if callid.isdigit() else 0)); con.commit()
 
 # ---------------------------------------------------------------- Asterisk config
 def write_pjsip(con):
@@ -1088,6 +1175,15 @@ class Agi:
 def agi_main(args):
     a = Agi()
     mode = args[0] if args else ""
+    if mode == "pushwait":
+        try: pushwait_main(a, args)
+        except Exception as e: sys.stderr.write(f"pushwait: {e}\n")
+        return
+    try: _agi_modes(a, mode, args)
+    finally:
+        if _DIALU and mode not in ("ans", "qos", "charge", "vmsave"): a.set("GS_DIALU", ",".join(_DIALU))
+
+def _agi_modes(a, mode, args):
     with _lock, db() as con:
         if mode == "out":                 # out <endpoint> <dest> [chosen caller ID]
             user, dest = base_user(args[1]), digits(args[2]); want_cid = digits(args[3]) if len(args) > 3 else ""
@@ -1321,7 +1417,8 @@ class ApiError(Exception):
     def __init__(self, code, msg): super().__init__(msg); self.code = code; self.msg = msg
 
 def cust_json(con, c):
-    d = {k: c[k] for k in c.keys() if k not in ("sip_pass", "web_pass")}
+    d = {k: c[k] for k in c.keys() if k not in ("sip_pass", "web_pass", "push_token")}
+    d["push"] = bool(c["push_token"]) if "push_token" in c.keys() else False
     d["usage"] = usage(con, c); d["plan_name"] = C["plans"].get(c["plan"], {}).get("name", c["plan"])
     return d
 
@@ -1838,6 +1935,15 @@ def api_route(method, path, q, body):
                 event(con, u, "forward_set", f"{mode or 'off'} {to} dnd={1 if body.get('dnd') else 0}"); con.commit()
                 c = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
                 return cust_json(con, c)
+            if sub == "push" and method == "POST":             # iPhone app: where to send "incoming call" notifications
+                tk = str(body.get("token") or "").lower()
+                if not re.fullmatch(r"[0-9a-f]{64,200}", tk): raise ApiError(400, "bad token")
+                con.execute("UPDATE customers SET push_token=NULL WHERE push_token=? AND sip_user<>?", (tk, u))   # phone moved to another line
+                con.execute("UPDATE customers SET push_token=?, push_platform=?, push_at=? WHERE sip_user=?",
+                            (tk, str(body.get("platform") or "ios")[:10], iso(now()), u))
+                con.commit(); return {"ok": True}
+            if sub == "push" and method == "DELETE":
+                con.execute("UPDATE customers SET push_token=NULL WHERE sip_user=?", (u,)); con.commit(); return {"ok": True}
             if sub == "webcreds" and method == "GET":         # computer browser login (website checked the owner)
                 if c["status"] != "active": raise ApiError(403, "line not active")
                 if not c["web_pass"] or not c["web_exp"] or c["web_exp"] < iso(now() + dt.timedelta(hours=2)):
@@ -2001,6 +2107,14 @@ if __name__ == "__main__":
     elif sys.argv[1:2] == ["daily"]: daily_main()
     elif sys.argv[1:2] == ["report"]: report_main()
     elif sys.argv[1:2] == ["sms-setup"]: sms_setup(os.environ.get("GSVOICE_CONF", "/etc/gsvoice/gsvoice.json"))
+    elif sys.argv[1:2] == ["pushtest"]:        # pushtest [line] — check the Apple push key; with a line: send it a test alert
+        if not apns_ready(): print("Apple push is not set up yet (run apns-setup.sh)"); sys.exit(1)
+        apns_jwt(); print("Apple push key OK")
+        if len(sys.argv) > 2:
+            with db() as con: r = con.execute("SELECT push_token FROM customers WHERE sip_user=? OR did=? OR email=?", (sys.argv[2],) * 3).fetchone()
+            if not r or not r["push_token"]: print("that line has no iPhone signed in yet (open the Phone tab in the iPhone app)"); sys.exit(1)
+            st = apns_send_many([(r["push_token"], call_push_payload("", "test", "GlobaleSIM test", "call alerts work ✓"), "test")])
+            print("Apple answered:", list(st.values())[0], "(200 = delivered)")
     elif sys.argv[1:2] == ["regen"]:
         with db() as con: write_pjsip(con)
     else: print(__doc__)
