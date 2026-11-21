@@ -604,6 +604,21 @@ random=yes
 #include "/var/lib/gsvoice/moh.conf"
 EOF
 [ -f /var/lib/gsvoice/moh.conf ] || echo "; company hold music — written by gsvoice" > /var/lib/gsvoice/moh.conf
+# Hold music plays like a radio: one never-ending stream per company, callers join wherever it is (mid-song or the next song)
+cat > /usr/local/bin/gs-moh-stream <<'EOF'
+#!/bin/bash
+# Usage: gs-moh-stream <folder> — plays every .wav in the folder in order, forever, as 8 kHz raw audio for Asterisk.
+# Asterisk reads it in real time; if Asterisk stops reading, sox fails and we exit (Asterisk starts us again when needed).
+D="$1"
+while true; do
+  shopt -s nullglob; F=("$D"/*.wav); shopt -u nullglob
+  [ ${#F[@]} -eq 0 ] && { sleep 2; continue; }
+  for f in "${F[@]}"; do
+    sox -q "$f" -t raw -r 8000 -c 1 -e signed-integer -b 16 - 2>/dev/null || { [ -f "$f" ] && exit 0; }
+  done
+done
+EOF
+chmod 755 /usr/local/bin/gs-moh-stream
 mkdir -p /var/lib/gsvoice/moh
 chown asterisk:asterisk /etc/asterisk/musiconhold.conf /var/lib/gsvoice/moh.conf /var/lib/gsvoice/moh
 
