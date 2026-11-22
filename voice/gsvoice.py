@@ -1246,6 +1246,7 @@ def _agi_modes(a, mode, args):
                 return ("1" + d) if len(d) == 10 else d
             to_raw = args[2] if len(args) > 2 else ""; caller = digits(args[3]) if len(args) > 3 else ""
             did = num(to_raw) or num(args[1]) or num("sip:" + args[1] + "@")
+            did = (C.get("did_alias") or {}).get(did, did)   # a backup-carrier (Sinch) number that rings like one of our numbers
             cust = con.execute("SELECT * FROM customers WHERE did=? AND status='active'", (did,)).fetchone()
             dnum = None
             if not cust and did:                  # a department's own direct number: billed to the company's main line

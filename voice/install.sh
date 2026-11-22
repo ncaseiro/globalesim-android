@@ -33,6 +33,13 @@ fi
 read -rp "Your phone number from the carrier, digits only with country code, e.g. 12145550123 [${DID:-}]: " x; DID=${x:-${DID:-}}
 DID=$(echo "$DID" | tr -cd '0-9')
 read -rp "Is 911 (E911 with your address) enabled on that number at the carrier? y/N [${E911:-n}]: " x; E911=${x:-${E911:-n}}
+echo "Backup carrier (Sinch Elastic SIP Trunk) — used automatically when Telnyx can't place a call. Type - to remove it."
+read -rp "Sinch trunk address, e.g. yourname.pstn.sinch.com (Enter = keep [${SINCH_HOST:-none}]): " x; SINCH_HOST=${x:-${SINCH_HOST:-}}; [ "$SINCH_HOST" = "-" ] && SINCH_HOST=""
+SINCH_HOST=$(echo "$SINCH_HOST" | tr -cd 'A-Za-z0-9.-')
+if [ -n "$SINCH_HOST" ]; then
+  read -rp "Sinch number(s) that should ring like one of your numbers, e.g. 12085813207=18307798230 (comma-separated, Enter = keep [${SINCH_MAP:-none}]): " x; SINCH_MAP=${x:-${SINCH_MAP:-}}; [ "$SINCH_MAP" = "-" ] && SINCH_MAP=""
+  SINCH_MAP=$(echo "$SINCH_MAP" | tr -cd '0-9=,')
+else SINCH_MAP=""; fi
 
 # Customer service (accounts, minutes, number buying) — settings live in /etc/gsvoice/gsvoice.json
 GSJ=/etc/gsvoice/gsvoice.json; mkdir -p /etc/gsvoice
@@ -54,6 +61,8 @@ DL_USER='$DL_USER'
 DL_PASS='$DL_PASS'
 DID='$DID'
 E911='$E911'
+SINCH_HOST='$SINCH_HOST'
+SINCH_MAP='$SINCH_MAP'
 TEST_PASS='$TEST_PASS'
 TEST_USER='$TEST_USER'
 EOF
@@ -227,6 +236,36 @@ endpoint=carrier
 EOF
 for h in $( [ "$PROVIDER" = didlogic ] && echo sip.nyc.didlogic.net sip.lax.didlogic.net ) "$DL_SERVER"; do echo "match=$h"; done | sort -u
 fi
+if [ -n "$SINCH_HOST" ]; then cat <<EOF
+
+; ---- Backup carrier: Sinch Elastic SIP Trunk (no password: Sinch allows this server's IP) ----
+[sinch]
+type=endpoint
+transport=transport-udp
+context=from-carrier
+allow_transfer=no
+disallow=all
+allow=ulaw,alaw
+aors=sinch
+from_domain=$SINCH_HOST
+send_pai=yes
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+dtmf_mode=rfc4733
+
+[sinch]
+type=aor
+contact=sip:$SINCH_HOST
+qualify_frequency=60
+
+[sinch-identify]
+type=identify
+endpoint=sinch
+EOF
+for n in 131 133 134 136 137 138 139 141; do echo "match=206.146.$n.0/28"; done
+fi
 echo
 echo "#include pjsip_customers.conf"
 } > pjsip.conf
@@ -243,6 +282,7 @@ writeprotect=yes
 DID=$DID
 DIALPFX=$( [ "$PROVIDER" = telnyx ] && echo "+" )
 E911_ON=$E911_ON
+SINCH_ON=$( [ -n "$SINCH_HOST" ] && echo 1 || echo 0 )
 
 ; Calls coming in from the carrier to your number -> ring the test phone
 [from-carrier]
@@ -363,6 +403,7 @@ exten => _.,1,AGI(gs-agi.py,xfer,\${BLINDTRANSFER},\${EXTEN})
  same => n(ok),GotoIf(\$["\${GS_XEXT}" = "1"]?ext)
  same => n,Set(CALLERID(num)=\${GS_CID})
  same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
+ same => n,ExecIf(\$[\${SINCH_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/+\${GS_NUM}@sinch,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
  same => n,Hangup()
  same => n(ext),Gosub(gs-pushwait,s,1(GS_DIALS))
  same => n,Dial(\${GS_DIALS},25,b(gs-qospre^s^1(\${GS_CALLID}^\${GS_DEPTNAME}))U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
@@ -388,6 +429,7 @@ exten => s,1,AGI(gs-agi.py,fwd,\${GS_FWDUSER},\${CALLERID(num)})
  same => n(ok),GotoIf(\$["\${GS_FWDEXT}" = "1"]?ext)
  same => n,Set(CALLERID(num)=\${GS_CID})
  same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
+ same => n,ExecIf(\$[\${SINCH_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/+\${GS_NUM}@sinch,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
  same => n,Goto(gs-vm,s,1)
  same => n(ext),Gosub(gs-pushwait,s,1(GS_DIALS))
  same => n,Dial(\${GS_DIALS},25)
@@ -464,6 +506,7 @@ exten => _1NXXNXXXXXX,1,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n,Set(CHANNEL(hangup_handler_push)=gs-charge,s,1(\${GS_CALLID}))
  same => n,Set(CHANNEL(hangup_handler_push)=gs-qos,s,1(\${GS_CALLID}))
  same => n,Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC}))
+ same => n,ExecIf(\$[\${SINCH_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/+\${EXTEN}@sinch,60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC})))
  same => n,Hangup()
  same => n(blocked),Playback(ss-noservice)
  same => n,Hangup()
@@ -494,6 +537,7 @@ exten => _1NXXNXXXXXX,1,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n,Set(CALLERID(num)=\${DID})
  same => n,Set(TIMEOUT(absolute)=7200)
  same => n,Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60)
+ same => n,ExecIf(\$[\${SINCH_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/+\${EXTEN}@sinch,60))
  same => n,Hangup()
  same => n(blocked),Playback(ss-noservice)
  same => n,Hangup()
@@ -646,12 +690,13 @@ read = system
 write = message
 EOF
 chown asterisk:asterisk /etc/asterisk/manager.conf; chmod 640 /etc/asterisk/manager.conf
-python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" "$AMI_SECRET" <<'EOF'
+python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" "$AMI_SECRET" "${SINCH_MAP:-}" <<'EOF'
 import json, sys
-p, dom, key, conn, tok, did, test, ami = sys.argv[1:9]
+p, dom, key, conn, tok, did, test, ami, smap = sys.argv[1:10]
 try: c = json.load(open(p))
 except Exception: c = {}
-c.update({"sip_domain": dom, "telnyx_api_key": key, "telnyx_connection_id": conn, "api_token": tok, "company_did": did, "test_user": test, "ami_secret": ami})
+c.update({"sip_domain": dom, "telnyx_api_key": key, "telnyx_connection_id": conn, "api_token": tok, "company_did": did, "test_user": test, "ami_secret": ami,
+          "did_alias": dict(x.split("=", 1) for x in smap.split(",") if x.count("=") == 1 and all(x.split("=")))})
 c.setdefault("notify_url", "https://globalesim.tel/app.php?api=voice_hook")   # voicemail emails go out from the website
 json.dump(c, open(p, "w"), indent=2)
 EOF
