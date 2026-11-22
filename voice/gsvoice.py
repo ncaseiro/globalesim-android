@@ -22,7 +22,7 @@ DEFAULTS = {
     "plans": {"num300": {"name": "GlobaleSIM Number 300", "minutes": 300}, "num1000": {"name": "GlobaleSIM Number 1000", "minutes": 1000},
               "biz_ext": {"name": "GlobaleSIM Business extension", "minutes": 1000}},
     # business lines: busier than personal lines, still capped (per extension)
-    "limits_biz": {"new_calls_per_10min": 20, "calls_per_day": 300},
+    "limits_biz": {"new_calls_per_10min": 20, "calls_per_day": 300, "robocall_calls": 40, "robocall_short_calls": 30},
     # where voicemail / alerts are reported (app.php?api=voice_hook), with a shared secret
     "notify_url": "", "notify_token": "",
     "data_dir": "/var/lib/gsvoice", "tts_cmd": "espeak-ng",
@@ -351,7 +351,10 @@ def check_outbound(con, cust, dest):
     return True, "ok", u["remaining"] * 60
 
 def robocall_check(con, cust):
-    L = C["limits"]
+    L = dict(C["limits"])
+    if co_of(con, cust):   # business lines (brokers, dispatch) make many short calls on purpose: far higher bar before an auto-pause
+        LB = C.get("limits_biz") or {}
+        L.update(robocall_calls=LB.get("robocall_calls", 40), robocall_short_calls=LB.get("robocall_short_calls", 30))
     since = iso(now() - dt.timedelta(minutes=L["robocall_window_min"]))
     rows = con.execute("SELECT peer, billsec FROM calls WHERE sip_user=? AND direction='out' AND started_at>=?", (cust["sip_user"], since)).fetchall()
     short = [r for r in rows if (r["billsec"] or 0) < L["robocall_short_sec"]]
