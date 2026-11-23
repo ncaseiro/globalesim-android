@@ -58,7 +58,7 @@ def conf():
     return c
 
 C = conf()
-_lock = threading.Lock()
+_lock = threading.RLock()   # re-entrant: the admin "check for new numbers" runs inside an API request
 
 def now(): return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 def iso(t): return t.strftime("%Y-%m-%d %H:%M:%S")
@@ -808,8 +808,44 @@ def sinch_adopt(say=print):
             con.execute("INSERT INTO stock (number, phone_id, bought_at, note, available_at) VALUES (?,?,?,?,?)", (d, "sinch:+" + d, iso(now()), "Sinch", iso(now())))
             event(con, "admin", "stock_adopt", d + " (Sinch)"); added += 1; say(f"  {d}: added to the pool")
         con.commit()
-    say(f"Done: {len(found)} Sinch number(s) found, {added} added to the pool.")
+    say(f"Sinch: {len(found)} number(s) found, {added} added to the pool.")
     return added
+
+def telnyx_adopt_new(say=print):
+    """Numbers bought in the Telnyx portal AFTER automatic adding was turned on: connect them to this server and add
+    them to the pool. Numbers that were already in the account before stay 'Not linked' until you move them yourself."""
+    if not C["telnyx_api_key"]: return 0
+    mark = os.path.join(C["data_dir"], "auto_adopt_since")
+    if not os.path.exists(mark):
+        with open(mark, "w") as f: f.write(iso(now()))
+    since = open(mark).read().strip()[:19].replace("T", " ")
+    skip = {digits(C.get("company_did") or "")} | {digits(v) for v in (C.get("did_alias") or {}).values()} | set((C.get("did_alias") or {}).keys())
+    added = 0
+    for n in telnyx_all("/phone_numbers"):
+        d = digits(n.get("phone_number")); bought = str(n.get("purchased_at") or n.get("created_at") or "")[:19].replace("T", " ")
+        if len(d) != 11 or d in skip or not bought or bought < since or not n.get("id"): continue
+        with _lock, db() as con:
+            if con.execute("SELECT 1 FROM customers WHERE did=? UNION SELECT 1 FROM stock WHERE number=? UNION SELECT 1 FROM departments WHERE did=?", (d, d, d)).fetchone(): continue
+            pid = str(n["id"])
+            try:
+                if C["telnyx_connection_id"] and str(n.get("connection_id") or "") != str(C["telnyx_connection_id"]):
+                    telnyx("PATCH", f"/phone_numbers/{pid}", {"connection_id": C["telnyx_connection_id"]})
+            except ApiError as e: say(f"  {d}: could not connect it to this server — {e.msg[:120]}"); continue
+            try: sms_attach(pid)
+            except Exception: pass
+            con.execute("INSERT INTO stock (number, phone_id, bought_at, note, available_at) VALUES (?,?,?,?,?)", (d, pid, iso(now()), "Telnyx portal", iso(now())))
+            event(con, "admin", "stock_adopt", d + " (Telnyx, automatic)"); con.commit(); added += 1; say(f"  {d}: added to the pool (Telnyx)")
+    return added
+
+def auto_adopt(say=print):
+    """Both carriers: new numbers bought in their portals join the pool by themselves (cron every 5 min + admin button)."""
+    out = {"telnyx": 0, "sinch": 0, "errors": []}
+    try: out["telnyx"] = telnyx_adopt_new(say)
+    except ApiError as e: out["errors"].append("Telnyx: " + e.msg[:150])
+    if sinch_on():
+        try: out["sinch"] = sinch_adopt(say)
+        except ApiError as e: out["errors"].append("Sinch: " + e.msg[:150])
+    return out
 
 def via_of(con, cid):
     """'sinch' when the caller ID is one of our Sinch numbers: those calls go out through Sinch first (911 too)."""
@@ -1815,6 +1851,9 @@ def api_route(method, path, q, body):
         if p == ["stock"] and method == "GET":                       # the pool, quick (no Telnyx call): ready numbers first
             return {"stock": [dict(r) for r in con.execute("SELECT number, available_at, note FROM stock ORDER BY COALESCE(available_at,'') > ?, number", (iso(now()),))],
                     "now": iso(now())}
+        if p == ["numbers", "adopt-new"] and method == "POST":       # admin "Check for new numbers now"
+            con.commit(); r = auto_adopt(lambda *a: None)
+            return {"ok": not r["errors"], **r}
         if len(p) == 4 and p[:2] == ["telnyx", "stock"] and p[3] == "adopt" and method == "POST":   # a number bought in the Telnyx portal -> our pool
             num = digits(p[2]); num = ("1" + num) if len(num) == 10 else num
             if not re.fullmatch(r"1\d{10}", num): raise ApiError(400, "bad number")
@@ -2428,6 +2467,10 @@ if __name__ == "__main__":
         ns = [n.get("phoneNumber") for n in r.get("availableNumbers") or []]
         print(f"Numbers for sale in {ac}:", ", ".join(ns) or "none right now")
         print("Prices:", "; ".join(f"{n.get('phoneNumber')} setup {((n.get('setupPrice') or {}).get('amount'))} monthly {((n.get('monthlyPrice') or {}).get('amount'))}" for n in (r.get("availableNumbers") or [])[:2]))
+    elif sys.argv[1:2] == ["auto-adopt"]:      # auto-adopt [--quiet] — new numbers from the Telnyx portal and the Sinch dashboard -> pool (cron)
+        q = "--quiet" in sys.argv
+        r = auto_adopt((lambda *a: None) if q else print)
+        if not q: print(f"Added: {r['telnyx']} Telnyx, {r['sinch']} Sinch." + ("  Problems: " + "; ".join(r["errors"]) if r["errors"] else ""))
     elif sys.argv[1:2] == ["sinch-adopt"]:     # sinch-adopt [--quiet] — Sinch numbers bought in the dashboard -> our trunk + the pool (cron every 30 min)
         q = "--quiet" in sys.argv
         if not sinch_on():
