@@ -350,6 +350,15 @@ exten => s,1,Answer()
  same => n,Goto(gs-vm,s,1)
 
 ; Voicemail: recorded, then the website emails the customer (and it shows in the app)
+; A parked call nobody picked up in 3 minutes: ring all phones of the person who parked it for 30 s, then their voicemail
+[gs-park-timeout]
+exten => _[A-Za-z0-9].,1,Goto(s,1)
+exten => s,1,AGI(gs-agi.py,parkback,\${PARKER})
+ same => n,GotoIf(\$["\${GS_DIALS}" = ""]?vm)
+ same => n,Gosub(gs-pushwait,s,1(GS_DIALS))
+ same => n,Dial(\${GS_DIALS},30)
+ same => n(vm),Goto(gs-vm,s,1)
+
 [gs-vm]
 exten => s,1,GotoIf(\$["\${GS_VMUSER}" = ""]?none)
  same => n,Answer()
@@ -391,6 +400,14 @@ exten => s,1,Set(GS_ANS=\${EPOCH})
 
 ; "Transfer now" (blind transfer) from the app, computer or desk phone: same checks + billing as a normal call
 [gs-transfer]
+; Park: transfer the caller to *8 -> a free slot 801-899 in the company's lot, with the company's hold music
+exten => *8,1,AGI(gs-agi.py,park,\${BLINDTRANSFER})
+ same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok)
+ same => n,Playback(pbx-invalid)
+ same => n,Hangup()
+ same => n(ok),Set(PARKINGEXTEN=\${GS_SLOT})
+ same => n,Park(\${GS_LOT},s)
+ same => n,Hangup()
 exten => _+X.,1,Goto(gs-transfer,\${EXTEN:1},1)
 exten => _X.,1,Goto(gs-xfer-go,\${EXTEN},1)
 exten => _D.,1,Goto(gs-xfer-go,\${EXTEN},1)
@@ -443,6 +460,16 @@ exten => _.,1,Hangup()
 ; Checked by gsvoice before every call: active account, minutes left, max 5 calls / 10 min,
 ; 100 / day, one call at a time; the call is cut off when the minutes run out.
 [from-customer]
+; Park (some phones look up the transfer target here instead of in gs-transfer)
+exten => *8,1,Goto(gs-transfer,*8,1)
+; Pick up a parked call: *8 + slot (e.g. *848), any phone of the same company
+exten => _*8XX,1,AGI(gs-agi.py,unpark,\${CHANNEL(endpoint)},\${EXTEN:1})
+ same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok)
+ same => n,Playback(pbx-invalid)
+ same => n,Hangup()
+ same => n(ok),Set(__TRANSFER_CONTEXT=gs-transfer)
+ same => n,ParkedCall(\${GS_LOT},\${EXTEN:1})
+ same => n,Hangup()
 ; Calls between extensions of the same company (101-899): free, never leave the server
 exten => _[1-8]XX,1,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n,AGI(gs-agi.py,ext,\${CHANNEL(endpoint)},\${EXTEN})
@@ -666,6 +693,14 @@ chmod 755 /usr/local/bin/gs-moh-stream
 mkdir -p /var/lib/gsvoice/moh
 chown asterisk:asterisk /etc/asterisk/musiconhold.conf /var/lib/gsvoice/moh.conf /var/lib/gsvoice/moh
 
+# Call parking: one lot per company, written by gsvoice (slots 801-899)
+cat > /etc/asterisk/res_parking.conf <<EOF
+[general]
+#include /var/lib/gsvoice/parking.conf
+EOF
+[ -f /var/lib/gsvoice/parking.conf ] || echo "; company parking lots — written by gsvoice" > /var/lib/gsvoice/parking.conf
+chown asterisk:asterisk /etc/asterisk/res_parking.conf /var/lib/gsvoice/parking.conf
+
 # Asterisk's built-in web server, local only — Caddy passes browser calls (wss://…/ws) to it
 cat > /etc/asterisk/http.conf <<EOF
 [general]
@@ -686,8 +721,8 @@ port = 5038
 secret = $AMI_SECRET
 deny = 0.0.0.0/0.0.0.0
 permit = 127.0.0.1/255.255.255.255
-read = system
-write = message
+read = system,call
+write = message,call
 EOF
 chown asterisk:asterisk /etc/asterisk/manager.conf; chmod 640 /etc/asterisk/manager.conf
 python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" "$AMI_SECRET" "${SINCH_MAP:-}" <<'EOF'
