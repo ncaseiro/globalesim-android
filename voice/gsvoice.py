@@ -1774,7 +1774,20 @@ def api_route(method, path, q, body):
                             "email": c["email"] if c else "", "sip_user": c["sip_user"] if c else "", "line_status": c["status"] if c else "",
                             "company": co["name"] if co else ((deptrows[d]["co"] or "") if d in deptrows else ""), "ext": (c["ext"] or "") if c else "",
                             "available_at": (stockrows[d]["available_at"] or "") if d in stockrows else "", "prev_email": (stockrows[d]["prev_email"] or "") if d in stockrows else "",
-                            "pool_note": (stockrows[d]["note"] or "") if d in stockrows else ""})
+                            "pool_note": (stockrows[d]["note"] or "") if d in stockrows else "", "carrier": "Telnyx"})
+            seen = {x["number"] for x in out}                         # Sinch numbers: from our own records (no Telnyx entry)
+            for d, pid, bought in [(r["number"], r["phone_id"], r["bought_at"]) for r in stockrows.values() if is_sinch(r["phone_id"])] + \
+                    [(r["did"], r["phone_id"], r["created_at"]) for r in con.execute("SELECT did, phone_id, created_at FROM customers WHERE phone_id LIKE 'sinch:%' AND did IS NOT NULL")] + \
+                    [(r["did"], r["phone_id"], "") for r in con.execute("SELECT did, phone_id FROM departments WHERE phone_id LIKE 'sinch:%' AND did IS NOT NULL")]:
+                if d in seen: continue
+                seen.add(d); c = con.execute("SELECT * FROM customers WHERE did=?", (d,)).fetchone(); co = co_of(con, c) if c else None
+                out.append({"id": pid, "number": d, "status": "active", "connection": C.get("sinch_host") or "Sinch", "billing": "", "e911": bool(c and c["e911"]),
+                            "purchased_at": (bought or "")[:10], "use": "customer" if c else ("stock" if d in stock else ("department" if d in deptrows else "other")),
+                            "dept": deptrows[d]["name"] if d in deptrows else "", "email": c["email"] if c else "", "sip_user": c["sip_user"] if c else "",
+                            "line_status": c["status"] if c else "", "company": co["name"] if co else ((deptrows[d]["co"] or "") if d in deptrows else ""),
+                            "ext": (c["ext"] or "") if c else "", "available_at": (stockrows[d]["available_at"] or "") if d in stockrows else "",
+                            "prev_email": (stockrows[d]["prev_email"] or "") if d in stockrows else "", "pool_note": (stockrows[d]["note"] or "") if d in stockrows else "",
+                            "carrier": "Sinch"})
             return {"numbers": out}
         if len(p) == 4 and p[:2] == ["telnyx", "numbers"] and p[3] == "billing" and method == "POST":
             m = str(body.get("method") or "")
