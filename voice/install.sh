@@ -819,6 +819,7 @@ json.dump(c, open(p, "w"), indent=2)
 EOF
 chown -R asterisk:asterisk /opt/gsvoice /var/lib/gsvoice /etc/gsvoice; chmod 640 "$GSJ"; chmod 750 /etc/gsvoice
 echo '41 5 * * * asterisk /usr/bin/python3 /opt/gsvoice/gsvoice.py daily >/dev/null 2>&1' > /etc/cron.d/gsvoice-daily   # releases numbers unpaid 30+ days
+echo '*/30 * * * * asterisk /usr/bin/python3 /opt/gsvoice/gsvoice.py sinch-adopt --quiet >/dev/null 2>&1' > /etc/cron.d/gsvoice-sinch   # numbers bought in the Sinch dashboard join the pool by themselves
 # Security report: root collects fail2ban numbers (only root can), the report itself runs as asterisk and is emailed ~6 AM Central
 cat > /usr/local/bin/gsvoice-f2b <<'EOF'
 #!/bin/bash

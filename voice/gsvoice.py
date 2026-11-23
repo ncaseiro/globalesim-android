@@ -787,6 +787,30 @@ def sinch_e911_off(phone_id):
 
 _SINCH_SEEN = {}     # numbers we showed from Sinch's list (number -> when): buying one goes straight to Sinch
 
+def sinch_adopt(say=print):
+    """Numbers bought by hand in the Sinch dashboard: connect them to our trunk and add them to the pool (ready now)."""
+    tid = sinch_trunk_id(); found, tok = [], ""
+    while True:
+        r = sinch_num("/activeNumbers?" + urllib.parse.urlencode({"regionCode": "US", "type": "LOCAL", "pageSize": "100", **({"pageToken": tok} if tok else {})}))
+        found += r.get("activeNumbers") or []; tok = r.get("nextPageToken") or ""
+        if not tok: break
+    added = 0
+    with _lock, db() as con:
+        for n in found:
+            d = digits(n.get("phoneNumber"))
+            if len(d) != 11 or (C.get("did_alias") or {}).get(d): continue          # the backup alias number stays as it is
+            vc = n.get("voiceConfiguration") or {}
+            if vc.get("type") != "EST" or str(vc.get("trunkId") or "") != tid:
+                try: sinch_num(f"/activeNumbers/+{d}", {"voiceConfiguration": {"type": "EST", "trunkId": tid}}, "PATCH"); say(f"  {d}: connected to our trunk")
+                except ApiError as e: say(f"  {d}: could not connect it to the trunk — {e.msg}"); continue
+            used = con.execute("SELECT 1 FROM customers WHERE did=? UNION SELECT 1 FROM departments WHERE did=? UNION SELECT 1 FROM stock WHERE number=?", (d, d, d)).fetchone()
+            if used: say(f"  {d}: already in use or in the pool"); continue
+            con.execute("INSERT INTO stock (number, phone_id, bought_at, note, available_at) VALUES (?,?,?,?,?)", (d, "sinch:+" + d, iso(now()), "Sinch", iso(now())))
+            event(con, "admin", "stock_adopt", d + " (Sinch)"); added += 1; say(f"  {d}: added to the pool")
+        con.commit()
+    say(f"Done: {len(found)} Sinch number(s) found, {added} added to the pool.")
+    return added
+
 def via_of(con, cid):
     """'sinch' when the caller ID is one of our Sinch numbers: those calls go out through Sinch first (911 too)."""
     d = digits(cid)
@@ -2391,28 +2415,14 @@ if __name__ == "__main__":
         ns = [n.get("phoneNumber") for n in r.get("availableNumbers") or []]
         print(f"Numbers for sale in {ac}:", ", ".join(ns) or "none right now")
         print("Prices:", "; ".join(f"{n.get('phoneNumber')} setup {((n.get('setupPrice') or {}).get('amount'))} monthly {((n.get('monthlyPrice') or {}).get('amount'))}" for n in (r.get("availableNumbers") or [])[:2]))
-    elif sys.argv[1:2] == ["sinch-adopt"]:     # sinch-adopt — Sinch numbers bought in the dashboard: point them at our trunk and add them to the pool
-        if not sinch_on(): print("Sinch API is not set up (run the installer and fill in the Sinch questions)"); sys.exit(1)
-        tid = sinch_trunk_id(); found, tok = [], ""
-        while True:
-            r = sinch_num("/activeNumbers?" + urllib.parse.urlencode({"regionCode": "US", "type": "LOCAL", "pageSize": "100", **({"pageToken": tok} if tok else {})}))
-            found += r.get("activeNumbers") or []; tok = r.get("nextPageToken") or ""
-            if not tok: break
-        added = 0
-        with _lock, db() as con:
-            for n in found:
-                d = digits(n.get("phoneNumber")); pid = "sinch:+" + d
-                if len(d) != 11 or (C.get("did_alias") or {}).get(d): continue          # the backup alias number stays as it is
-                vc = n.get("voiceConfiguration") or {}
-                if vc.get("type") != "EST" or str(vc.get("trunkId") or "") != tid:
-                    try: sinch_num(f"/activeNumbers/+{d}", {"voiceConfiguration": {"type": "EST", "trunkId": tid}}, "PATCH"); print(f"  {d}: connected to our trunk")
-                    except ApiError as e: print(f"  {d}: could not connect it to the trunk — {e.msg}"); continue
-                used = con.execute("SELECT 1 FROM customers WHERE did=? UNION SELECT 1 FROM departments WHERE did=? UNION SELECT 1 FROM stock WHERE number=?", (d, d, d)).fetchone()
-                if used: print(f"  {d}: already in use or in the pool"); continue
-                con.execute("INSERT INTO stock (number, phone_id, bought_at, note, available_at) VALUES (?,?,?,?,?)", (d, pid, iso(now()), "Sinch", iso(now())))
-                event(con, "admin", "stock_adopt", d + " (Sinch)"); added += 1; print(f"  {d}: added to the pool")
-            con.commit()
-        print(f"Done: {len(found)} Sinch number(s) found, {added} added to the pool.")
+    elif sys.argv[1:2] == ["sinch-adopt"]:     # sinch-adopt [--quiet] — Sinch numbers bought in the dashboard -> our trunk + the pool (cron every 30 min)
+        q = "--quiet" in sys.argv
+        if not sinch_on():
+            if not q: print("Sinch API is not set up (run the installer and fill in the Sinch questions)")
+            sys.exit(0 if q else 1)
+        try: sinch_adopt(print if not q else (lambda *a: None))
+        except ApiError as e:
+            if not q: print("Problem:", e.msg); sys.exit(1)
     elif sys.argv[1:2] == ["pushtest"]:        # pushtest [line] — check the Apple push key; with a line: send it a test alert
         if not apns_ready(): print("Apple push is not set up yet (run apns-setup.sh)"); sys.exit(1)
         apns_jwt(); print("Apple push key OK")
