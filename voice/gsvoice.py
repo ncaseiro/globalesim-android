@@ -19,6 +19,8 @@ DEFAULTS = {
     "sip_domain": "voice.globalesim.tel",
     "company_did": "", "test_user": "",
     "telnyx_api_key": "", "telnyx_connection_id": "", "telnyx_api_base": "https://api.telnyx.com/v2",
+    # second carrier (Sinch Elastic SIP Trunk): numbers can also be bought there; sinch_host = the trunk address
+    "sinch_project_id": "", "sinch_key_id": "", "sinch_key_secret": "", "sinch_host": "", "sinch_trunk_id": "",
     "plans": {"num300": {"name": "GlobaleSIM Number 300", "minutes": 300}, "num1000": {"name": "GlobaleSIM Number 1000", "minutes": 1000},
               "biz_ext": {"name": "GlobaleSIM Business extension", "minutes": 1000}},
     # business lines: busier than personal lines, still capped (per extension)
@@ -701,6 +703,102 @@ def telnyx(method, path, body=None):
     except urllib.error.HTTPError as e:
         raise ApiError(502, "telnyx: " + e.read().decode(errors="replace")[:400])
 
+# ---------------------------------------------------------------- Sinch (second carrier: number search / buy / 911)
+# Our id for a Sinch number is "sinch:+1NXXNXXXXXX" (Telnyx ids are plain numbers), so every Telnyx-only call skips it.
+def is_sinch(phone_id): return str(phone_id or "").startswith("sinch:")
+def sinch_on(): return bool(C.get("sinch_project_id") and C.get("sinch_key_id") and C.get("sinch_key_secret"))
+
+def sinch(method, url, body=None):
+    if not sinch_on(): raise ApiError(503, "sinch not configured")
+    import base64
+    auth = base64.b64encode(f"{C['sinch_key_id']}:{C['sinch_key_secret']}".encode()).decode()
+    req = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": "Basic " + auth, "Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r: return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        raise ApiError(502, f"sinch {e.code}: " + e.read().decode(errors="replace")[:400])
+    except urllib.error.URLError as e:
+        raise ApiError(502, f"sinch: {e.reason}")
+
+def sinch_num(path, body=None, method="GET"):
+    return sinch(method, f"https://numbers.api.sinch.com/v1/projects/{C['sinch_project_id']}{path}", body)
+
+_sinch_trunk = {}
+def sinch_trunk_id():
+    """Our trunk's id: from the settings, else looked up once by its address (e.g. globalesim-sfo.pstn.sinch.com)."""
+    if C.get("sinch_trunk_id"): return C["sinch_trunk_id"]
+    if "id" in _sinch_trunk: return _sinch_trunk["id"]
+    r = sinch("GET", f"https://elastic-trunking.api.sinch.com/v1/projects/{C['sinch_project_id']}/trunks?pageSize=100")
+    trunks = r.get("trunks") or r.get("sipTrunks") or r.get("data") or (r if isinstance(r, list) else [])
+    host = (C.get("sinch_host") or "").lower(); want = host.split(".")[0]
+    for t in trunks:
+        if host and (str(t.get("domain", "")).lower() == host or str(t.get("hostName", "")).lower() == want):
+            _sinch_trunk["id"] = str(t.get("id")); return _sinch_trunk["id"]
+    if len(trunks) == 1: _sinch_trunk["id"] = str(trunks[0].get("id")); return _sinch_trunk["id"]
+    raise ApiError(502, "sinch: trunk not found — set sinch_trunk_id")
+
+def sinch_search(area_code="", limit=10):
+    """US local voice numbers Sinch can rent us in an area code (11 digits each). Errors: an empty list (Telnyx still answers)."""
+    if not sinch_on(): return []
+    ac = digits(area_code)[:3]; out = []
+    for pat, how in (((ac, "START"), ("1" + ac, "CONTAINS")) if ac else (("", ""),)):
+        q = {"regionCode": "US", "type": "LOCAL", "capabilities": "VOICE", "size": str(max(limit, 10))}
+        if pat: q.update({"numberPattern.pattern": pat, "numberPattern.searchPattern": how})
+        try: r = sinch_num("/availableNumbers?" + urllib.parse.urlencode(q))
+        except ApiError as e:
+            sys.stderr.write(f"sinch search: {e.msg}\n"); return out
+        for n in r.get("availableNumbers") or []:
+            d = digits(n.get("phoneNumber"))
+            if len(d) == 11 and (not ac or d[1:4] == ac) and d not in out: out.append(d)
+        if out: break
+    return out[:limit]
+
+def sinch_rent(num="", area_code=""):
+    """Rent a number (or any in the area code) and point it at our trunk. Returns (11 digits, 'sinch:+1…')."""
+    vc = {"type": "EST", "trunkId": sinch_trunk_id()}
+    if num: r = sinch_num(f"/availableNumbers/+{digits(num)}:rent", {"voiceConfiguration": vc}, "POST")
+    else:
+        r = sinch_num("/availableNumbers:rentAny", {"regionCode": "US", "type": "LOCAL", "capabilities": ["VOICE"], "voiceConfiguration": vc,
+                       "numberPattern": {"pattern": digits(area_code)[:3], "searchPattern": "START"}}, "POST")
+    d = digits(r.get("phoneNumber") or num)
+    if len(d) != 11: raise ApiError(502, "sinch: no number in the answer")
+    return d, "sinch:+" + d
+
+def sinch_release(phone_id):
+    sinch_num(f"/activeNumbers/{phone_id.split(':', 1)[1]}:release", {}, "POST")
+
+def sinch_e911(phone_id, a):
+    """Register the 911 address for a Sinch number (validated first). Returns an id to keep with the line."""
+    street = (a.get("street") or "").strip(); m = re.match(r"^(\d+[A-Za-z0-9-]*)\s+(.+)$", street)
+    addr = {"streetNumber": m.group(1) if m else "", "streetInfo": m.group(2) if m else street, "location": a.get("unit", ""),
+            "city": a.get("city", ""), "state": a.get("state", ""), "postalCode": digits(a.get("zip", ""))[:5]}
+    body = {"displayName": (a.get("name") or "GlobaleSIM customer")[:40], "address": addr}
+    n = phone_id.split(":", 1)[1]
+    v = sinch_num(f"/activeNumbers/{n}/emergencyAddress:validate", body, "POST")
+    res = v.get("validationResult") or ""
+    if res == "NO_MATCH": raise ApiError(400, "911 address not found — check the street, city and ZIP")
+    if v.get("validatedAddress"): body["address"] = {**addr, **{k: x for k, x in v["validatedAddress"].items() if x}}
+    sinch_num(f"/activeNumbers/{n}/emergencyAddress:provision", body, "POST")
+    return phone_id
+
+def sinch_e911_off(phone_id):
+    sinch_num(f"/activeNumbers/{phone_id.split(':', 1)[1]}/emergencyAddress:deprovision", {}, "POST")
+
+_SINCH_SEEN = {}     # numbers we showed from Sinch's list (number -> when): buying one goes straight to Sinch
+
+def via_of(con, cid):
+    """'sinch' when the caller ID is one of our Sinch numbers: those calls go out through Sinch first (911 too)."""
+    d = digits(cid)
+    if not d: return ""
+    for t in ("customers", "departments", "stock"):
+        col = "number" if t == "stock" else "did"
+        try:
+            r = con.execute(f"SELECT phone_id FROM {t} WHERE {col}=? LIMIT 1", (d,)).fetchone()
+        except sqlite3.Error: continue
+        if r and is_sinch(r["phone_id"]): return "sinch"
+    return ""
+
 def telnyx_available(params):
     """Numbers Telnyx can sell us. No exact match (error 10031): ask again for the closest ones (best_effort);
     still nothing: an empty list, not an error."""
@@ -716,8 +814,19 @@ def telnyx_search(area_code="", contains="", limit=10):
     params = {"filter[country_code]": "US", "filter[features][]": "voice", "filter[limit]": str(limit)}
     if area_code: params["filter[national_destination_code]"] = digits(area_code)[:3]
     if contains: params["filter[phone_number][contains]"] = digits(contains)
-    r = telnyx_available(params)
-    return [n.get("phone_number") for n in r.get("data", []) if n.get("phone_number")]
+    out = []
+    if C["telnyx_api_key"]:
+        try:
+            r = telnyx_available(params)
+            out = [n.get("phone_number") for n in r.get("data", []) if n.get("phone_number")]
+        except ApiError as e:
+            if not sinch_on(): raise
+            sys.stderr.write(f"telnyx search: {e.msg}\n")
+    if sinch_on() and not contains and len(out) < limit:          # Sinch numbers fill the rest of the list
+        have = {digits(x) for x in out}
+        extra = [d for d in sinch_search(area_code, limit) if d not in have][:limit - len(out)]
+        _SINCH_SEEN.update({d: time.time() for d in extra}); out += ["+" + d for d in extra]
+    return out
 
 def telnyx_phone_id(did, tries=1):
     """Telnyx id of one of our numbers, looked up by the number itself ('' if not in the account).
@@ -732,14 +841,37 @@ def telnyx_phone_id(did, tries=1):
 def telnyx_backup(phone_id, to):
     """Backup number: Telnyx sends calls there by itself when our voice server can't be reached (on-failure).
     to = 11 digits, or '' to turn it off."""
+    if is_sinch(phone_id):
+        if not to: return
+        raise ApiError(400, "the backup cell number isn't available on this number yet")
     cf = {"call_forwarding_enabled": True, "forwards_to": "+" + to, "forwarding_type": "on-failure"} if to else {"call_forwarding_enabled": False}
     telnyx("PATCH", f"/phone_numbers/{phone_id}/voice", {"call_forwarding": cf})
 
 def telnyx_buy(num, area_code="", taken=()):
-    """Buy num (11 digits); if it's gone, take another from the same area code. Returns (num, phone_id)."""
+    """Buy num (11 digits) from Telnyx, or from Sinch when Telnyx doesn't have it (a number shown from Sinch's list,
+    or nothing left in that area code at Telnyx). Returns (num, phone_id)."""
+    if num and sinch_on() and time.time() - _SINCH_SEEN.get(num, 0) < 3600 and num not in taken:
+        try: return sinch_rent(num)
+        except ApiError as e: sys.stderr.write(f"sinch rent {num}: {e.msg}\n")
+    try:
+        if not C["telnyx_api_key"]: raise ApiError(409, "no telnyx")
+        return _telnyx_buy(num, area_code, taken)
+    except ApiError:
+        if not sinch_on(): raise
+    if num and num not in taken:
+        try: return sinch_rent(num)
+        except ApiError as e: sys.stderr.write(f"sinch rent {num}: {e.msg}\n")
+    ac = digits(area_code)[:3] or (num[1:4] if num else "")
+    if ac:
+        try: return sinch_rent("", ac)
+        except ApiError as e: sys.stderr.write(f"sinch rentAny {ac}: {e.msg}\n")
+    raise ApiError(409, "no number available in that area code — try another")
+
+def _telnyx_buy(num, area_code="", taken=()):
     tried, candidates = set(), [num] if num else []
     if not candidates or area_code:
-        try: candidates += [digits(x) for x in telnyx_search(area_code or num[1:4], limit=5)]
+        try: candidates += [digits(n.get("phone_number")) for n in telnyx_available({"filter[country_code]": "US", "filter[features][]": "voice",
+                            "filter[limit]": "5", "filter[national_destination_code]": digits(area_code or num[1:4])[:3]}).get("data", []) if n.get("phone_number")]
         except ApiError: pass
     for n in candidates:
         if not n or n in tried or n in taken: continue
@@ -830,6 +962,7 @@ def line_costs(con):
 
 def telnyx_e911(phone_id, a):
     """a = {name, street, unit, city, state, zip}. Returns address id (911 enabled) or raises ApiError."""
+    if is_sinch(phone_id): return sinch_e911(phone_id, a)
     first, _, last = (a.get("name") or "").strip().partition(" ")
     r = telnyx("POST", "/addresses", {"first_name": first or "Customer", "last_name": last or first or "Customer",
                                        "business_name": a.get("name") or "GlobaleSIM customer", "street_address": a.get("street", ""),
@@ -842,6 +975,7 @@ def telnyx_e911(phone_id, a):
 
 def e911_off(phone_id, address_id=""):
     """Turn 911 off on a number (it must never send help to the previous owner's address)."""
+    if is_sinch(phone_id): sinch_e911_off(phone_id); return True
     try: telnyx("PATCH", f"/phone_numbers/{phone_id}/voice", {"emergency": {"emergency_enabled": False}}); return True
     except ApiError:
         if not address_id: raise
@@ -852,7 +986,7 @@ def to_pool(con, c, why):
     """Take the number off a line and keep it in our pool: Telnyx bills by the month, so returning it saves nothing.
     911 is switched off; the number rests pool_rest_days before a new customer is offered it."""
     if not c["did"]: return True
-    if c["phone_id"] and C["telnyx_api_key"] and c["e911"]:
+    if c["phone_id"] and c["e911"]:
         try: e911_off(c["phone_id"], c["e911_address_id"] or "")
         except ApiError as e: event(con, c["sip_user"], "e911_failed", "could not turn 911 off on " + c["did"] + ": " + e.msg[:150])
     if c["phone_id"] and C["telnyx_api_key"] and c["backup_to"]:     # the next owner's calls must never ring this person's cell
@@ -1210,7 +1344,7 @@ def sms_retry_loop():
             sys.stderr.write("sms retry %r\n" % e)
 
 def sms_attach(phone_id):
-    if C["messaging_profile_id"] and phone_id:
+    if C["messaging_profile_id"] and phone_id and not is_sinch(phone_id):
         try: telnyx("PATCH", f"/phone_numbers/{phone_id}/messaging", {"messaging_profile_id": C["messaging_profile_id"]}); return True
         except ApiError as e: sys.stderr.write("sms attach %s: %s\n" % (phone_id, e.msg))
     return False
@@ -1254,7 +1388,9 @@ class Agi:
     def cmd(self, c):
         sys.stdout.write(c + "\n"); sys.stdout.flush()
         return sys.stdin.readline().strip()
-    def set(self, k, v): self.cmd(f'SET VARIABLE {k} "{v}"')
+    def set(self, k, v):
+        if k == "GS_CID": self.cid = v
+        self.cmd(f'SET VARIABLE {k} "{v}"')
 
 def agi_main(args):
     a = Agi()
@@ -1263,7 +1399,10 @@ def agi_main(args):
         try: pushwait_main(a, args)
         except Exception as e: sys.stderr.write(f"pushwait: {e}\n")
         return
-    try: _agi_modes(a, mode, args)
+    try:
+        _agi_modes(a, mode, args)
+        if getattr(a, "cid", "") and sinch_on():         # our Sinch numbers call out through Sinch first
+            with db() as con: a.set("GS_VIA", via_of(con, a.cid))
     finally:
         if _DIALU and mode not in ("ans", "qos", "charge", "vmsave"): a.set("GS_DIALU", ",".join(_DIALU))
 
@@ -1658,7 +1797,8 @@ def api_route(method, path, q, body):
         if len(p) == 4 and p[:2] == ["telnyx", "stock"] and p[3] == "release" and method == "POST":
             st = con.execute("SELECT * FROM stock WHERE number=?", (digits(p[2]),)).fetchone()
             if not st: raise ApiError(404, "not in stock")
-            if st["phone_id"]: telnyx("DELETE", f"/phone_numbers/{st['phone_id']}")
+            if is_sinch(st["phone_id"]): sinch_release(st["phone_id"])
+            elif st["phone_id"]: telnyx("DELETE", f"/phone_numbers/{st['phone_id']}")
             con.execute("DELETE FROM stock WHERE number=?", (st["number"],)); event(con, "admin", "stock_release", st["number"]); con.commit()
             return {"ok": True}
         if p == ["quality"] and method == "GET":                    # admin: call quality of the last N days
@@ -2240,6 +2380,17 @@ if __name__ == "__main__":
     elif sys.argv[1:2] == ["daily"]: daily_main()
     elif sys.argv[1:2] == ["report"]: report_main()
     elif sys.argv[1:2] == ["sms-setup"]: sms_setup(os.environ.get("GSVOICE_CONF", "/etc/gsvoice/gsvoice.json"))
+    elif sys.argv[1:2] == ["sinch-check"]:     # sinch-check [area code] — key works? trunk found? numbers for sale? (buys nothing)
+        if not sinch_on(): print("Sinch API is not set up (run the installer and fill in the Sinch questions)"); sys.exit(1)
+        try: print("Sinch key OK — trunk id:", sinch_trunk_id())
+        except ApiError as e: print("Problem:", e.msg); sys.exit(1)
+        ac = sys.argv[2] if len(sys.argv) > 2 else "214"
+        try: r = sinch_num("/availableNumbers?" + urllib.parse.urlencode({"regionCode": "US", "type": "LOCAL", "capabilities": "VOICE", "size": "5",
+                                                                            "numberPattern.pattern": ac, "numberPattern.searchPattern": "START"}))
+        except ApiError as e: print("Number search problem:", e.msg); sys.exit(1)
+        ns = [n.get("phoneNumber") for n in r.get("availableNumbers") or []]
+        print(f"Numbers for sale in {ac}:", ", ".join(ns) or "none right now")
+        print("Prices:", "; ".join(f"{n.get('phoneNumber')} setup {((n.get('setupPrice') or {}).get('amount'))} monthly {((n.get('monthlyPrice') or {}).get('amount'))}" for n in (r.get("availableNumbers") or [])[:2]))
     elif sys.argv[1:2] == ["pushtest"]:        # pushtest [line] — check the Apple push key; with a line: send it a test alert
         if not apns_ready(): print("Apple push is not set up yet (run apns-setup.sh)"); sys.exit(1)
         apns_jwt(); print("Apple push key OK")

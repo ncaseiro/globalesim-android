@@ -48,6 +48,14 @@ API_DOMAIN=$(jget sip_domain); TX_KEY=$(jget telnyx_api_key); TX_CONN=$(jget tel
 read -rp "Domain for the customer API and app [${API_DOMAIN:-voice.globalesim.tel}]: " x; API_DOMAIN=${x:-${API_DOMAIN:-voice.globalesim.tel}}
 read -rsp "Telnyx API key (hidden, Enter = keep current / skip): " x; echo; TX_KEY=${x:-$TX_KEY}
 read -rp "Telnyx SIP connection ID [${TX_CONN:-}]: " x; TX_CONN=${x:-$TX_CONN}
+SN_PROJ=$(jget sinch_project_id); SN_KID=$(jget sinch_key_id); SN_SEC=$(jget sinch_key_secret)
+if [ -n "$SINCH_HOST" ]; then
+  echo "Sinch API access (lets customers pick Sinch numbers too). Sinch dashboard -> Settings -> Access Keys. Type - to remove."
+  read -rp "Sinch Project ID [${SN_PROJ:-none}]: " x; SN_PROJ=${x:-$SN_PROJ}; [ "$SN_PROJ" = "-" ] && SN_PROJ=""
+  read -rp "Sinch Access Key ID [${SN_KID:-none}]: " x; SN_KID=${x:-$SN_KID}; [ "$SN_KID" = "-" ] && SN_KID=""
+  read -rsp "Sinch Key Secret (hidden, Enter = keep current): " x; echo; SN_SEC=${x:-$SN_SEC}; [ -z "$SN_KID" ] && SN_SEC=""
+  SN_PROJ=$(echo "$SN_PROJ" | tr -cd 'A-Za-z0-9-'); SN_KID=$(echo "$SN_KID" | tr -cd 'A-Za-z0-9-'); SN_SEC=$(echo "$SN_SEC" | tr -d '[:space:]')
+else SN_PROJ=""; SN_KID=""; SN_SEC=""; fi
 API_TOKEN=${API_TOKEN:-$(openssl rand -hex 24)}
 NEW_PASS=0; [ -z "$TEST_PASS" ] && NEW_PASS=1
 TEST_PASS=${TEST_PASS:-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20)}
@@ -434,8 +442,12 @@ exten => _.,1,AGI(gs-agi.py,xfer,\${BLINDTRANSFER},\${EXTEN})
  same => n,Hangup()
  same => n(ok),GotoIf(\$["\${GS_XEXT}" = "1"]?ext)
  same => n,Set(CALLERID(num)=\${GS_CID})
+ same => n,GotoIf(\$["\${GS_VIA}" = "sinch"]?viasinch)
  same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
  same => n,ExecIf(\$[\${SINCH_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/+\${GS_NUM}@sinch,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
+ same => n,Hangup()
+ same => n(viasinch),Dial(PJSIP/+\${GS_NUM}@sinch,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
+ same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
  same => n,Hangup()
  same => n(ext),Gosub(gs-pushwait,s,1(GS_DIALS))
  same => n,Dial(\${GS_DIALS},25,b(gs-qospre^s^1(\${GS_CALLID}^\${GS_DEPTNAME}))U(gs-ans^\${GS_CALLID}^\${GS_DEPT}))
@@ -460,8 +472,12 @@ exten => s,1,AGI(gs-agi.py,fwd,\${GS_FWDUSER},\${CALLERID(num)})
  same => n,Goto(gs-vm,s,1)
  same => n(ok),GotoIf(\$["\${GS_FWDEXT}" = "1"]?ext)
  same => n,Set(CALLERID(num)=\${GS_CID})
+ same => n,GotoIf(\$["\${GS_VIA}" = "sinch"]?viasinch)
  same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
  same => n,ExecIf(\$[\${SINCH_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/+\${GS_NUM}@sinch,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
+ same => n,Goto(gs-vm,s,1)
+ same => n(viasinch),Dial(PJSIP/+\${GS_NUM}@sinch,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
+ same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
  same => n,Goto(gs-vm,s,1)
  same => n(ext),Gosub(gs-pushwait,s,1(GS_DIALS))
  same => n,Dial(\${GS_DIALS},25)
@@ -538,7 +554,11 @@ exten => 911,1,AGI(gs-agi.py,e911,\${CHANNEL(endpoint)})
  same => n,Playback(ss-noservice)
  same => n,Hangup()
  same => n(go),Set(CALLERID(all)=<\${GS_CID}>)
+ same => n,GotoIf(\$["\${GS_VIA}" = "sinch"]?viasinch)
  same => n,Dial(PJSIP/911@carrier,120)
+ same => n,Hangup()
+ same => n(viasinch),Dial(PJSIP/911@sinch,120)
+ same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/911@carrier,120))
  same => n,Hangup()
 ; Kari's Law: 911 works with or without a leading 9
 exten => 9911,1,Goto(from-customer,911,1)
@@ -548,7 +568,10 @@ exten => 933,1,AGI(gs-agi.py,e933,\${CHANNEL(endpoint)})
  same => n,Playback(ss-noservice)
  same => n,Hangup()
  same => n(go),Set(CALLERID(all)=<\${GS_CID}>)
+ same => n,GotoIf(\$["\${GS_VIA}" = "sinch"]?viasinch)
  same => n,Dial(PJSIP/933@carrier,60)
+ same => n,Hangup()
+ same => n(viasinch),Dial(PJSIP/933@sinch,60)
  same => n,Hangup()
 exten => _NXXNXXXXXX,1,Goto(from-customer,1\${EXTEN},1)
 exten => _+1NXXNXXXXXX,1,Goto(from-customer,\${EXTEN:1},1)
@@ -567,8 +590,12 @@ exten => _1NXXNXXXXXX,1,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n(go),Set(CALLERID(all)=<\${GS_CID}>)
  same => n,Set(CHANNEL(hangup_handler_push)=gs-charge,s,1(\${GS_CALLID}))
  same => n,Set(CHANNEL(hangup_handler_push)=gs-qos,s,1(\${GS_CALLID}))
+ same => n,GotoIf(\$["\${GS_VIA}" = "sinch"]?viasinch)
  same => n,Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC}))
  same => n,ExecIf(\$[\${SINCH_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/+\${EXTEN}@sinch,60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC})))
+ same => n,Hangup()
+ same => n(viasinch),Dial(PJSIP/+\${EXTEN}@sinch,60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC}))
+ same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC})))
  same => n,Hangup()
  same => n(blocked),Playback(ss-noservice)
  same => n,Hangup()
@@ -779,13 +806,14 @@ read = system,call
 write = message,call
 EOF
 chown asterisk:asterisk /etc/asterisk/manager.conf; chmod 640 /etc/asterisk/manager.conf
-python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" "$AMI_SECRET" "${SINCH_MAP:-}" <<'EOF'
-import json, sys
-p, dom, key, conn, tok, did, test, ami, smap = sys.argv[1:10]
+SN_SEC="$SN_SEC" python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" "$AMI_SECRET" "${SINCH_MAP:-}" "${SINCH_HOST:-}" "${SN_PROJ:-}" "${SN_KID:-}" <<'EOF'
+import json, os, sys
+p, dom, key, conn, tok, did, test, ami, smap, shost, sproj, skid = sys.argv[1:13]
 try: c = json.load(open(p))
 except Exception: c = {}
 c.update({"sip_domain": dom, "telnyx_api_key": key, "telnyx_connection_id": conn, "api_token": tok, "company_did": did, "test_user": test, "ami_secret": ami,
-          "did_alias": dict(x.split("=", 1) for x in smap.split(",") if x.count("=") == 1 and all(x.split("=")))})
+          "did_alias": dict(x.split("=", 1) for x in smap.split(",") if x.count("=") == 1 and all(x.split("="))),
+          "sinch_host": shost, "sinch_project_id": sproj, "sinch_key_id": skid, "sinch_key_secret": os.environ.get("SN_SEC", "")})
 c.setdefault("notify_url", "https://globalesim.tel/app.php?api=voice_hook")   # voicemail emails go out from the website
 json.dump(c, open(p, "w"), indent=2)
 EOF
