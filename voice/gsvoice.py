@@ -824,6 +824,8 @@ def telnyx_adopt_new(say=print):
     for n in telnyx_all("/phone_numbers"):
         d = digits(n.get("phone_number")); bought = str(n.get("purchased_at") or n.get("created_at") or "")[:19].replace("T", " ")
         if len(d) != 11 or d in skip or not bought or bought < since or not n.get("id"): continue
+        # numbers being ported in (or just ported) belong to a customer already — never put those in the pool
+        if str(n.get("status") or "active") != "active" or "port" in str(n.get("source_type") or n.get("number_type_source") or "").lower(): continue
         with _lock, db() as con:
             if con.execute("SELECT 1 FROM customers WHERE did=? UNION SELECT 1 FROM stock WHERE number=? UNION SELECT 1 FROM departments WHERE did=?", (d, d, d)).fetchone(): continue
             pid = str(n["id"])
