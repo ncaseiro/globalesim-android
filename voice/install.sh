@@ -406,11 +406,26 @@ exten => *8,1,AGI(gs-agi.py,park,\${BLINDTRANSFER})
  same => n,Playback(pbx-invalid)
  same => n,Hangup()
  same => n(ok),Set(PARKINGEXTEN=\${GS_SLOT})
+ same => n,ExecIf(\$["\${GS_DESKEP}" != ""]?Gosub(gs-parkmsg,s,1(\${GS_DESKEP},\${GS_SLOT})))
  same => n,Park(\${GS_LOT},s)
+ same => n,Hangup()
+; Conference: transfer a caller to *9 -> the user's own 3-way room (the user then dials *9 to join)
+exten => *9,1,AGI(gs-agi.py,conf,ch,\${BLINDTRANSFER})
+ same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok)
+ same => n,Playback(pbx-invalid)
+ same => n,Hangup()
+ same => n(ok),Set(CONFBRIDGE(user,template)=gs_guest)
+ same => n,Set(CONFBRIDGE(user,music_on_hold_class)=\${GS_MOH})
+ same => n,ConfBridge(\${GS_ROOM},gs_bridge)
  same => n,Hangup()
 exten => _+X.,1,Goto(gs-transfer,\${EXTEN:1},1)
 exten => _X.,1,Goto(gs-xfer-go,\${EXTEN},1)
 exten => _D.,1,Goto(gs-xfer-go,\${EXTEN},1)
+[gs-parkmsg]
+; desk phones: show the parking slot on the screen (text message)
+exten => s,1,Set(MESSAGE(body)=Call parked on \${ARG2}. Pick up with *\${ARG2})
+ same => n,MessageSend(pjsip:\${ARG1},"Parked" <sip:park@$API_DOMAIN>)
+ same => n,Return()
 [gs-xfer-go]
 exten => h,1,NoOp(transfer leg ended)
 exten => _.,1,AGI(gs-agi.py,xfer,\${BLINDTRANSFER},\${EXTEN})
@@ -462,6 +477,26 @@ exten => _.,1,Hangup()
 [from-customer]
 ; Park (some phones look up the transfer target here instead of in gs-transfer)
 exten => *8,1,Goto(gs-transfer,*8,1)
+; Desk phone Retrieve key: *80 = the only parked call, or say the slot
+exten => *80,1,AGI(gs-agi.py,unpark,\${CHANNEL(endpoint)},0)
+ same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok)
+ same => n,GotoIf(\$["\${GS_COUNT}" = "0"]?none)
+ same => n,Read(GS_IN,vm-enter-num-to-call,2,,1,8)
+ same => n,Goto(from-customer,*8\${GS_IN},1)
+ same => n(none),Playback(pbx-invalidpark)
+ same => n,Hangup()
+ same => n(ok),Set(__TRANSFER_CONTEXT=gs-transfer)
+ same => n,ParkedCall(\${GS_LOT},\${GS_SLOT})
+ same => n,Hangup()
+; Join your own conference room (after transferring the callers to *9)
+exten => *9,1,AGI(gs-agi.py,conf,ep,\${CHANNEL(endpoint)})
+ same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok)
+ same => n,Playback(pbx-invalid)
+ same => n,Hangup()
+ same => n(ok),Set(__TRANSFER_CONTEXT=gs-transfer)
+ same => n,Set(CONFBRIDGE(user,template)=gs_host)
+ same => n,ConfBridge(\${GS_ROOM},gs_bridge)
+ same => n,Hangup()
 ; Pick up a parked call: *8 + slot (e.g. *848), any phone of the same company
 exten => _*8XX,1,AGI(gs-agi.py,unpark,\${CHANNEL(endpoint)},\${EXTEN:1})
  same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok)
@@ -700,6 +735,25 @@ cat > /etc/asterisk/res_parking.conf <<EOF
 EOF
 [ -f /var/lib/gsvoice/parking.conf ] || echo "; company parking lots — written by gsvoice" > /var/lib/gsvoice/parking.conf
 chown asterisk:asterisk /etc/asterisk/res_parking.conf /var/lib/gsvoice/parking.conf
+
+# Conference (merge calls): callers wait in the user's room, the user joins; when the user hangs up the conference ends
+cat > /etc/asterisk/confbridge.conf <<EOF
+[gs_bridge]
+type=bridge
+max_members=10
+[gs_guest]
+type=user
+quiet=yes
+music_on_hold_when_empty=yes
+end_marked=yes
+dsp_drop_silence=yes
+[gs_host]
+type=user
+marked=yes
+quiet=yes
+dsp_drop_silence=yes
+EOF
+chown asterisk:asterisk /etc/asterisk/confbridge.conf
 
 # Asterisk's built-in web server, local only — Caddy passes browser calls (wss://…/ws) to it
 cat > /etc/asterisk/http.conf <<EOF
