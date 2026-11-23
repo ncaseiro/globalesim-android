@@ -1768,11 +1768,19 @@ def api_route(method, path, q, body):
             mine = [n for n in mine if not con.execute("SELECT 1 FROM customers WHERE did=?", (n,)).fetchone()]
             try: r = telnyx_available(params)
             except ApiError:
-                if not mine: raise
+                if not mine and not sinch_on(): raise
                 r = {}
             out = [{"phone_number": "+" + n, "region": "In stock", "monthly": None, "stock": True} for n in mine[:5]]
-            return {"numbers": out + [{"phone_number": n.get("phone_number"), "region": ", ".join(x.get("region_name", "") for x in n.get("region_information", []) if x.get("region_type") in ("rate_center", "state")),
-                                 "monthly": (n.get("cost_information") or {}).get("monthly_cost")} for n in r.get("data", []) if digits(n.get("phone_number")) not in mine]}
+            out += [{"phone_number": n.get("phone_number"), "region": ", ".join(x.get("region_name", "") for x in n.get("region_information", []) if x.get("region_type") in ("rate_center", "state")),
+                     "monthly": (n.get("cost_information") or {}).get("monthly_cost")} for n in r.get("data", []) if digits(n.get("phone_number")) not in mine]
+            lim = int(digits(q.get("limit", "10")) or 10)
+            if sinch_on() and len(out) < lim and not has and not q.get("ends_with"):       # Sinch fills the list when Telnyx has few or none
+                have = {digits(x["phone_number"]) for x in out}
+                extra = [d for d in sinch_search(ac, lim) if d not in have][:lim - len(out)]
+                _SINCH_SEEN.update({d: time.time() for d in extra})
+                out += [{"phone_number": "+" + d, "region": "", "monthly": None} for d in extra]
+            if not out and r == {} : raise ApiError(502, "number search is not available right now")
+            return {"numbers": out}
         # ---- Telnyx tools for the admin panel ----
         if p == ["telnyx", "overview"] and method == "GET":
             R = C["rates"]; out = {"rates": R, "errors": []}
