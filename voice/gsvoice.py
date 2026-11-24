@@ -21,6 +21,7 @@ DEFAULTS = {
     "telnyx_api_key": "", "telnyx_connection_id": "", "telnyx_api_base": "https://api.telnyx.com/v2",
     # second carrier (Sinch Elastic SIP Trunk): numbers can also be bought there; sinch_host = the trunk address
     "sinch_project_id": "", "sinch_key_id": "", "sinch_key_secret": "", "sinch_host": "", "sinch_trunk_id": "",
+    "sinch_sell": False,       # offer/buy Sinch numbers for customers (off: Sinch trunk is trial-only — keep it as backup only)
     "plans": {"num300": {"name": "GlobaleSIM Number 300", "minutes": 300}, "num1000": {"name": "GlobaleSIM Number 1000", "minutes": 1000},
               "biz_ext": {"name": "GlobaleSIM Business extension", "minutes": 1000}},
     # business lines: busier than personal lines, still capped (per extension)
@@ -974,7 +975,7 @@ def telnyx_search(area_code="", contains="", limit=10):
         except ApiError as e:
             if not sinch_on(): raise
             sys.stderr.write(f"telnyx search: {e.msg}\n")
-    if sinch_on() and not contains and len(out) < limit:          # Sinch numbers fill the rest of the list
+    if sinch_on() and C.get("sinch_sell") and not contains and len(out) < limit:          # Sinch numbers fill the rest of the list
         have = {digits(x) for x in out}
         extra = [d for d in sinch_search(area_code, limit) if d not in have][:limit - len(out)]
         _SINCH_SEEN.update({d: time.time() for d in extra}); out += ["+" + d for d in extra]
@@ -1002,14 +1003,14 @@ def telnyx_backup(phone_id, to):
 def telnyx_buy(num, area_code="", taken=()):
     """Buy num (11 digits) from Telnyx, or from Sinch when Telnyx doesn't have it (a number shown from Sinch's list,
     or nothing left in that area code at Telnyx). Returns (num, phone_id)."""
-    if num and sinch_on() and time.time() - _SINCH_SEEN.get(num, 0) < 3600 and num not in taken:
+    if num and sinch_on() and C.get("sinch_sell") and time.time() - _SINCH_SEEN.get(num, 0) < 3600 and num not in taken:
         try: return sinch_rent(num)
         except ApiError as e: sys.stderr.write(f"sinch rent {num}: {e.msg}\n")
     try:
         if not C["telnyx_api_key"]: raise ApiError(409, "no telnyx")
         return _telnyx_buy(num, area_code, taken)
     except ApiError:
-        if not sinch_on(): raise
+        if not (sinch_on() and C.get("sinch_sell")): raise
     if num and num not in taken:
         try: return sinch_rent(num)
         except ApiError as e: sys.stderr.write(f"sinch rent {num}: {e.msg}\n")
@@ -1041,8 +1042,9 @@ def get_number(con, want, area, taken):
     """A number for a new line: the picked one or one from the same area code — from our pool first (ready now, already paid).
     Pool numbers still resting after a previous owner are only used when picked by number."""
     ac = digits(area)[:3] or (want[1:4] if want else "")
-    ready = "SELECT * FROM stock WHERE number LIKE ? AND COALESCE(available_at,'')<=? ORDER BY bought_at LIMIT 1"
+    ready = "SELECT * FROM stock WHERE number LIKE ? AND COALESCE(available_at,'')<=?" + ("" if C.get("sinch_sell") else " AND COALESCE(phone_id,'') NOT LIKE 'sinch:%'") + " ORDER BY bought_at LIMIT 1"
     st = con.execute("SELECT * FROM stock WHERE number=?", (want,)).fetchone() if want else None
+    if st and is_sinch(st["phone_id"]) and not C.get("sinch_sell"): raise ApiError(409, "that number is not available — pick another")
     if not st and not want and ac:
         st = con.execute(ready, ("1" + ac + "%", iso(now()))).fetchone()
     if not st:
@@ -1927,7 +1929,8 @@ def api_route(method, path, q, body):
             if q.get("ends_with"): params["filter[phone_number][ends_with]"] = digits(q["ends_with"])
             # our own stock first: ready at once and already paid for
             ac, has = digits(q.get("area_code"))[:3], digits(q.get("contains"))
-            mine = [r["number"] for r in con.execute("SELECT number FROM stock WHERE COALESCE(available_at,'')<=? ORDER BY number", (iso(now()),)) if (not ac or r["number"][1:4] == ac) and (not has or has in r["number"][1:])]
+            mine = [r["number"] for r in con.execute("SELECT number, phone_id FROM stock WHERE COALESCE(available_at,'')<=? ORDER BY number", (iso(now()),))
+                    if (C.get("sinch_sell") or not is_sinch(r["phone_id"])) and (not ac or r["number"][1:4] == ac) and (not has or has in r["number"][1:])]
             mine = [n for n in mine if not con.execute("SELECT 1 FROM customers WHERE did=?", (n,)).fetchone()]
             try: r = telnyx_available(params)
             except ApiError:
@@ -1937,7 +1940,7 @@ def api_route(method, path, q, body):
             out += [{"phone_number": n.get("phone_number"), "region": ", ".join(x.get("region_name", "") for x in n.get("region_information", []) if x.get("region_type") in ("rate_center", "state")),
                      "monthly": (n.get("cost_information") or {}).get("monthly_cost")} for n in r.get("data", []) if digits(n.get("phone_number")) not in mine]
             lim = int(digits(q.get("limit", "10")) or 10)
-            if sinch_on() and len(out) < lim and not has and not q.get("ends_with"):       # Sinch fills the list when Telnyx has few or none
+            if sinch_on() and C.get("sinch_sell") and len(out) < lim and not has and not q.get("ends_with"):       # Sinch fills the list when Telnyx has few or none
                 have = {digits(x["phone_number"]) for x in out}
                 extra = [d for d in sinch_search(ac, lim) if d not in have][:lim - len(out)]
                 _SINCH_SEEN.update({d: time.time() for d in extra})
