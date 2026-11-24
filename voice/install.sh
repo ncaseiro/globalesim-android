@@ -92,6 +92,21 @@ if [ -n "$SINCH_HOST" ]; then
   read -rp "Sinch number(s) that should ring like one of your numbers, e.g. 12085813207=18307798230 (comma-separated, Enter = keep [${SINCH_MAP:-none}]): " x; SINCH_MAP=${x:-${SINCH_MAP:-}}; [ "$SINCH_MAP" = "-" ] && SINCH_MAP=""
   SINCH_MAP=$(echo "$SINCH_MAP" | tr -cd '0-9=,')
 else SINCH_MAP=""; fi
+echo "Backup carrier VoIP.ms (sub account from voip.ms -> Sub Accounts) — takes over outgoing calls when Telnyx can't, and rings its own number. Type - to remove it."
+case "${BK_USER:-}" in *[[:space:]/:\'\"]*) BK_USER="";; esac
+read -rp "VoIP.ms sub account username, e.g. 585855_gsfo (Enter = keep [${BK_USER:-none}]): " x
+case "$x" in *[[:space:]/:\'\"]*) echo "That doesn't look like a VoIP.ms username (it has spaces or / : quotes) — run the installer again and type only the username."; exit 1;; esac
+BK_USER=${x:-${BK_USER:-}}; [ "$BK_USER" = "-" ] && BK_USER=""
+if [ -n "$BK_USER" ]; then
+  read -rsp "VoIP.ms sub account password (hidden, Enter = keep current): " x; echo; BK_PASS=${x:-${BK_PASS:-}}
+  case "$BK_PASS" in *[[:space:]\'\"]*) echo "The password has spaces or quotes — set a letters-and-numbers password in VoIP.ms and run the installer again."; exit 1;; esac
+  [ -n "$BK_PASS" ] || { echo "A password is required"; exit 1; }
+  read -rp "VoIP.ms server [${BK_SERVER:-sanjose1.voip.ms}]: " x; BK_SERVER=${x:-${BK_SERVER:-sanjose1.voip.ms}}; BK_SERVER=$(echo "$BK_SERVER" | tr -cd 'A-Za-z0-9.-')
+  read -rp "Your VoIP.ms backup number, digits only, e.g. 19453778722 [${BK_DID:-none}]: " x; BK_DID=$(echo "${x:-${BK_DID:-}}" | tr -cd '0-9'); [ ${#BK_DID} = 10 ] && BK_DID=1$BK_DID
+  if [ -n "$BK_DID" ]; then
+    read -rp "When someone calls $BK_DID, ring it like which of your numbers? [${BK_RING:-${DID:-}}]: " x; BK_RING=$(echo "${x:-${BK_RING:-${DID:-}}}" | tr -cd '0-9'); [ ${#BK_RING} = 10 ] && BK_RING=1$BK_RING
+  else BK_RING=""; fi
+else BK_PASS=""; BK_SERVER=""; BK_DID=""; BK_RING=""; fi
 
 # Customer service (accounts, minutes, number buying) — settings live in /etc/gsvoice/gsvoice.json
 GSJ=/etc/gsvoice/gsvoice.json; mkdir -p /etc/gsvoice
@@ -126,6 +141,11 @@ DID='$DID'
 E911='$E911'
 SINCH_HOST='$SINCH_HOST'
 SINCH_MAP='$SINCH_MAP'
+BK_USER='$BK_USER'
+BK_PASS='$BK_PASS'
+BK_SERVER='$BK_SERVER'
+BK_DID='$BK_DID'
+BK_RING='$BK_RING'
 TEST_PASS='$TEST_PASS'
 TEST_USER='$TEST_USER'
 EOF
@@ -329,6 +349,56 @@ endpoint=sinch
 EOF
 for n in 131 133 134 136 137 138 139 141; do echo "match=206.146.$n.0/28"; done
 fi
+if [ -n "$BK_USER" ]; then cat <<EOF
+
+; ---- Backup carrier: VoIP.ms (signs in like Telnyx; the sub account only accepts calls from this server's IP) ----
+[voipms-auth]
+type=auth
+auth_type=userpass
+username=$BK_USER
+password=$BK_PASS
+
+[voipms-reg]
+type=registration
+transport=transport-udp
+outbound_auth=voipms-auth
+server_uri=sip:$BK_SERVER
+client_uri=sip:$BK_USER@$BK_SERVER
+contact_user=$BK_USER
+retry_interval=60
+forbidden_retry_interval=600
+expiration=300
+line=yes
+endpoint=voipms
+
+[voipms]
+type=endpoint
+transport=transport-udp
+context=from-carrier
+allow_transfer=no
+disallow=all
+allow=ulaw
+outbound_auth=voipms-auth
+aors=voipms
+from_user=$BK_USER
+from_domain=$BK_SERVER
+send_pai=yes
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+dtmf_mode=rfc4733
+
+[voipms]
+type=aor
+contact=sip:$BK_SERVER
+
+[voipms-identify]
+type=identify
+endpoint=voipms
+match=208.100.60.0/24
+EOF
+fi
 echo
 echo "#include pjsip_customers.conf"
 } > pjsip.conf
@@ -346,6 +416,9 @@ DID=$DID
 DIALPFX=$( [ "$PROVIDER" = telnyx ] && echo "+" )
 E911_ON=$E911_ON
 SINCH_ON=$( [ -n "$SINCH_HOST" ] && echo 1 || echo 0 )
+BK_ON=$( [ -n "$BK_USER$SINCH_HOST" ] && echo 1 || echo 0 )
+BK_EP=$( [ -n "$BK_USER" ] && echo voipms || echo sinch )
+BK_PFX=$( [ -n "$BK_USER" ] || echo "+" )
 
 ; Calls coming in from the carrier to your number -> ring the test phone
 [from-carrier]
@@ -501,7 +574,7 @@ exten => _.,1,AGI(gs-agi.py,xfer,\${BLINDTRANSFER},\${EXTEN})
  same => n,Set(CALLERID(num)=\${GS_CID})
  same => n,GotoIf(\$["\${GS_VIA}" = "sinch"]?viasinch)
  same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
- same => n,ExecIf(\$[\${SINCH_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/+\${GS_NUM}@sinch,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
+ same => n,ExecIf(\$[\${BK_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/\${BK_PFX}\${GS_NUM}@\${BK_EP},60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
  same => n,Hangup()
  same => n(viasinch),Dial(PJSIP/+\${GS_NUM}@sinch,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
  same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
@@ -531,7 +604,7 @@ exten => s,1,AGI(gs-agi.py,fwd,\${GS_FWDUSER},\${CALLERID(num)})
  same => n,Set(CALLERID(num)=\${GS_CID})
  same => n,GotoIf(\$["\${GS_VIA}" = "sinch"]?viasinch)
  same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
- same => n,ExecIf(\$[\${SINCH_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/+\${GS_NUM}@sinch,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
+ same => n,ExecIf(\$[\${BK_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/\${BK_PFX}\${GS_NUM}@\${BK_EP},30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
  same => n,Goto(gs-vm,s,1)
  same => n(viasinch),Dial(PJSIP/+\${GS_NUM}@sinch,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
  same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
@@ -649,7 +722,7 @@ exten => _1NXXNXXXXXX,1,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n,Set(CHANNEL(hangup_handler_push)=gs-qos,s,1(\${GS_CALLID}))
  same => n,GotoIf(\$["\${GS_VIA}" = "sinch"]?viasinch)
  same => n,Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC}))
- same => n,ExecIf(\$[\${SINCH_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/+\${EXTEN}@sinch,60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC})))
+ same => n,ExecIf(\$[\${BK_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/\${BK_PFX}\${EXTEN}@\${BK_EP},60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC})))
  same => n,Hangup()
  same => n(viasinch),Dial(PJSIP/+\${EXTEN}@sinch,60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC}))
  same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC})))
@@ -683,7 +756,7 @@ exten => _1NXXNXXXXXX,1,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n,Set(CALLERID(num)=\${DID})
  same => n,Set(TIMEOUT(absolute)=7200)
  same => n,Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60)
- same => n,ExecIf(\$[\${SINCH_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/+\${EXTEN}@sinch,60))
+ same => n,ExecIf(\$[\${BK_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/\${BK_PFX}\${EXTEN}@\${BK_EP},60))
  same => n,Hangup()
  same => n(blocked),Playback(ss-noservice)
  same => n,Hangup()
@@ -863,7 +936,7 @@ read = system,call
 write = message,call
 EOF
 chown asterisk:asterisk /etc/asterisk/manager.conf; chmod 640 /etc/asterisk/manager.conf
-SN_SEC="$SN_SEC" GTTS_KEY="$GTTS_KEY" python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" "$AMI_SECRET" "${SINCH_MAP:-}" "${SINCH_HOST:-}" "${SN_PROJ:-}" "${SN_KID:-}" <<'EOF'
+SN_SEC="$SN_SEC" GTTS_KEY="$GTTS_KEY" BK_EP="$( [ -n "$BK_USER" ] && echo voipms )" BK_DID="${BK_DID:-}" BK_RING="${BK_RING:-}" python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" "$AMI_SECRET" "${SINCH_MAP:-}" "${SINCH_HOST:-}" "${SN_PROJ:-}" "${SN_KID:-}" <<'EOF'
 import json, os, sys
 p, dom, key, conn, tok, did, test, ami, smap, shost, sproj, skid = sys.argv[1:13]
 try: c = json.load(open(p))
@@ -872,6 +945,9 @@ c.update({"sip_domain": dom, "telnyx_api_key": key, "telnyx_connection_id": conn
           "did_alias": dict(x.split("=", 1) for x in smap.split(",") if x.count("=") == 1 and all(x.split("="))),
           "sinch_host": shost, "sinch_project_id": sproj, "sinch_key_id": skid, "sinch_key_secret": os.environ.get("SN_SEC", ""),
           "google_tts_key": os.environ.get("GTTS_KEY", "")})
+bd, br = os.environ.get("BK_DID", ""), os.environ.get("BK_RING", "")
+if bd and br and bd != br: c["did_alias"][bd] = br          # the VoIP.ms backup number rings like one of our numbers
+c["backup_ep"] = os.environ.get("BK_EP", ""); c["backup_did"] = bd
 c.setdefault("notify_url", "https://globalesim.tel/app.php?api=voice_hook")   # voicemail emails go out from the website
 json.dump(c, open(p, "w"), indent=2)
 EOF
@@ -962,6 +1038,16 @@ if [ -n "$DL_USER" ]; then
         exit 1
       fi
     fi
+  fi
+fi
+if [ -n "$BK_USER" ]; then
+  for i in 1 2 3 4 5 6; do asterisk -rx "pjsip show registrations" | grep voipms-reg | grep -q " Registered" && break; sleep 5; done
+  asterisk -rx "pjsip show registrations" | grep voipms-reg || true
+  if asterisk -rx "pjsip show registrations" | grep voipms-reg | grep -q " Registered"; then
+    printf '\033[1;32mBackup carrier VoIP.ms: signed in.\033[0m\n'
+  else
+    printf '\n\033[1;33m!! Not signed in to VoIP.ms yet (Telnyx calls are not affected).\033[0m\n'
+    echo "   Check the VoIP.ms sub account username/password, then run the installer again."
   fi
 fi
 
