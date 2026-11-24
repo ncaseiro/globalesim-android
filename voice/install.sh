@@ -25,7 +25,10 @@ if [ "$x" != "${PROVIDER:-}" ]; then DL_SERVER=""; DL_USER=""; DL_PASS=""; fi   
 PROVIDER=$x
 DEF_SERVER=$([ "$PROVIDER" = telnyx ] && echo sip.telnyx.com || echo sip.nyc.didlogic.net)
 read -rp "SIP server [${DL_SERVER:-$DEF_SERVER}]: " x; DL_SERVER=${x:-${DL_SERVER:-$DEF_SERVER}}
-read -rp "SIP username [${DL_USER:-}]: " x; DL_USER=${x:-${DL_USER:-}}
+case "${DL_USER:-}" in *[[:space:]/:\'\"]*) DL_USER="";; esac      # a pasted command is never a SIP username
+read -rp "SIP username [${DL_USER:-}]: " x
+case "$x" in *[[:space:]/:\'\"]*) echo "That doesn't look like a SIP username (it has spaces or / : quotes) — run the installer again and type only the username."; exit 1;; esac
+DL_USER=${x:-${DL_USER:-}}
 if [ -n "$DL_USER" ]; then
   read -rsp "SIP password (hidden, Enter = keep current): " x; echo; DL_PASS=${x:-${DL_PASS:-}}
   [ -n "$DL_PASS" ] || { echo "A password is required"; exit 1; }
