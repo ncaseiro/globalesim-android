@@ -9,6 +9,55 @@ CONF=/etc/globalesim-voice.conf
 PROVIDER=""; DL_SERVER=""; DL_USER=""; DL_PASS=""; DID=""; E911=""; TEST_PASS=""; TEST_USER=""
 [ -f "$CONF" ] && . "$CONF"
 
+# ---- Backups: gs-backup (every 30 min + before every install) and gs-restore (roll back) ----
+mkdir -p /var/backups/gsvoice; chmod 700 /var/backups/gsvoice
+cat > /usr/local/sbin/gs-backup <<'GSB'
+#!/usr/bin/env bash
+# gs-backup [label] — snapshot of the voice server settings + database. Keeps 48 recent (24 h) + 14 daily.
+set -eu
+B=/var/backups/gsvoice; L=${1:-auto}; T=$(date +%Y%m%d-%H%M%S); D="$B/$T-$L"; mkdir -p "$D"; chmod 700 "$D"
+tar czf "$D/settings.tgz" --ignore-failed-read -C / etc/globalesim-voice.conf etc/gsvoice etc/asterisk opt/gsvoice usr/share/asterisk/agi-bin/gs-agi.py \
+    etc/cron.d/gsvoice-adopt etc/cron.d/gsvoice-watch etc/cron.d/gsvoice-daily 2>/dev/null || true
+if [ -f /var/lib/gsvoice/gsvoice.db ]; then
+  python3 -c "import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close()" /var/lib/gsvoice/gsvoice.db "$D/gsvoice.db" && gzip -f "$D/gsvoice.db"
+fi
+tar czf "$D/files.tgz" --ignore-failed-read -C / --exclude=var/lib/gsvoice/gsvoice.db* --exclude=var/lib/gsvoice/moh var/lib/gsvoice 2>/dev/null || true
+grep -h "carrier-reg" <(asterisk -rx "pjsip show registrations" 2>/dev/null) > "$D/registration.txt" 2>/dev/null || true
+# retention: newest 48 'auto', 14 'daily', 20 of anything else (before-install, manual)
+for k in auto:48 daily:14; do ls -1d "$B"/*-"${k%%:*}" 2>/dev/null | sort | head -n -"${k##*:}" | xargs -r rm -rf; done
+ls -1d "$B"/* 2>/dev/null | grep -vE -- "-(auto|daily)$" | sort | head -n -20 | xargs -r rm -rf
+echo "$D"
+GSB
+cat > /usr/local/sbin/gs-restore <<'GSB'
+#!/usr/bin/env bash
+# gs-restore — roll the voice server back to an earlier backup.
+#   gs-restore            list backups and choose one (settings only — keeps today's customers, calls, voicemail)
+#   gs-restore --with-db  also put the database back to that moment (loses anything that happened since)
+set -eu
+B=/var/backups/gsvoice; WITHDB=0; [ "${1:-}" = "--with-db" ] && WITHDB=1
+mapfile -t L < <(ls -1d "$B"/* 2>/dev/null | sort -r | head -40)
+[ ${#L[@]} -gt 0 ] || { echo "No backups yet."; exit 1; }
+echo "Backups (newest first) — Telnyx sign-in at that moment shown on the right:"
+for i in "${!L[@]}"; do n=$(basename "${L[$i]}"); r=$(grep -o "Registered\|Unregistered\|Rejected" "${L[$i]}/registration.txt" 2>/dev/null | head -1 || true)
+  printf "  %2d) %s-%s-%s %s:%s  %-14s %s\n" $((i+1)) "${n:0:4}" "${n:4:2}" "${n:6:2}" "${n:9:2}" "${n:11:2}" "${n#*-*-}" "${r:-?}"; done
+read -rp "Number to restore (Enter = cancel): " k; [ -n "$k" ] || exit 0
+D=${L[$((k-1))]}; [ -d "$D" ] || { echo "No such backup"; exit 1; }
+echo "Saving the current state first (label: before-restore)…"; /usr/local/sbin/gs-backup before-restore >/dev/null
+systemctl stop gsvoice-api || true
+tar xzf "$D/settings.tgz" -C /
+[ -f "$D/files.tgz" ] && tar xzf "$D/files.tgz" -C / || true
+if [ $WITHDB = 1 ] && [ -f "$D/gsvoice.db.gz" ]; then gunzip -c "$D/gsvoice.db.gz" > /var/lib/gsvoice/gsvoice.db; chown asterisk:asterisk /var/lib/gsvoice/gsvoice.db; fi
+chown -R asterisk:asterisk /etc/asterisk /var/lib/gsvoice 2>/dev/null || true
+systemctl restart asterisk; systemctl start gsvoice-api
+sleep 8; asterisk -rx "pjsip show registrations" | grep carrier-reg || echo "(no Telnyx sign-in configured in that backup)"
+echo "Restored $(basename "$D")."
+GSB
+chmod 700 /usr/local/sbin/gs-backup /usr/local/sbin/gs-restore
+echo "*/30 * * * * root /usr/local/sbin/gs-backup auto >/dev/null 2>&1
+17 3 * * * root /usr/local/sbin/gs-backup daily >/dev/null 2>&1" > /etc/cron.d/gsvoice-backup
+[ -f "$CONF" ] && PRE_BACKUP=$(/usr/local/sbin/gs-backup before-install) && echo "Saved the current setup: $PRE_BACKUP" || PRE_BACKUP=""
+PRE_REG=$(asterisk -rx "pjsip show registrations" 2>/dev/null | grep carrier-reg | grep -c " Registered" || true)
+
 say "1/6 Installing Asterisk, firewall and fail2ban (takes 2-4 minutes)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -896,7 +945,25 @@ if [ -n "$TX_KEY" ]; then
 fi
 sleep 6
 asterisk -rx "logger reload" >/dev/null || true
-if [ -n "$DL_USER" ]; then asterisk -rx "pjsip show registrations" | grep -E "carrier-reg" || true; fi
+if [ -n "$DL_USER" ]; then
+  for i in 1 2 3 4 5 6; do asterisk -rx "pjsip show registrations" | grep carrier-reg | grep -q " Registered" && break; sleep 5; done
+  asterisk -rx "pjsip show registrations" | grep -E "carrier-reg" || true
+  if ! asterisk -rx "pjsip show registrations" | grep carrier-reg | grep -q " Registered"; then
+    printf '\n\033[1;31m!! The server could NOT sign in to Telnyx — calls will fail.\033[0m\n'
+    echo "   Usually the SIP username or password was typed wrong."
+    if [ -n "$PRE_BACKUP" ] && [ "${PRE_REG:-0}" -ge 1 ]; then
+      read -rp "   Put back the setup from before this install (it was signed in)? [Y/n] " x
+      if [ "${x:-y}" != "n" ] && [ "${x:-y}" != "N" ]; then
+        systemctl stop gsvoice-api || true
+        tar xzf "$PRE_BACKUP/settings.tgz" -C /; chown -R asterisk:asterisk /etc/asterisk 2>/dev/null || true
+        systemctl restart asterisk; systemctl start gsvoice-api; sleep 8
+        asterisk -rx "pjsip show registrations" | grep carrier-reg || true
+        echo "   Rolled back. Run the installer again and re-enter the Telnyx SIP username/password carefully."
+        exit 1
+      fi
+    fi
+  fi
+fi
 
 cat <<EOF
 

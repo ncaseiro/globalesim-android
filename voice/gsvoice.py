@@ -42,7 +42,8 @@ DEFAULTS = {
     "pool_rest_days": 30,
     "guard": {"out_minutes_hour": 900, "out_minutes_day": 6000, "out_calls_10min": 150, "concurrent": 40, "new_lines_day": 25},
     "low_balance": 20,                 # email when the Telnyx balance drops below this (USD)
-    "alert_kinds": ["auto_suspend", "guard_trip", "e911_failed", "release_failed", "low_balance", "line_flood", "backup_failed"],
+    "alert_kinds": ["auto_suspend", "guard_trip", "e911_failed", "release_failed", "low_balance", "line_flood", "backup_failed",
+                    "carrier_unregistered", "carrier_registered"],
     "topup_minutes": 300,
     "limits": {"new_calls_per_10min": 5, "calls_per_day": 100, "new_account_days": 7, "new_account_minutes": 100,
                "robocall_window_min": 30, "robocall_calls": 8, "robocall_short_sec": 15, "robocall_short_calls": 6},
@@ -1430,6 +1431,26 @@ def sms_in(payload):
         with _lock, db() as con: con.execute("UPDATE texts SET delivered=1 WHERE id=?", (tid,)); con.commit()
 
 # ---------------------------------------------------------------- alerts + daily security report
+_reg = {"bad": 0, "state": ""}
+def reg_watch():
+    """Every minute: is the server signed in to Telnyx? 3 bad minutes in a row → alert; back → 'restored'."""
+    out = ast_rx("pjsip show registrations")
+    if not out: return                                   # Asterisk not answering — the ping watchdog covers that
+    line = next((l for l in out.splitlines() if "carrier-reg" in l), "")
+    with _lock, db() as con:
+        expected = setting(con, "reg_expected") == "1" or bool(line)
+        if line and "Registered" in line: set_setting(con, "reg_expected", "1")
+        ok = bool(line) and "Registered" in line and "Unregistered" not in line
+        if not expected: con.commit(); return
+        _reg["bad"] = 0 if ok else _reg["bad"] + 1
+        prev = _reg["state"] or setting(con, "reg_state") or "ok"
+        new = "ok" if ok else ("down" if _reg["bad"] >= 3 else prev)
+        if new != prev:
+            event(con, "admin", "carrier_registered" if new == "ok" else "carrier_unregistered",
+                  "signed in to Telnyx" if new == "ok" else ("registration: " + (line.strip()[:150] or "missing from the configuration")))
+            set_setting(con, "reg_state", new)
+        _reg["state"] = new; con.commit()
+
 def alert_loop():
     """Every minute: email new alert events to the owner (via the website), at most one per kind per 30 min; check the Telnyx balance."""
     last_bal = 0
@@ -1457,6 +1478,7 @@ def alert_loop():
             for k, rs in send.items():
                 lines = [f"{r['ts']} UTC  {r['sip_user'] or '-'}  {r['detail']}" for r in rs[:20]]
                 notify_site("alert", {"subject": ALERT_TITLES.get(k, k), "text": "\n".join(lines) + "\n\n" + ALERT_HELP.get(k, "")})
+            reg_watch()
             if time.time() - last_bal > 1800 and C["telnyx_api_key"]:
                 last_bal = time.time()
                 try:
@@ -1473,8 +1495,14 @@ def alert_loop():
 ALERT_TITLES = {"auto_suspend": "ALERT: a line was paused for robocall-like calling", "guard_trip": "ALERT: all outgoing calls paused (master shutoff)",
                 "e911_failed": "ALERT: a 911 address was not accepted", "release_failed": "ALERT: a number could not be released",
                 "low_balance": "ALERT: Telnyx balance is low", "line_flood": "ALERT: unusual number of new lines",
-                "backup_failed": "ALERT: a backup number could not be changed at Telnyx"}
-ALERT_HELP = {"auto_suspend": "The line can't call out until you activate it in /shop-admin → Phone lines. Check its recent calls first.",
+                "backup_failed": "ALERT: a backup number could not be changed at Telnyx",
+                "carrier_down": "OUTAGE: incoming test call failed", "carrier_ok": "Restored: incoming test call works again",
+                "carrier_unregistered": "OUTAGE: the voice server is NOT signed in to Telnyx — calls are failing",
+                "carrier_registered": "Restored: the voice server is signed in to Telnyx again"}
+ALERT_HELP = {"carrier_unregistered": "Calls in and out through Telnyx fail until the server signs in again. Check: asterisk -rx \"pjsip show registrations\". "
+                                      "If the SIP username/password changed, run the installer and enter them again — or roll back with: gs-restore",
+              "carrier_registered": "Calls through Telnyx work again.",
+"auto_suspend": "The line can't call out until you activate it in /shop-admin → Phone lines. Check its recent calls first.",
               "guard_trip": "Incoming calls still work. If this was real traffic, raise the limits; if not, find the line in /shop-admin and pause it. Turn outgoing calls back on in /shop-admin → Phone lines.",
               "e911_failed": "Fix the customer's 911 address (contact them), then retry.",
               "low_balance": "Add funds at Telnyx, or calls and number purchases will stop.",
