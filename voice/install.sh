@@ -118,6 +118,19 @@ read -rp "Telnyx SIP connection ID [${TX_CONN:-}]: " x; TX_CONN=${x:-$TX_CONN}
 GTTS_KEY=$(jget google_tts_key)
 read -rsp "Google Text-to-Speech API key for premium voices (hidden, Enter = keep current, - = remove): " x; echo
 GTTS_KEY=${x:-$GTTS_KEY}; [ "$GTTS_KEY" = "-" ] && GTTS_KEY=""; GTTS_KEY=$(echo "$GTTS_KEY" | tr -cd 'A-Za-z0-9_-')
+VMS_USER=$(jget voipms_api_user); VMS_PASS=$(jget voipms_api_pass); VMS_SELL=$(jget voipms_sell)
+if [ -n "$BK_USER" ]; then
+  echo "VoIP.ms API (lets customers pick VoIP.ms numbers). voip.ms -> Main Menu -> SOAP and REST/JSON API. Type - to remove."
+  read -rp "VoIP.ms login email for the API [${VMS_USER:-none}]: " x; VMS_USER=${x:-$VMS_USER}; [ "$VMS_USER" = "-" ] && VMS_USER=""
+  case "$VMS_USER" in *[[:space:]\'\"]*) echo "That doesn't look like an email address — run the installer again."; exit 1;; esac
+  if [ -n "$VMS_USER" ]; then
+    read -rsp "VoIP.ms API password (hidden, Enter = keep current): " x; echo; VMS_PASS=${x:-$VMS_PASS}
+    case "$VMS_PASS" in *[[:space:]\'\"]*) echo "The API password has spaces or quotes — set a letters-and-numbers one in VoIP.ms and run the installer again."; exit 1;; esac
+    case "$VMS_SELL" in True|true|1|y) d=y;; *) d=n;; esac
+    read -rp "Offer VoIP.ms numbers to customers when they pick a number? y/N [$d]: " x; x=${x:-$d}
+    case "$x" in y|Y|yes|YES) VMS_SELL=1;; *) VMS_SELL=0;; esac
+  else VMS_PASS=""; VMS_SELL=0; fi
+else VMS_USER=""; VMS_PASS=""; VMS_SELL=0; fi
 SN_PROJ=$(jget sinch_project_id); SN_KID=$(jget sinch_key_id); SN_SEC=$(jget sinch_key_secret)
 if [ -n "$SINCH_HOST" ]; then
   echo "Sinch API access (lets customers pick Sinch numbers too). Sinch dashboard -> Settings -> Access Keys. Type - to remove."
@@ -572,11 +585,11 @@ exten => _.,1,AGI(gs-agi.py,xfer,\${BLINDTRANSFER},\${EXTEN})
  same => n,Hangup()
  same => n(ok),GotoIf(\$["\${GS_XEXT}" = "1"]?ext)
  same => n,Set(CALLERID(num)=\${GS_CID})
- same => n,GotoIf(\$["\${GS_VIA}" = "sinch"]?viasinch)
+ same => n,GotoIf(\$["\${GS_VIA}" != ""]?viasinch)
  same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
  same => n,ExecIf(\$[\${BK_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/\${BK_PFX}\${GS_NUM}@\${BK_EP},60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
  same => n,Hangup()
- same => n(viasinch),Dial(PJSIP/+\${GS_NUM}@sinch,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
+ same => n(viasinch),Dial(PJSIP/\${IF(\$["\${GS_VIA}" = "voipms"]?:+)}\${GS_NUM}@\${GS_VIA},60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
  same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,60,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
  same => n,Hangup()
  same => n(ext),Gosub(gs-pushwait,s,1(GS_DIALS))
@@ -602,11 +615,11 @@ exten => s,1,AGI(gs-agi.py,fwd,\${GS_FWDUSER},\${CALLERID(num)})
  same => n,Goto(gs-vm,s,1)
  same => n(ok),GotoIf(\$["\${GS_FWDEXT}" = "1"]?ext)
  same => n,Set(CALLERID(num)=\${GS_CID})
- same => n,GotoIf(\$["\${GS_VIA}" = "sinch"]?viasinch)
+ same => n,GotoIf(\$["\${GS_VIA}" != ""]?viasinch)
  same => n,Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
  same => n,ExecIf(\$[\${BK_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/\${BK_PFX}\${GS_NUM}@\${BK_EP},30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
  same => n,Goto(gs-vm,s,1)
- same => n(viasinch),Dial(PJSIP/+\${GS_NUM}@sinch,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
+ same => n(viasinch),Dial(PJSIP/\${IF(\$["\${GS_VIA}" = "voipms"]?:+)}\${GS_NUM}@\${GS_VIA},30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX}))
  same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/\${DIALPFX}\${GS_NUM}@carrier,30,U(gs-outans^\${GS_XCALL}^\${GS_XMAX})))
  same => n,Goto(gs-vm,s,1)
  same => n(ext),Gosub(gs-pushwait,s,1(GS_DIALS))
@@ -684,10 +697,10 @@ exten => 911,1,AGI(gs-agi.py,e911,\${CHANNEL(endpoint)})
  same => n,Playback(ss-noservice)
  same => n,Hangup()
  same => n(go),Set(CALLERID(all)=<\${GS_CID}>)
- same => n,GotoIf(\$["\${GS_VIA}" = "sinch"]?viasinch)
+ same => n,GotoIf(\$["\${GS_VIA}" != ""]?viasinch)
  same => n,Dial(PJSIP/911@carrier,120)
  same => n,Hangup()
- same => n(viasinch),Dial(PJSIP/911@sinch,120)
+ same => n(viasinch),Dial(PJSIP/911@\${GS_VIA},120)
  same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/911@carrier,120))
  same => n,Hangup()
 ; Kari's Law: 911 works with or without a leading 9
@@ -720,11 +733,11 @@ exten => _1NXXNXXXXXX,1,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n(go),Set(CALLERID(all)=<\${GS_CID}>)
  same => n,Set(CHANNEL(hangup_handler_push)=gs-charge,s,1(\${GS_CALLID}))
  same => n,Set(CHANNEL(hangup_handler_push)=gs-qos,s,1(\${GS_CALLID}))
- same => n,GotoIf(\$["\${GS_VIA}" = "sinch"]?viasinch)
+ same => n,GotoIf(\$["\${GS_VIA}" != ""]?viasinch)
  same => n,Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC}))
  same => n,ExecIf(\$[\${BK_ON} = 1 & ("\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION")]?Dial(PJSIP/\${BK_PFX}\${EXTEN}@\${BK_EP},60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC})))
  same => n,Hangup()
- same => n(viasinch),Dial(PJSIP/+\${EXTEN}@sinch,60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC}))
+ same => n(viasinch),Dial(PJSIP/\${IF(\$["\${GS_VIA}" = "voipms"]?:+)}\${EXTEN}@\${GS_VIA},60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC}))
  same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/\${DIALPFX}\${EXTEN}@carrier,60,L(\${GS_MAXMS})U(gs-outans^\${GS_CALLID}^\${GS_MAXSEC})))
  same => n,Hangup()
  same => n(blocked),Playback(ss-noservice)
@@ -936,7 +949,7 @@ read = system,call
 write = message,call
 EOF
 chown asterisk:asterisk /etc/asterisk/manager.conf; chmod 640 /etc/asterisk/manager.conf
-SN_SEC="$SN_SEC" GTTS_KEY="$GTTS_KEY" BK_EP="$( [ -n "$BK_USER" ] && echo voipms )" BK_DID="${BK_DID:-}" BK_RING="${BK_RING:-}" python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" "$AMI_SECRET" "${SINCH_MAP:-}" "${SINCH_HOST:-}" "${SN_PROJ:-}" "${SN_KID:-}" <<'EOF'
+SN_SEC="$SN_SEC" GTTS_KEY="$GTTS_KEY" BK_EP="$( [ -n "$BK_USER" ] && echo voipms )" BK_DID="${BK_DID:-}" BK_RING="${BK_RING:-}" VMS_USER="$VMS_USER" VMS_PASS="$VMS_PASS" VMS_SELL="$VMS_SELL" VMS_ACCT="${BK_USER:-}" VMS_SERVER="${BK_SERVER:-}" python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" "$AMI_SECRET" "${SINCH_MAP:-}" "${SINCH_HOST:-}" "${SN_PROJ:-}" "${SN_KID:-}" <<'EOF'
 import json, os, sys
 p, dom, key, conn, tok, did, test, ami, smap, shost, sproj, skid = sys.argv[1:13]
 try: c = json.load(open(p))
@@ -948,6 +961,9 @@ c.update({"sip_domain": dom, "telnyx_api_key": key, "telnyx_connection_id": conn
 bd, br = os.environ.get("BK_DID", ""), os.environ.get("BK_RING", "")
 if bd and br and bd != br: c["did_alias"][bd] = br          # the VoIP.ms backup number rings like one of our numbers
 c["backup_ep"] = os.environ.get("BK_EP", ""); c["backup_did"] = bd
+c.update({"voipms_api_user": os.environ.get("VMS_USER", ""), "voipms_api_pass": os.environ.get("VMS_PASS", ""),
+          "voipms_account": os.environ.get("VMS_ACCT", ""), "voipms_server": os.environ.get("VMS_SERVER", "") or "sanjose1.voip.ms",
+          "voipms_sell": os.environ.get("VMS_SELL", "0") == "1"})
 c.setdefault("notify_url", "https://globalesim.tel/app.php?api=voice_hook")   # voicemail emails go out from the website
 json.dump(c, open(p, "w"), indent=2)
 EOF
