@@ -278,6 +278,10 @@ val LocalProfileInfo.displayProvider: String
                  "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION"):
         if f"android.permission.{perm}" not in x:
             x = x.replace("<application", f'<uses-permission android:name="android.permission.{perm}" />\n    <application', 1)
+    # location is optional hardware: without this, asking for it hides the app from phones/tablets that have no GPS
+    for feat in ("android.hardware.location", "android.hardware.location.gps", "android.hardware.location.network"):
+        if f'"{feat}"' not in x:
+            x = x.replace("<application", f'<uses-feature android:name="{feat}" android:required="false" />\n    <application', 1)
     if "tel.globalesim.app.VoiceService" not in x:
         comps = """
         <service
