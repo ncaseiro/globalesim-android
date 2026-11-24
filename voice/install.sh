@@ -531,6 +531,14 @@ exten => s,1,Set(CHANNEL(hangup_handler_push)=gs-qos,s,1(\${ARG1}))
  same => n,Return()
 
 ; After every customer call: charge the minutes (rounded up) and run the robocall check
+; 911/933 from the apps: the phone's GPS position rides along; Telnyx turns it into a PIDF-LO for the 911 center
+[gs-geo]
+exten => s,1,GotoIf(\$["\${GS_LAT}" = "" | "\${GS_LON}" = ""]?done)
+ same => n,Set(PJSIP_HEADER(add,Geolocation)=<cid:location@globalesim.tel>)
+ same => n,Set(PJSIP_HEADER(add,X-Latitude)=\${GS_LAT})
+ same => n,Set(PJSIP_HEADER(add,X-Longitude)=\${GS_LON})
+ same => n(done),Return()
+
 [gs-charge]
 ; minutes = the longer of: time talking to a person (ANSWEREDTIME) or time since the server answered (menu / voicemail, GS_ANS)
 exten => s,1,AGI(gs-agi.py,charge,\${ARG1},\${ANSWEREDTIME},\${GS_ANS},\${EPOCH},\${DIALEDTIME},\${GS_START})
@@ -692,10 +700,10 @@ exten => 911,1,AGI(gs-agi.py,e911,\${CHANNEL(endpoint)})
  same => n,Hangup()
  same => n(go),Set(CALLERID(all)=<\${GS_CID}>)
  same => n,GotoIf(\$["\${GS_VIA}" != ""]?viasinch)
- same => n,Dial(PJSIP/911@carrier,120)
+ same => n,Dial(PJSIP/911@carrier,120,b(gs-geo^s^1))
  same => n,Hangup()
  same => n(viasinch),Dial(PJSIP/911@\${GS_VIA},120)
- same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/911@carrier,120))
+ same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/911@carrier,120,b(gs-geo^s^1)))
  same => n,Hangup()
 ; Kari's Law: 911 works with or without a leading 9
 exten => 9911,1,Goto(from-customer,911,1)
@@ -706,7 +714,7 @@ exten => 933,1,AGI(gs-agi.py,e933,\${CHANNEL(endpoint)})
  same => n,Hangup()
  same => n(go),Set(CALLERID(all)=<\${GS_CID}>)
  same => n,GotoIf(\$["\${GS_VIA}" = "sinch"]?viasinch)
- same => n,Dial(PJSIP/933@carrier,60)
+ same => n,Dial(PJSIP/933@carrier,60,b(gs-geo^s^1))
  same => n,Hangup()
  same => n(viasinch),Dial(PJSIP/933@sinch,60)
  same => n,Hangup()

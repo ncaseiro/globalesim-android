@@ -101,6 +101,7 @@ def db():
     CREATE INDEX IF NOT EXISTS vm_user ON voicemails(sip_user, id);
     CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT);
     CREATE TABLE IF NOT EXISTS departments (id INTEGER PRIMARY KEY, company_id INTEGER, name TEXT, exts TEXT DEFAULT '[]', created_at TEXT);
+    CREATE TABLE IF NOT EXISTS geo911 (sip_user TEXT PRIMARY KEY, lat REAL, lon REAL, acc REAL, address TEXT, at REAL);
     CREATE TABLE IF NOT EXISTS stock (number TEXT PRIMARY KEY, phone_id TEXT, bought_at TEXT, note TEXT, available_at TEXT, prev_email TEXT);
     CREATE UNIQUE INDEX IF NOT EXISTS customers_did ON customers(did) WHERE did IS NOT NULL AND did <> '';
     """)
@@ -1429,6 +1430,18 @@ def notify_site(kind, data):
     except Exception as e:
         sys.stderr.write("notify %s %r\n" % (kind, e))
 
+def geo_fresh(con, u, max_age=180):
+    """The phone's own location sent by the app for an emergency call (last few minutes), or None."""
+    r = con.execute("SELECT * FROM geo911 WHERE sip_user=?", (u,)).fetchone()
+    return r if r and time.time() - float(r["at"] or 0) <= max_age else None
+
+def geo_text(g):
+    """'near 1601 W University Dr, McKinney TX (33.19876, -96.63912, ±12 m) https://maps.google.com/?q=…'"""
+    if not g: return ""
+    pt = f"{g['lat']:.6f}, {g['lon']:.6f}"
+    return ((g["address"] + " — ") if g["address"] else "") + f"GPS {pt}" + (f" (±{int(g['acc'])} m)" if g["acc"] else "") + \
+           f"  https://maps.google.com/?q={g['lat']:.6f},{g['lon']:.6f}"
+
 def notify_detached(kind, data):
     """Send a site notification from a child process so the caller (an AGI on an emergency call) never waits for it."""
     try:
@@ -1778,7 +1791,18 @@ def _agi_modes(a, mode, args):
             a.set("GS_OK", "1" if ok else "0")
             if ok: a.set("GS_CID", "+" + cust["did"])
             test = mode == "e933"
-            event(con, args[1], "e933_test" if test else "e911_call", "routed" if ok else "no 911 address")
+            # the phone's live location (the app sends it the moment 911 is dialed). Phones that have sent one before get a short
+            # wait (max 1.5 s) so it can ride along with the call; it goes to Telnyx, which passes it to the 911 center (PIDF-LO)
+            g = geo_fresh(con, orig["sip_user"]) if orig is not None else None
+            if g is None and orig is not None and con.execute("SELECT 1 FROM geo911 WHERE sip_user=?", (orig["sip_user"],)).fetchone():
+                con.commit()
+                for _ in range(6):
+                    time.sleep(0.25); g = geo_fresh(con, orig["sip_user"], 20)
+                    if g: break
+            if g:
+                a.set("__GS_LAT", f"{g['lat']:.6f}"); a.set("__GS_LON", f"{g['lon']:.6f}")
+            event(con, orig["sip_user"] if orig is not None else args[1], "e933_test" if test else "e911_call",
+                  ("routed" if ok else "no 911 address") + (" · " + geo_text(g) if g else ""))
             if not test and orig is not None:            # Kari's Law: tell the company (and us) at once — never delays the call
                 addr = {}
                 try: addr = json.loads((cust["e911_json"] if cust else None) or "{}")
@@ -1786,7 +1810,7 @@ def _agi_modes(a, mode, args):
                 info = {"sip_user": orig["sip_user"], "email": orig["email"], "ext": orig["ext"] or "", "name": orig["display_name"] or "",
                         "did": (cust["did"] if cust else "") or "", "routed": ok, "at": dt.datetime.now().isoformat(timespec="seconds"),
                         "address": ", ".join(x for x in (addr.get("street"), addr.get("unit"), addr.get("city"), addr.get("state"), addr.get("zip")) if x),
-                        "company": co["name"] if co else "", "owner_email": co["owner_email"] if co else ""}
+                        "company": co["name"] if co else "", "owner_email": co["owner_email"] if co else "", "gps": geo_text(g)}
                 notify_detached("e911_call", info)
         elif mode == "in":                # in <exten> <to-header> <caller>
             # the dialed number = user part of the To URI (never the host/port digits), else the extension
@@ -2569,6 +2593,30 @@ def api_route(method, path, q, body):
                 co = co_of(con, c)
                 if co: d["company"] = {"id": co["id"], "name": co["name"], "owner": co["owner_email"] == c["email"], "ext": c["ext"], "main_did": co_main_did(con, co)}
                 return d
+            if sub == "location" and method == "POST":         # the app's live location during a 911 / 933 call
+                try: lat, lon = float(body.get("lat")), float(body.get("lon"))
+                except (TypeError, ValueError): raise ApiError(400, "lat and lon required")
+                if not (-90 <= lat <= 90 and -180 <= lon <= 180): raise ApiError(400, "bad coordinates")
+                try: acc = max(0.0, min(100000.0, float(body.get("acc") or 0)))
+                except (TypeError, ValueError): acc = 0.0
+                addr = str(body.get("address") or "")[:200]
+                con.execute("INSERT OR REPLACE INTO geo911 (sip_user, lat, lon, acc, address, at) VALUES (?,?,?,?,?,?)", (u, lat, lon, acc, addr, time.time()))
+                g = con.execute("SELECT * FROM geo911 WHERE sip_user=?", (u,)).fetchone()
+                ev = con.execute("SELECT ts FROM events WHERE sip_user=? AND kind='e911_call' ORDER BY id DESC LIMIT 1", (u,)).fetchone()
+                late = bool(ev and ev["ts"] and ev["ts"] >= iso(now() - dt.timedelta(minutes=10)))
+                if late and body.get("final"):            # the location came in after the call started: send it to the company and us as well
+                    co = co_of(con, c)
+                    notify_detached("e911_loc", {"sip_user": u, "email": c["email"], "ext": c["ext"] or "", "name": c["display_name"] or "",
+                                                 "company": co["name"] if co else "", "owner_email": co["owner_email"] if co else "", "gps": geo_text(g)})
+                event(con, u, "e911_location", geo_text(g)[:300]); con.commit()
+                reg = c
+                if not c["did"]:
+                    co = co_of(con, c)
+                    if co: reg = con.execute("SELECT * FROM customers WHERE sip_user=?", (co["main_user"],)).fetchone() or c
+                ra = {}
+                try: ra = json.loads(reg["e911_json"] or "{}")
+                except Exception: pass
+                return {"ok": True, "registered": ", ".join(x for x in (ra.get("street"), ra.get("unit"), ra.get("city"), ra.get("state"), ra.get("zip")) if x)}
             if sub == "desk":                                    # desk phone login + automatic setup
                 if method == "POST":
                     on = bool(body.get("on", True))
