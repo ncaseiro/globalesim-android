@@ -273,7 +273,9 @@ val LocalProfileInfo.displayProvider: String
     for perm in ("RECORD_AUDIO", "MODIFY_AUDIO_SETTINGS", "BLUETOOTH_CONNECT", "WAKE_LOCK",
                  # ring with the app closed: background line, notifications, lock-screen call screen
                  "POST_NOTIFICATIONS", "FOREGROUND_SERVICE", "FOREGROUND_SERVICE_SPECIAL_USE", "FOREGROUND_SERVICE_MICROPHONE",
-                 "RECEIVE_BOOT_COMPLETED", "VIBRATE", "USE_FULL_SCREEN_INTENT", "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS", "SYSTEM_ALERT_WINDOW"):
+                 "RECEIVE_BOOT_COMPLETED", "VIBRATE", "USE_FULL_SCREEN_INTENT", "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS", "SYSTEM_ALERT_WINDOW",
+                 # 911: the phone's location goes with emergency calls (asked only when 911 is dialed)
+                 "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION"):
         if f"android.permission.{perm}" not in x:
             x = x.replace("<application", f'<uses-permission android:name="android.permission.{perm}" />\n    <application', 1)
     if "tel.globalesim.app.VoiceService" not in x:

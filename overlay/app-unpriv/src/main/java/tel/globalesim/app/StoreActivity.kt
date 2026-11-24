@@ -18,7 +18,9 @@ import android.telephony.euicc.EuiccManager
 import android.view.View
 import android.view.WindowInsets
 import android.widget.FrameLayout
+import android.webkit.GeolocationPermissions
 import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -85,6 +87,16 @@ class StoreActivity : Activity() {
             javaScriptEnabled = true
             domStorageEnabled = true
             userAgentString = "$userAgentString GlobaleSIMApp/1"
+            setGeolocationEnabled(true)
+        }
+        // 911/933 calls: the page asks for the phone's location (it goes with the call to the 911 center) — only our own pages may ask
+        web.webChromeClient = object : WebChromeClient() {
+            override fun onGeolocationPermissionsShowPrompt(origin: String, callback: GeolocationPermissions.Callback) {
+                if (!isStore(Uri.parse(origin))) { callback.invoke(origin, false, false); return }
+                if (hasLocation()) { callback.invoke(origin, true, false); return }
+                pendingGeo = origin to callback
+                requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), GEO_REQUEST)
+            }
         }
         web.addJavascriptInterface(Bridge(), "GlobaleSIM")
         // GlobaleSIM Phone: native calling engine, reports to the page as window.gsVoiceEvent(json)
@@ -150,6 +162,10 @@ class StoreActivity : Activity() {
     }
 
     private val MIC_REQUEST = 7
+    private val GEO_REQUEST = 9
+    private var pendingGeo: Pair<String, GeolocationPermissions.Callback>? = null
+    private fun hasLocation() = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+        checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
     private val NOTIF_REQUEST = 8
     private fun hasMic() = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
     private fun askMic() {
@@ -164,6 +180,10 @@ class StoreActivity : Activity() {
             if (answerAfterMic) { answerAfterMic = false; if (hasMic()) VoiceManager.answer() }
             val js = JSONObject().put("type", "perm").put("mic", hasMic()).toString()
             web.evaluateJavascript("window.gsVoiceEvent && window.gsVoiceEvent($js)", null)
+        }
+        if (requestCode == GEO_REQUEST) {
+            pendingGeo?.let { (o, cb) -> cb.invoke(o, hasLocation(), false) }
+            pendingGeo = null
         }
         if (requestCode == NOTIF_REQUEST) {
             VoiceService.start(this)
