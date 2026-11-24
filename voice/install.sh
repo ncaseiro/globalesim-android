@@ -85,13 +85,7 @@ fi
 read -rp "Your phone number from the carrier, digits only with country code, e.g. 12145550123 [${DID:-}]: " x; DID=${x:-${DID:-}}
 DID=$(echo "$DID" | tr -cd '0-9')
 read -rp "Is 911 (E911 with your address) enabled on that number at the carrier? y/N [${E911:-n}]: " x; E911=${x:-${E911:-n}}
-echo "Backup carrier (Sinch Elastic SIP Trunk) — used automatically when Telnyx can't place a call. Type - to remove it."
-read -rp "Sinch trunk address, e.g. yourname.pstn.sinch.com (Enter = keep [${SINCH_HOST:-none}]): " x; SINCH_HOST=${x:-${SINCH_HOST:-}}; [ "$SINCH_HOST" = "-" ] && SINCH_HOST=""
-SINCH_HOST=$(echo "$SINCH_HOST" | tr -cd 'A-Za-z0-9.-')
-if [ -n "$SINCH_HOST" ]; then
-  read -rp "Sinch number(s) that should ring like one of your numbers, e.g. 12085813207=18307798230 (comma-separated, Enter = keep [${SINCH_MAP:-none}]): " x; SINCH_MAP=${x:-${SINCH_MAP:-}}; [ "$SINCH_MAP" = "-" ] && SINCH_MAP=""
-  SINCH_MAP=$(echo "$SINCH_MAP" | tr -cd '0-9=,')
-else SINCH_MAP=""; fi
+SINCH_HOST=""; SINCH_MAP=""        # Sinch was removed (Nov 2026) — VoIP.ms is the backup carrier
 echo "Backup carrier VoIP.ms (sub account from voip.ms -> Sub Accounts) — takes over outgoing calls when Telnyx can't, and rings its own number. Type - to remove it."
 case "${BK_USER:-}" in *[[:space:]/:\'\"]*) BK_USER="";; esac
 read -rp "VoIP.ms sub account username, e.g. 585855_gsfo (Enter = keep [${BK_USER:-none}]): " x

@@ -730,6 +730,7 @@ def sell_sql():
 
 # ---- VoIP.ms (REST API: https://voip.ms/api/v1/rest.php; this server's IP must be allowed in the portal) ----
 _VOIPMS_SEEN = {}
+_VOIPMS_REGION = {}      # number -> "Ratecenter, ST" from the last search (shown next to the number)
 _voipms_pop = {}
 def voipms_on(): return bool(C.get("voipms_api_user") and C.get("voipms_api_pass") and C.get("voipms_account"))
 
@@ -738,7 +739,7 @@ def voipms(method, **params):
     q = urllib.parse.urlencode({"api_username": C["voipms_api_user"], "api_password": C["voipms_api_pass"], "method": method,
                                 **{k: v for k, v in params.items() if v is not None}})
     try:
-        with urllib.request.urlopen(urllib.request.Request("https://voip.ms/api/v1/rest.php?" + q, headers={"User-Agent": "gsvoice"}), timeout=25) as r:
+        with urllib.request.urlopen(urllib.request.Request((C.get("voipms_url") or "https://voip.ms/api/v1/rest.php") + "?" + q, headers={"User-Agent": "gsvoice"}), timeout=25) as r:
             d = json.loads(r.read().decode() or "{}")
     except urllib.error.HTTPError as e: raise ApiError(502, f"voip.ms {e.code}")
     except (urllib.error.URLError, OSError, ValueError) as e: raise ApiError(502, f"voip.ms: {getattr(e, 'reason', e)}")
@@ -767,7 +768,8 @@ def voipms_search(area_code="", limit=10, contains=""):
     out = []
     for x in r.get("dids") or []:
         d = digits(str(x.get("did") or "")); d = ("1" + d) if len(d) == 10 else d
-        if len(d) == 11 and (not ac or d[1:4] == ac) and d not in out: out.append(d)
+        if len(d) == 11 and (not ac or d[1:4] == ac) and d not in out:
+            out.append(d); _VOIPMS_REGION[d] = ", ".join(v for v in (str(x.get("ratecenter") or "").title(), str(x.get("state") or "")) if v)
         if len(out) >= limit: break
     return out
 
@@ -1108,7 +1110,7 @@ def telnyx_buy(num, area_code="", taken=()):
     """Buy num (11 digits) from Telnyx, or from Sinch when Telnyx doesn't have it (a number shown from Sinch's list,
     or nothing left in that area code at Telnyx). Returns (num, phone_id)."""
     vsell = voipms_on() and C.get("voipms_sell")
-    if num and vsell and time.time() - _VOIPMS_SEEN.get(num, 0) < 3600 and num not in taken:    # a number shown from VoIP.ms's list
+    if num and voipms_on() and time.time() - _VOIPMS_SEEN.get(num, 0) < 3600 and num not in taken:    # a number shown from VoIP.ms's list (customer or admin)
         try: return voipms_buy(num)
         except ApiError as e: sys.stderr.write(f"voipms buy {num}: {e.msg}\n")
     if num and sinch_on() and C.get("sinch_sell") and time.time() - _SINCH_SEEN.get(num, 0) < 3600 and num not in taken:
@@ -2052,20 +2054,27 @@ def api_route(method, path, q, body):
             except ApiError:
                 if not mine and not (sinch_on() or voipms_on()): raise
                 r = {}
-            out = [{"phone_number": "+" + n, "region": "In stock", "monthly": None, "stock": True} for n in mine[:5]]
+            out = [{"phone_number": "+" + n, "region": "In stock", "monthly": None, "stock": True, "carrier": "Pool"} for n in mine[:5]]
             out += [{"phone_number": n.get("phone_number"), "region": ", ".join(x.get("region_name", "") for x in n.get("region_information", []) if x.get("region_type") in ("rate_center", "state")),
-                     "monthly": (n.get("cost_information") or {}).get("monthly_cost")} for n in r.get("data", []) if digits(n.get("phone_number")) not in mine]
+                     "monthly": (n.get("cost_information") or {}).get("monthly_cost"), "carrier": "Telnyx"} for n in r.get("data", []) if digits(n.get("phone_number")) not in mine]
             lim = int(digits(q.get("limit", "10")) or 10)
+            if q.get("mix") and voipms_on() and not q.get("ends_with"):      # admin: both carriers side by side, about half each
+                have = {digits(x["phone_number"]) for x in out}
+                vm = [d for d in voipms_search(ac, lim, has) if d not in have]
+                _VOIPMS_SEEN.update({d: time.time() for d in vm})
+                tx = [x for x in out if x["carrier"] == "Telnyx"]; pool = [x for x in out if x["carrier"] == "Pool"]
+                nv = min(len(vm), max(lim // 2, lim - len(tx))); nt = min(len(tx), lim - nv)
+                return {"numbers": pool + tx[:nt] + [{"phone_number": "+" + d, "region": _VOIPMS_REGION.get(d, ""), "monthly": None, "carrier": "VoIP.ms"} for d in vm[:nv]]}
             if sinch_on() and C.get("sinch_sell") and len(out) < lim and not has and not q.get("ends_with"):       # Sinch fills the list when Telnyx has few or none
                 have = {digits(x["phone_number"]) for x in out}
                 extra = [d for d in sinch_search(ac, lim) if d not in have][:lim - len(out)]
                 _SINCH_SEEN.update({d: time.time() for d in extra})
-                out += [{"phone_number": "+" + d, "region": "", "monthly": None} for d in extra]
+                out += [{"phone_number": "+" + d, "region": "", "monthly": None, "carrier": "Sinch"} for d in extra]
             if voipms_on() and C.get("voipms_sell") and len(out) < lim and not q.get("ends_with"):        # VoIP.ms fills the list too
                 have = {digits(x["phone_number"]) for x in out}
                 extra = [d for d in voipms_search(ac, lim, has) if d not in have][:lim - len(out)]
                 _VOIPMS_SEEN.update({d: time.time() for d in extra})
-                out += [{"phone_number": "+" + d, "region": "", "monthly": None} for d in extra]
+                out += [{"phone_number": "+" + d, "region": _VOIPMS_REGION.get(d, ""), "monthly": None, "carrier": "VoIP.ms"} for d in extra]
             if not out and r == {} : raise ApiError(502, "number search is not available right now")
             return {"numbers": out}
         # ---- Telnyx tools for the admin panel ----
@@ -2138,7 +2147,8 @@ def api_route(method, path, q, body):
             want = digits(body.get("phone_number")); want = ("1" + want) if len(want) == 10 else want
             if not re.fullmatch(r"1\d{10}", want): raise ApiError(400, "phone_number required")
             if con.execute("SELECT 1 FROM customers WHERE did=? UNION SELECT 1 FROM stock WHERE number=? UNION SELECT 1 FROM departments WHERE did=?", (want, want, want)).fetchone(): raise ApiError(409, "we already own that number")
-            num, pid = telnyx_buy(want, "", ())
+            if body.get("carrier") == "voipms": num, pid = voipms_buy(want)       # admin picked a VoIP.ms number
+            else: num, pid = telnyx_buy(want, "", ())
             if num != want: raise ApiError(409, "that number was just taken")
             con.execute("INSERT INTO stock (number, phone_id, bought_at, note) VALUES (?,?,?,?)", (num, pid, iso(now()), (body.get("note") or "")[:80]))
             event(con, "admin", "stock_buy", num); con.commit()
@@ -2148,9 +2158,9 @@ def api_route(method, path, q, body):
                     "now": iso(now())}
         if p == ["carriers", "status"] and method == "GET":
             t, sn = watch_targets(con)
-            return {"status": carrier_status(con), "targets": {"telnyx": t, "sinch": sn}, "enabled": bool(C["watch"].get("enabled"))}
+            return {"status": carrier_status(con), "targets": {"telnyx": t, backup_name(): sn}, "backup": backup_name(), "enabled": bool(C["watch"].get("enabled"))}
         if p == ["carriers", "notify"] and method == "POST":         # admin: email the outage / restored notice to affected customers
-            carrier = "sinch" if body.get("carrier") == "sinch" else "telnyx"; kind = "restored" if body.get("kind") == "restored" else "outage"
+            carrier = body.get("carrier") if body.get("carrier") in ("sinch", "voipms") else "telnyx"; kind = "restored" if body.get("kind") == "restored" else "outage"
             ppl = outage_customers(con, carrier)
             for x in ppl:
                 notify_detached("outage_notice", {"email": x["email"], "number": x["number"], "notice": kind, "message": str(body.get("message") or "")[:1000]})
