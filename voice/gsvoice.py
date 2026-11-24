@@ -734,12 +734,12 @@ _VOIPMS_REGION = {}      # number -> "Ratecenter, ST" from the last search (show
 _voipms_pop = {}
 def voipms_on(): return bool(C.get("voipms_api_user") and C.get("voipms_api_pass") and C.get("voipms_account"))
 
-def voipms(method, **params):
+def voipms(method, _timeout=25, **params):
     if not voipms_on(): raise ApiError(503, "voip.ms not configured")
     q = urllib.parse.urlencode({"api_username": C["voipms_api_user"], "api_password": C["voipms_api_pass"], "method": method,
                                 **{k: v for k, v in params.items() if v is not None}})
     try:
-        with urllib.request.urlopen(urllib.request.Request((C.get("voipms_url") or "https://voip.ms/api/v1/rest.php") + "?" + q, headers={"User-Agent": "gsvoice"}), timeout=25) as r:
+        with urllib.request.urlopen(urllib.request.Request((C.get("voipms_url") or "https://voip.ms/api/v1/rest.php") + "?" + q, headers={"User-Agent": "gsvoice"}), timeout=_timeout) as r:
             d = json.loads(r.read().decode() or "{}")
     except urllib.error.HTTPError as e: raise ApiError(502, f"voip.ms {e.code}")
     except (urllib.error.URLError, OSError, ValueError) as e: raise ApiError(502, f"voip.ms: {getattr(e, 'reason', e)}")
@@ -776,7 +776,13 @@ def voipms_search(area_code="", limit=10, contains=""):
 def voipms_buy(num):
     """Order num (11 digits) at VoIP.ms, routed to our sub account on our server. Returns (11 digits, 'voipms:+1…')."""
     d = digits(num); d = d[1:] if len(d) == 11 else d
-    voipms("orderDID", did=d, routing="account:" + C["voipms_account"], pop=voipms_pop(), dialtime="60", cnam="0", billing_type="1")
+    try: voipms("orderDID", _timeout=75, did=d, routing="account:" + C["voipms_account"], pop=voipms_pop(), dialtime="60", cnam="0", billing_type="1")
+    except ApiError as e:
+        if "timed out" not in e.msg and "timeout" not in e.msg.lower(): raise
+        time.sleep(5)              # VoIP.ms is slow to answer orders: did the order go through anyway?
+        try: mine = any(digits(str(x.get("did") or ""))[-10:] == d for x in voipms("getDIDsInfo", _timeout=40, did=d).get("dids") or [])
+        except ApiError: mine = False
+        if not mine: raise ApiError(504, "VoIP.ms did not answer in time — check the VoIP.ms portal before trying again")
     return "1" + d, "voipms:+1" + d
 
 def voipms_release(phone_id):
