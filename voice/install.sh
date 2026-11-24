@@ -48,6 +48,9 @@ API_DOMAIN=$(jget sip_domain); TX_KEY=$(jget telnyx_api_key); TX_CONN=$(jget tel
 read -rp "Domain for the customer API and app [${API_DOMAIN:-voice.globalesim.tel}]: " x; API_DOMAIN=${x:-${API_DOMAIN:-voice.globalesim.tel}}
 read -rsp "Telnyx API key (hidden, Enter = keep current / skip): " x; echo; TX_KEY=${x:-$TX_KEY}
 read -rp "Telnyx SIP connection ID [${TX_CONN:-}]: " x; TX_CONN=${x:-$TX_CONN}
+GTTS_KEY=$(jget google_tts_key)
+read -rsp "Google Text-to-Speech API key for premium voices (hidden, Enter = keep current, - = remove): " x; echo
+GTTS_KEY=${x:-$GTTS_KEY}; [ "$GTTS_KEY" = "-" ] && GTTS_KEY=""; GTTS_KEY=$(echo "$GTTS_KEY" | tr -cd 'A-Za-z0-9_-')
 SN_PROJ=$(jget sinch_project_id); SN_KID=$(jget sinch_key_id); SN_SEC=$(jget sinch_key_secret)
 if [ -n "$SINCH_HOST" ]; then
   echo "Sinch API access (lets customers pick Sinch numbers too). Sinch dashboard -> Settings -> Access Keys. Type - to remove."
@@ -806,14 +809,15 @@ read = system,call
 write = message,call
 EOF
 chown asterisk:asterisk /etc/asterisk/manager.conf; chmod 640 /etc/asterisk/manager.conf
-SN_SEC="$SN_SEC" python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" "$AMI_SECRET" "${SINCH_MAP:-}" "${SINCH_HOST:-}" "${SN_PROJ:-}" "${SN_KID:-}" <<'EOF'
+SN_SEC="$SN_SEC" GTTS_KEY="$GTTS_KEY" python3 - "$GSJ" "$API_DOMAIN" "$TX_KEY" "$TX_CONN" "$API_TOKEN" "${DID:-}" "$TEST_USER" "$AMI_SECRET" "${SINCH_MAP:-}" "${SINCH_HOST:-}" "${SN_PROJ:-}" "${SN_KID:-}" <<'EOF'
 import json, os, sys
 p, dom, key, conn, tok, did, test, ami, smap, shost, sproj, skid = sys.argv[1:13]
 try: c = json.load(open(p))
 except Exception: c = {}
 c.update({"sip_domain": dom, "telnyx_api_key": key, "telnyx_connection_id": conn, "api_token": tok, "company_did": did, "test_user": test, "ami_secret": ami,
           "did_alias": dict(x.split("=", 1) for x in smap.split(",") if x.count("=") == 1 and all(x.split("="))),
-          "sinch_host": shost, "sinch_project_id": sproj, "sinch_key_id": skid, "sinch_key_secret": os.environ.get("SN_SEC", "")})
+          "sinch_host": shost, "sinch_project_id": sproj, "sinch_key_id": skid, "sinch_key_secret": os.environ.get("SN_SEC", ""),
+          "google_tts_key": os.environ.get("GTTS_KEY", "")})
 c.setdefault("notify_url", "https://globalesim.tel/app.php?api=voice_hook")   # voicemail emails go out from the website
 json.dump(c, open(p, "w"), indent=2)
 EOF

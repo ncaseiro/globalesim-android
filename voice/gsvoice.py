@@ -30,6 +30,8 @@ DEFAULTS = {
     "data_dir": "/var/lib/gsvoice", "tts_cmd": "espeak-ng",
     # natural voices (Piper, runs on this server); the installer downloads the models into piper_dir/voices
     "piper_dir": "/opt/piper",
+    # premium voices (Google Cloud Text-to-Speech, Chirp 3 HD). Empty = only the free voices above
+    "google_tts_key": "",
     # Master shutoff for outgoing calls (all lines together). Tripping it pauses outgoing calls only and emails you.
     # Telnyx list prices (USD), used for cost estimates in the admin panel
     "rates": {"in": 0.0032, "out": 0.005, "number": 1.0, "e911": 1.5, "channel_tiers": [[10, 12.0], [40, 11.0], [200, 9.0], [1000000, 8.0]]},
@@ -1113,9 +1115,36 @@ VOICES = [  # id, label, language — only those whose model is installed are of
     ("pt_BR-faber-medium", "Faber — male, Portuguese (Brazil)", "pt"), ("fr_FR-siwis-medium", "Siwis — female, French", "fr"),
 ]
 
+# Premium voices: Google Chirp 3 HD — id "g:<language>-Chirp3-HD-<name>"
+GOOGLE_LANGS = [("en-US", "en", "US English"), ("en-GB", "en", "British English"), ("es-US", "es", "Spanish (US)"),
+                ("pt-BR", "pt", "Portuguese (Brazil)"), ("fr-FR", "fr", "French")]
+GOOGLE_NAMES = [("Aoede", "female"), ("Kore", "female"), ("Leda", "female"), ("Zephyr", "female"),
+                ("Charon", "male"), ("Puck", "male"), ("Orus", "male"), ("Fenrir", "male")]
+
 def voices():
-    return [{"id": v, "label": lab, "lang": lg} for v, lab, lg in VOICES
+    out = []
+    if C.get("google_tts_key"):
+        for lc, lg, lname in GOOGLE_LANGS:
+            for n, sex in GOOGLE_NAMES:
+                out.append({"id": f"g:{lc}-Chirp3-HD-{n}", "label": f"{n} — {sex}, {lname}", "lang": lg, "group": "Premium voices"})
+    out += [{"id": v, "label": lab, "lang": lg, "group": "Standard voices (free)"} for v, lab, lg in VOICES
             if os.path.exists(os.path.join(C["piper_dir"], "voices", v + ".onnx")) and os.path.exists(os.path.join(C["piper_dir"], "piper"))]
+    return out
+
+def google_tts(text, voice, out_wav):
+    """Google Cloud Text-to-Speech → WAV file. voice = 'g:en-US-Chirp3-HD-Aoede'."""
+    import base64
+    name = voice[2:]; lc = "-".join(name.split("-")[:2])
+    body = {"input": {"text": text[:1500]}, "voice": {"languageCode": lc, "name": name},
+            "audioConfig": {"audioEncoding": "LINEAR16", "sampleRateHertz": 24000}}
+    req = urllib.request.Request("https://texttospeech.googleapis.com/v1/text:synthesize?key=" + urllib.parse.quote(C["google_tts_key"]),
+                                 data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r: audio = json.loads(r.read()).get("audioContent")
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"google tts {e.code}: " + e.read().decode(errors="replace")[:300])
+    if not audio: raise RuntimeError("google tts: no audio")
+    with open(out_wav, "wb") as f: f.write(base64.b64decode(audio))
 
 def default_voice(lang):
     for v in voices():
@@ -1132,6 +1161,18 @@ def to_8k(src, path_noext, max_secs=120):
 def tts(text, path_noext, lang="en", voice=""):
     """Text → 8 kHz mono WAV that Asterisk plays: a natural Piper voice when installed, espeak-ng otherwise."""
     voice = voice if any(v["id"] == voice for v in voices()) else default_voice(lang)
+    if voice.startswith("g:"):                       # premium (Google); on any problem fall back to the free voices
+        os.makedirs(os.path.dirname(path_noext), exist_ok=True)
+        raw = path_noext + ".g.wav"
+        try:
+            google_tts(text, voice, raw)
+            if to_8k(raw, path_noext): return True
+        except Exception as e:
+            sys.stderr.write("google tts %r\n" % e)
+        finally:
+            try: os.remove(raw)
+            except OSError: pass
+        voice = next((v["id"] for v in voices() if v["lang"] == lang and not v["id"].startswith("g:")), "")
     if voice:
         os.makedirs(os.path.dirname(path_noext), exist_ok=True)
         raw = path_noext + ".piper.wav"
