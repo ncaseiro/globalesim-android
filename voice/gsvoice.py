@@ -32,6 +32,9 @@ DEFAULTS = {
     "piper_dir": "/opt/piper",
     # premium voices (Google Cloud Text-to-Speech, Chirp 3 HD). Empty = only the free voices above
     "google_tts_key": "",
+    # carrier watch: every 5 min a test call goes in to one number of each carrier (sent out through the OTHER carrier,
+    # never answered = free). Blank numbers = picked automatically. 2 misses in a row = outage alert.
+    "watch": {"enabled": True, "telnyx_did": "", "sinch_did": "", "fails_to_alert": 2},
     # Master shutoff for outgoing calls (all lines together). Tripping it pauses outgoing calls only and emails you.
     # Telnyx list prices (USD), used for cost estimates in the admin panel
     "rates": {"in": 0.0032, "out": 0.005, "number": 1.0, "e911": 1.5, "channel_tiers": [[10, 12.0], [40, 11.0], [200, 9.0], [1000000, 8.0]]},
@@ -851,6 +854,90 @@ def auto_adopt(say=print):
         except ApiError as e: out["errors"].append("Sinch: " + e.msg[:150])
     return out
 
+# ---------------------------------------------------------------- carrier watch (outage alarm)
+def watch_targets(con):
+    """(telnyx number, sinch number) to test, 11 digits each ('' when there is none)."""
+    W = C["watch"]
+    t = digits(W.get("telnyx_did") or "")
+    if not t:
+        for q in ("SELECT did d, phone_id p FROM customers WHERE status='active' AND did<>''", "SELECT did d, phone_id p FROM departments WHERE did<>''",
+                  "SELECT number d, phone_id p FROM stock"):
+            r = next((r for r in con.execute(q) if r["p"] and not is_sinch(r["p"]) and len(digits(r["d"])) == 11), None)
+            if r: t = digits(r["d"]); break
+    s_ = digits(W.get("sinch_did") or "")
+    if not s_:
+        for q in ("SELECT number d, phone_id p FROM stock", "SELECT did d, phone_id p FROM departments WHERE did<>''",
+                  "SELECT did d, phone_id p FROM customers WHERE status='active' AND did<>''"):
+            r = next((r for r in con.execute(q) if is_sinch(r["p"])), None)
+            if r: s_ = digits(r["d"]); break
+    return t, s_
+
+def watch_send(name, via, to, frm):
+    """Start a test call to `to` through trunk `via` with caller ID `frm` (Asterisk call file, rings 25 s, never answered)."""
+    body = f"Channel: PJSIP/+{to}@{via}\nCallerID: <{frm}>\nMaxRetries: 0\nWaitTime: 25\nApplication: Wait\nData: 1\nArchive: no\n"
+    tmp = f"/var/spool/asterisk/tmp-gswatch-{name}"; out = f"/var/spool/asterisk/outgoing/gswatch-{name}.call"
+    with open(tmp, "w") as f: f.write(body)
+    os.rename(tmp, out)
+
+def carrier_status(con):
+    return json.loads(setting(con, "carrier_status") or "{}")
+
+def watch_run():
+    """One round (cron every 5 min): test incoming calls on Telnyx and on Sinch; alert on outage / recovery."""
+    W = C["watch"]
+    if not W.get("enabled"): return {}
+    with _lock, db() as con: t, sn = watch_targets(con)
+    plan = []
+    if t and sn and C.get("sinch_host"):
+        plan = [("telnyx", "sinch", t, sn), ("sinch", "carrier", sn, t)]      # Telnyx number called via Sinch, and the other way
+    if not plan: return {}
+    with _lock, db() as con:
+        for name, via, to, frm in plan:
+            set_setting(con, "watch_probe_" + name, json.dumps({"to": to, "from": frm, "at": time.time()}))
+        con.commit()
+    for name, via, to, frm in plan:
+        try: watch_send(name, via, to, frm)
+        except OSError as e: sys.stderr.write(f"watch {name}: {e}\n")
+    time.sleep(35)
+    res = {}
+    with _lock, db() as con:
+        st = carrier_status(con); changed = []
+        for name, via, to, frm in plan:
+            sent = json.loads(setting(con, "watch_probe_" + name) or "{}").get("at", 0)
+            ok = float(setting(con, "watch_hit_" + name) or 0) >= float(sent)
+            cur = st.get(name) or {"state": "unknown", "fails": 0, "since": iso(now())}
+            cur["fails"] = 0 if ok else cur.get("fails", 0) + 1; cur["checked"] = iso(now()); cur["number"] = to
+            if ok: cur["ever_ok"] = True
+            # no alarm until the test has worked once (e.g. a carrier still on trial can't place the test call yet)
+            new = "ok" if ok else ("down" if cur.get("ever_ok") and cur["fails"] >= int(W.get("fails_to_alert", 2)) else cur.get("state", "unknown"))
+            if new != cur.get("state"):
+                if not (cur.get("state") == "unknown" and new == "ok"): changed.append((name, new))
+                cur["state"] = new; cur["since"] = iso(now())
+                event(con, "admin", "carrier_" + new, f"{name}: incoming test call to {to} " + ("works again" if new == "ok" else "failed twice"))
+            st[name] = cur; res[name] = ok
+        set_setting(con, "carrier_status", json.dumps(st)); con.commit()
+    for name, new in changed:
+        label = "Telnyx" if name == "telnyx" else "Sinch"
+        if new == "down":
+            subj = f"OUTAGE: incoming calls on {label} numbers are failing"
+            text = (f"The test call to a {label} number ({st[name]['number']}) did not reach the voice server twice in a row "
+                    f"(checked {st[name]['checked']} UTC).\n\nCustomers whose number is on {label} may not receive calls. "
+                    "Outgoing calls fail over to the other carrier automatically.\n\nWhat to do: check the carrier's status page, "
+                    "open a ticket with them, and send the outage notice to affected customers from /phone-admin (Numbers).")
+        else:
+            subj = f"Restored: incoming calls on {label} numbers work again"
+            text = f"The test call to {st[name]['number']} reached the voice server again at {st[name]['checked']} UTC."
+        notify_site("alert", {"subject": subj, "text": text})
+    return res
+
+def outage_customers(con, carrier):
+    """Active lines whose number is on `carrier` ('telnyx'/'sinch'): email + number, one per account."""
+    out, seen = [], set()
+    for r in con.execute("SELECT email, did, phone_id FROM customers WHERE status='active' AND did<>'' AND email<>''"):
+        if (is_sinch(r["phone_id"]) == (carrier == "sinch")) and r["email"].lower() not in seen:
+            seen.add(r["email"].lower()); out.append({"email": r["email"], "number": r["did"]})
+    return out
+
 def via_of(con, cid):
     """'sinch' when the caller ID is one of our Sinch numbers: those calls go out through Sinch first (911 too)."""
     d = digits(cid)
@@ -1554,6 +1641,11 @@ def _agi_modes(a, mode, args):
                 return ("1" + d) if len(d) == 10 else d
             to_raw = args[2] if len(args) > 2 else ""; caller = digits(args[3]) if len(args) > 3 else ""
             did = num(to_raw) or num(args[1]) or num("sip:" + args[1] + "@")
+            for pn in ("telnyx", "sinch"):        # our own carrier test call: note it arrived and reject it unanswered (free)
+                pr = json.loads(setting(con, "watch_probe_" + pn) or "{}")
+                if pr and pr.get("to") in (did, num(to_raw)) and caller[-10:] == str(pr.get("from", ""))[-10:] and \
+                        time.time() - float(pr.get("at", 0)) < 120:
+                    set_setting(con, "watch_hit_" + pn, str(time.time())); con.commit(); a.set("GS_PROBE", "1"); return
             did = (C.get("did_alias") or {}).get(did, did)   # a backup-carrier (Sinch) number that rings like one of our numbers
             cust = con.execute("SELECT * FROM customers WHERE did=? AND status='active'", (did,)).fetchone()
             dnum = None
@@ -1902,6 +1994,16 @@ def api_route(method, path, q, body):
         if p == ["stock"] and method == "GET":                       # the pool, quick (no Telnyx call): ready numbers first
             return {"stock": [dict(r) for r in con.execute("SELECT number, available_at, note FROM stock ORDER BY COALESCE(available_at,'') > ?, number", (iso(now()),))],
                     "now": iso(now())}
+        if p == ["carriers", "status"] and method == "GET":
+            t, sn = watch_targets(con)
+            return {"status": carrier_status(con), "targets": {"telnyx": t, "sinch": sn}, "enabled": bool(C["watch"].get("enabled"))}
+        if p == ["carriers", "notify"] and method == "POST":         # admin: email the outage / restored notice to affected customers
+            carrier = "sinch" if body.get("carrier") == "sinch" else "telnyx"; kind = "restored" if body.get("kind") == "restored" else "outage"
+            ppl = outage_customers(con, carrier)
+            for x in ppl:
+                notify_detached("outage_notice", {"email": x["email"], "number": x["number"], "notice": kind, "message": str(body.get("message") or "")[:1000]})
+            event(con, "admin", "outage_notice", f"{kind} notice to {len(ppl)} {carrier} customers"); con.commit()
+            return {"ok": True, "sent": len(ppl)}
         if p == ["numbers", "adopt-new"] and method == "POST":       # admin "Check for new numbers now"
             con.commit(); r = auto_adopt(lambda *a: None)
             return {"ok": not r["errors"], **r}
@@ -2216,11 +2318,18 @@ def api_route(method, path, q, body):
                 event(con, co["main_user"] or "", "dept_set", str(body.get("name") or did_)[:60]); con.commit()
                 return {"departments": dept_list(con, cid)}
             if sub == "board" and method == "GET":         # the office app's live board: everyone's state + departments
+                _cs = carrier_status(con)
                 team = team_json(con, co)
                 for d in (dl := dept_list(con, cid)):
                     st = {t["ext"]: t["state"] for t in team}
                     d["free"] = sum(1 for e in d["exts"] if st.get(e) == "available"); d["busy"] = sum(1 for e in d["exts"] if st.get(e) == "busy")
-                return {"team": team, "departments": dl, "at": iso(now())}
+                outage = []
+                for cn, cs in _cs.items():                  # a carrier outage that touches this company's numbers → banner in Office
+                    if (cs or {}).get("state") != "down": continue
+                    nums = [r["phone_id"] for r in con.execute("SELECT c.phone_id FROM customers c WHERE c.company_id=? AND c.did<>'' "
+                                                                "UNION SELECT d.phone_id FROM departments d WHERE d.company_id=? AND d.did<>''", (cid, cid))]
+                    if any(x and is_sinch(x) == (cn == "sinch") for x in nums): outage.append({"carrier": cn, "since": cs.get("since", "")})
+                return {"team": team, "departments": dl, "at": iso(now()), "outage": outage}
             if sub == "calls" and method == "GET":         # company call history (who answered, for which department)
                 ms = co_members(con, cid); names = {m["sip_user"]: {"name": m["display_name"] or "", "ext": m["ext"] or ""} for m in ms}
                 users = list(names) or [""]
@@ -2518,6 +2627,8 @@ if __name__ == "__main__":
         ns = [n.get("phoneNumber") for n in r.get("availableNumbers") or []]
         print(f"Numbers for sale in {ac}:", ", ".join(ns) or "none right now")
         print("Prices:", "; ".join(f"{n.get('phoneNumber')} setup {((n.get('setupPrice') or {}).get('amount'))} monthly {((n.get('monthlyPrice') or {}).get('amount'))}" for n in (r.get("availableNumbers") or [])[:2]))
+    elif sys.argv[1:2] == ["carrier-watch"]:   # carrier-watch — one round of the outage test (cron every 5 min)
+        print(json.dumps(watch_run()))
     elif sys.argv[1:2] == ["auto-adopt"]:      # auto-adopt [--quiet] — new numbers from the Telnyx portal and the Sinch dashboard -> pool (cron)
         q = "--quiet" in sys.argv
         r = auto_adopt((lambda *a: None) if q else print)

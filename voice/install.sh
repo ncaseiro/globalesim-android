@@ -299,9 +299,11 @@ SINCH_ON=$( [ -n "$SINCH_HOST" ] && echo 1 || echo 0 )
 [from-carrier]
 exten => _.,1,Set(GS_TO=\${PJSIP_HEADER(read,To)})
  same => n,AGI(gs-agi.py,in,\${EXTEN},"\${GS_TO}",\${CALLERID(num)})
+ same => n,GotoIf(\$["\${GS_PROBE}" = "1"]?probe)
  same => n,GotoIf(\$["\${GS_OK}" = "1"]?ok)
  same => n,Playback(ss-noservice)
  same => n,Hangup()
+ same => n(probe),Hangup(17)
  same => n(ok),Set(CHANNEL(hangup_handler_push)=gs-charge,s,1(\${GS_CALLID}))
  same => n,Set(__TRANSFER_CONTEXT=gs-transfer)
  same => n,GotoIf(\$["\${GS_MODE}" = "ivr"]?gs-ivr,s,1)
@@ -824,7 +826,8 @@ EOF
 chown -R asterisk:asterisk /opt/gsvoice /var/lib/gsvoice /etc/gsvoice; chmod 640 "$GSJ"; chmod 750 /etc/gsvoice
 echo '41 5 * * * asterisk /usr/bin/python3 /opt/gsvoice/gsvoice.py daily >/dev/null 2>&1' > /etc/cron.d/gsvoice-daily   # releases numbers unpaid 30+ days
 rm -f /etc/cron.d/gsvoice-sinch
-echo '*/5 * * * * asterisk /usr/bin/python3 /opt/gsvoice/gsvoice.py auto-adopt --quiet >/dev/null 2>&1' > /etc/cron.d/gsvoice-adopt   # numbers bought in the Telnyx portal / Sinch dashboard join the pool by themselves
+echo '*/5 * * * * asterisk /usr/bin/python3 /opt/gsvoice/gsvoice.py auto-adopt --quiet >/dev/null 2>&1' > /etc/cron.d/gsvoice-adopt
+echo '2-59/5 * * * * asterisk /usr/bin/python3 /opt/gsvoice/gsvoice.py carrier-watch >/dev/null 2>&1' > /etc/cron.d/gsvoice-watch   # outage alarm: test incoming calls on both carriers   # numbers bought in the Telnyx portal / Sinch dashboard join the pool by themselves
 # Security report: root collects fail2ban numbers (only root can), the report itself runs as asterisk and is emailed ~6 AM Central
 cat > /usr/local/bin/gsvoice-f2b <<'EOF'
 #!/bin/bash
