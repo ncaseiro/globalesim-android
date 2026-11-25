@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="gs_blue">#0B3D91</color>
+    <color name="gs_green">#12A150</color>
+    <color name="gs_paper">#F5F8FC</color>
+    <style name="Theme.GsMobile" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:colorPrimary">@color/gs_blue</item>
+        <item name="android:colorAccent">@color/gs_green</item>
+        <item name="android:windowBackground">@color/gs_paper</item>
+        <item name="android:statusBarColor">@color/gs_blue</item>
+        <item name="android:navigationBarColor">#FFFFFF</item>
+    </style>
+</resources>
