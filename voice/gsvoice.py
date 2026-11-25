@@ -965,8 +965,11 @@ def watch_targets(con):
     W = C["watch"]
     t = digits(W.get("telnyx_did") or "")
     if not t:
-        for q in ("SELECT did d, phone_id p FROM customers WHERE status='active' AND did<>''", "SELECT did d, phone_id p FROM departments WHERE did<>''",
-                  "SELECT number d, phone_id p FROM stock"):
+        # a spare pool number first: the test ends as "busy", and on a customer's number that sends it to their
+        # backup phone (it rang the owner's cell every 5 minutes). Customer numbers only when the pool is empty.
+        for q in ("SELECT number d, phone_id p FROM stock", "SELECT did d, phone_id p FROM departments WHERE did<>''",
+                  "SELECT did d, phone_id p FROM customers WHERE status='active' AND did<>'' AND COALESCE(backup_to,'')=''",
+                  "SELECT did d, phone_id p FROM customers WHERE status='active' AND did<>''"):
             r = next((r for r in con.execute(q) if r["p"] and not is_alt(r["p"]) and len(digits(r["d"])) == 11), None)
             if r: t = digits(r["d"]); break
     s_ = digits(W.get("sinch_did") or "")
