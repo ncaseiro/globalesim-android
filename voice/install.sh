@@ -316,6 +316,27 @@ force_rport=yes
 rewrite_contact=yes
 dtmf_mode=rfc4733
 
+; the same carrier, used only for 911/933 calls that know the phone's GPS position: a PIDF-LO
+; (geolocation.conf, filled in per call by [gs-geo]) goes in the INVITE, as Telnyx asks
+[carrier911]
+type=endpoint
+transport=transport-udp
+context=from-carrier
+allow_transfer=no
+disallow=all
+allow=ulaw,alaw
+outbound_auth=carrier-auth
+aors=carrier
+$( [ "$PROVIDER" = didlogic ] && echo "from_user=$DL_USER" )
+from_domain=$DL_SERVER
+send_pai=yes
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+dtmf_mode=rfc4733
+geoloc_outgoing_call_profile=gs_e911
+
 [carrier]
 type=aor
 contact=sip:$DL_SERVER
@@ -409,6 +430,24 @@ fi
 echo
 echo "#include pjsip_customers.conf"
 } > pjsip.conf
+
+# 911 location (PIDF-LO). The point here is only a placeholder: [gs-geo] puts the phone's real position in on every call,
+# and calls without a position never use this profile (they go out on [carrier], where Telnyx uses the 911 address on file).
+cat > geolocation.conf <<'EOF'
+[gs_gps]
+type=location
+format=GML
+location_info=shape=Point,pos="0.0 0.0"
+method=LIS
+
+[gs_e911]
+type=profile
+location_reference=gs_gps
+pidf_element=tuple
+usage_rules=retransmission-allowed=yes
+allow_routing_use=yes
+profile_precedence=prefer_incoming
+EOF
 [ -f pjsip_customers.conf ] || echo "; customers are added by gsvoice" > pjsip_customers.conf
 
 E911_ON=0; case "$E911" in y|Y|yes|YES) E911_ON=1;; esac
@@ -531,12 +570,15 @@ exten => s,1,Set(CHANNEL(hangup_handler_push)=gs-qos,s,1(\${ARG1}))
  same => n,Return()
 
 ; After every customer call: charge the minutes (rounded up) and run the robocall check
-; 911/933 from the apps: the phone's GPS position rides along; Telnyx turns it into a PIDF-LO for the 911 center
+; 911/933 from the apps: the phone's GPS position goes to Telnyx as a PIDF-LO (RFC 4119 / 5491) in the INVITE,
+; on the [carrier911] endpoint only. Without a position the call uses [carrier] and Telnyx uses the 911 address on file.
 [gs-geo]
 exten => s,1,GotoIf(\$["\${GS_LAT}" = "" | "\${GS_LON}" = ""]?done)
- same => n,Set(PJSIP_HEADER(add,Geolocation)=<cid:location@globalesim.tel>)
- same => n,Set(PJSIP_HEADER(add,X-Latitude)=\${GS_LAT})
- same => n,Set(PJSIP_HEADER(add,X-Longitude)=\${GS_LON})
+ same => n,Set(GEOLOC_PROFILE(format)=GML)
+ same => n,Set(GEOLOC_PROFILE(pidf_element)=tuple)
+ same => n,Set(GEOLOC_PROFILE(location_info)=shape=Point,pos="\${GS_LAT} \${GS_LON}")
+ same => n,Set(GEOLOC_PROFILE(usage_rules)=retransmission-allowed=yes)
+ same => n,Set(GEOLOC_PROFILE(method)=LIS)
  same => n(done),Return()
 
 [gs-charge]
@@ -700,10 +742,10 @@ exten => 911,1,AGI(gs-agi.py,e911,\${CHANNEL(endpoint)})
  same => n,Hangup()
  same => n(go),Set(CALLERID(all)=<\${GS_CID}>)
  same => n,GotoIf(\$["\${GS_VIA}" != ""]?viasinch)
- same => n,Dial(PJSIP/911@carrier,120,b(gs-geo^s^1))
+ same => n,Dial(PJSIP/911@\${IF(\$["\${GS_LAT}" != ""]?carrier911:carrier)},120,b(gs-geo^s^1))
  same => n,Hangup()
  same => n(viasinch),Dial(PJSIP/911@\${GS_VIA},120)
- same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/911@carrier,120,b(gs-geo^s^1)))
+ same => n,ExecIf(\$["\${DIALSTATUS}" = "CHANUNAVAIL" | "\${DIALSTATUS}" = "CONGESTION"]?Dial(PJSIP/911@carrier,120))
  same => n,Hangup()
 ; Kari's Law: 911 works with or without a leading 9
 exten => 9911,1,Goto(from-customer,911,1)
@@ -714,7 +756,7 @@ exten => 933,1,AGI(gs-agi.py,e933,\${CHANNEL(endpoint)})
  same => n,Hangup()
  same => n(go),Set(CALLERID(all)=<\${GS_CID}>)
  same => n,GotoIf(\$["\${GS_VIA}" = "sinch"]?viasinch)
- same => n,Dial(PJSIP/933@carrier,60,b(gs-geo^s^1))
+ same => n,Dial(PJSIP/933@\${IF(\$["\${GS_LAT}" != ""]?carrier911:carrier)},60,b(gs-geo^s^1))
  same => n,Hangup()
  same => n(viasinch),Dial(PJSIP/933@sinch,60)
  same => n,Hangup()
@@ -780,7 +822,8 @@ exten => _X.,1,Playback(ss-noservice)
 EOF
 # switch off modules we don't use (and that log errors on Ubuntu)
 # chan_sip (old SIP driver) must stay off: it grabs browser connections on /ws and rejects them
-for m in chan_sip.so res_config_ldap.so res_geolocation.so res_phoneprov.so res_pjsip_phoneprov_provider.so chan_iax2.so chan_skinny.so chan_mgcp.so chan_unistim.so; do
+sed -i "/^noload => res_geolocation\\.so\$/d; /^noload => res_pjsip_geolocation\\.so\$/d" modules.conf   # 911 location (PIDF-LO) needs these
+for m in chan_sip.so res_config_ldap.so res_phoneprov.so res_pjsip_phoneprov_provider.so chan_iax2.so chan_skinny.so chan_mgcp.so chan_unistim.so; do
   sed -i "/^noload => ${m//./\\.}\$/d" modules.conf                       # old copies (some landed outside [modules])
   sed -i "/^\[modules\]/a noload => $m" modules.conf                     # must be inside [modules] to count
 done
