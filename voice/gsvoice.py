@@ -27,7 +27,10 @@ DEFAULTS = {
     "voipms_sell": False,      # offer/buy VoIP.ms numbers for customers (voice only — texting stays on Telnyx numbers)   # registration backup carrier (installer: VoIP.ms) — endpoint name and its own test number
     "sinch_sell": False,       # offer/buy Sinch numbers for customers (off: Sinch trunk is trial-only — keep it as backup only)
     "plans": {"num300": {"name": "GlobaleSIM Number 300", "minutes": 300}, "num1000": {"name": "GlobaleSIM Number 1000", "minutes": 1000},
-              "biz_ext": {"name": "GlobaleSIM Business extension", "minutes": 1000}},
+              "biz_ext": {"name": "GlobaleSIM Business extension", "minutes": 1000},
+              # GlobaleSIM Mobile wireless plans (number + minutes; the data eSIM is handled by app.php)
+              "wl3": {"name": "GlobaleSIM Mobile Basic", "minutes": 500}, "wl5": {"name": "GlobaleSIM Mobile Standard", "minutes": 1500},
+              "wl15": {"name": "GlobaleSIM Mobile Plus", "minutes": 2000}},
     # business lines: busier than personal lines, still capped (per extension)
     "limits_biz": {"new_calls_per_10min": 20, "calls_per_day": 300, "robocall_calls": 40, "robocall_short_calls": 30},
     # where voicemail / alerts are reported (app.php?api=voice_hook), with a shared secret
