@@ -1820,9 +1820,12 @@ def _agi_modes(a, mode, args):
             to_raw = args[2] if len(args) > 2 else ""; caller = digits(args[3]) if len(args) > 3 else ""
             did = num(to_raw) or num(args[1]) or num("sip:" + args[1] + "@")
             for pn in ("telnyx", "sinch", "voipms"):        # our own carrier test call: note it arrived and reject it unanswered (free)
+                # Matched by the number dialed + the moment it was sent (one test call each round). Not by caller ID:
+                # carriers may replace it with the account's default number, and then the test rang a real line.
                 pr = json.loads(setting(con, "watch_probe_" + pn) or "{}")
-                if pr and pr.get("to") in (did, num(to_raw)) and caller[-10:] == str(pr.get("from", ""))[-10:] and \
-                        time.time() - float(pr.get("at", 0)) < 120:
+                sent = float(pr.get("at", 0)) if pr else 0
+                if pr and pr.get("to") in (did, num(to_raw)) and time.time() - sent < 45 and \
+                        float(setting(con, "watch_hit_" + pn) or 0) < sent:
                     set_setting(con, "watch_hit_" + pn, str(time.time())); con.commit(); a.set("GS_PROBE", "1"); return
             did = (C.get("did_alias") or {}).get(did, did)   # a backup-carrier (Sinch) number that rings like one of our numbers
             cust = con.execute("SELECT * FROM customers WHERE did=? AND status='active'", (did,)).fetchone()
