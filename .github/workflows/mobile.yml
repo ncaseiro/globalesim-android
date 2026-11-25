@@ -54,7 +54,8 @@ jobs:
           export GS_VERSION_NAME="0.1.$RUN_NO"
           gradle --no-daemon -PlinphoneVer="$LINPHONE_VER" :app:assembleRelease :app:bundleRelease
           mkdir -p ../out
-          cp app/build/outputs/apk/release/*.apk ../out/GlobaleSIM-Mobile-$GS_VERSION_NAME.apk
+          for f in app/build/outputs/apk/release/*.apk; do abi=$(basename "$f" | grep -oE 'arm64-v8a|armeabi-v7a'); cp "$f" ../out/GlobaleSIM-Mobile-$GS_VERSION_NAME-$abi.apk; done
+          ls -la ../out
           cp app/build/outputs/bundle/release/*.aab ../out/GlobaleSIM-Mobile-play-$GS_VERSION_NAME.aab
           cp app/build/outputs/mapping/release/mapping.txt ../out/mapping-mobile-$GS_VERSION_NAME.txt 2>/dev/null || true
           echo "versionCode $GS_VERSION_CODE, versionName $GS_VERSION_NAME, Linphone $LINPHONE_VER" | tee ../out/version.txt
@@ -65,15 +66,15 @@ jobs:
           name: GlobaleSIM-Mobile-apk
           path: out/*
 
-      # Latest build on the 'mobile-uploads' branch: the APK can be downloaded on a phone for testing,
-      # and Play Console can take the .aab from there.
-      - name: Publish to mobile-uploads branch
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        run: |
-          set -e
-          mkdir pu && cd pu
-          git init -q && git checkout -q -b mobile-uploads
-          cp ../out/* .
-          git add -A
-          git -c user.name="GlobaleSIM CI" -c user.email="ci@globalesim.tel" commit -qm "Mobile build $(cat version.txt)"
-          git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" mobile-uploads
+      # Latest build as a GitHub Release ("mobile-latest"): open it on a phone to download the test APK
+      # (arm64 = almost every phone from the last 6 years). Play Console takes the .aab from there too.
+      - name: Publish test release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mobile-latest
+          name: GlobaleSIM Mobile (latest test build)
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          body_path: out/version.txt
+          files: out/*

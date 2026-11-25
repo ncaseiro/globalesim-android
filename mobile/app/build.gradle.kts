@@ -46,6 +46,15 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     packaging { jniLibs { useLegacyPackaging = false } }
+    // test APKs per phone type (smaller downloads); Google Play gets the .aab and splits it itself
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a")
+            isUniversalApk = false
+        }
+    }
 }
 
 dependencies {
