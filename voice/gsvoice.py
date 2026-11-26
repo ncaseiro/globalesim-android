@@ -1830,8 +1830,10 @@ def _agi_modes(a, mode, args):
                 # carriers may replace it with the account's default number, and then the test rang a real line.
                 pr = json.loads(setting(con, "watch_probe_" + pn) or "{}")
                 sent = float(pr.get("at", 0)) if pr else 0
+                # A repeat attempt of the same test call (the carrier retries after our "busy") must not ring the line either:
+                # within the window, the first arrival counts, and any later one from the test's own caller ID too.
                 if pr and pr.get("to") in (did, num(to_raw)) and time.time() - sent < 45 and \
-                        float(setting(con, "watch_hit_" + pn) or 0) < sent:
+                        (float(setting(con, "watch_hit_" + pn) or 0) < sent or (caller and caller[-10:] == digits(pr.get("from", ""))[-10:])):
                     set_setting(con, "watch_hit_" + pn, str(time.time())); con.commit(); a.set("GS_PROBE", "1"); return
             did = (C.get("did_alias") or {}).get(did, did)   # a backup-carrier (Sinch) number that rings like one of our numbers
             cust = con.execute("SELECT * FROM customers WHERE did=? AND status='active'", (did,)).fetchone()
