@@ -1,0 +1,87 @@
+GLOBALESIM MOBILE — GOOGLE PLAY STORE LISTING (copy & paste)
+=============================================================
+
+Create app (Play Console → All apps → Create app)
+  App name (max 30):      GlobaleSIM Mobile
+  Default language:       English (United States)
+  App or game:            App
+  Free or paid:           Free
+Upload (Testing → Internal testing first, then Production):
+  GlobaleSIM-Mobile-play-0.1.3.aab   (package tel.globalesim.mobile)
+
+Store settings
+  Category:               Communication
+  Contact email:          your GlobaleSIM support email
+  Website:                https://mobile.globalesim.tel
+  Privacy policy:         https://globalesim.tel/privacy
+  Contains ads:           No
+
+
+SHORT DESCRIPTION (max 80)
+--------------------------
+Your own US phone number with a data plan. Call on Wi-Fi or mobile data.
+
+
+FULL DESCRIPTION
+----------------
+GlobaleSIM Mobile is a simple US phone plan: your own phone number, calling minutes and a US data eSIM — all in one app.
+
+ONE APP FOR YOUR NUMBER AND YOUR DATA
+• Your own US phone number for calls to and from the US and Canada
+• A US data eSIM that refills every month on the same eSIM
+• See your data left and minutes left at a glance
+• Running low? Add data in a few taps — no new eSIM, no new QR code
+
+CALLS THAT SAVE YOUR DATA
+• On Wi-Fi, calls use no mobile data
+• Out and about, calls use only a little data over 4G/5G
+• The app shows whether you're on Wi-Fi or cellular
+
+EVERYTHING A PHONE NEEDS
+• Keypad, recent calls and voicemail
+• Incoming calls ring even when the app is closed
+• Receive text messages
+• 911 with your location (US)
+
+PLANS
+Choose Basic, Standard or Plus at mobile.globalesim.tel — pay monthly with PayPal and cancel any time. Then sign in to this app with the same email.
+
+For personal (residential) use. Your phone must support eSIM.
+
+GlobaleSIM Mobile is a service of First Class Services LLC, Princeton, Texas.
+
+
+WHAT'S NEW (release notes)
+--------------------------
+First release of GlobaleSIM Mobile.
+
+
+GRAPHICS
+--------
+App icon 512×512:        play-icon-512.png
+Feature graphic:          play-feature-graphic-1024x500.png
+Phone screenshots (2–8):  take real screenshots on the phone (Power + Volume down), not photos:
+                          1) Home (number, data left, minutes)  2) Keypad  3) A call in progress
+                          4) Add data sheet  5) My plan
+
+
+APP CONTENT (Policy → App content)
+----------------------------------
+App access:       "All or some functionality is restricted" → give the review sign-in
+                  (the reviewer email + how to get the code). Enter it yourself — don't share it in chat.
+Ads:              No ads
+Content rating:   Questionnaire → category "Communication"; users can talk to each other: Yes
+                  (calls). No violence, etc. → expected rating: Everyone / PEGI 3 (with "Users interact")
+Target audience:  18 and over
+Data safety (what the app collects — none of it is sold or shared for ads):
+  • Personal info: Name, Email address, Address (911 service address) — Account management, App functionality
+  • Phone number — App functionality
+  • Location: Precise + Approximate — App functionality (sent only when you dial 911)
+  • Audio: Voice (calls) — App functionality, processed in real time, not stored
+    (voicemails callers leave are stored for the account owner)
+  • App activity / call history — App functionality
+  • Data is encrypted in transit: Yes · Users can request deletion: Yes (Account → Delete account)
+Permission declarations Play may ask for (same as the GlobaleSIM app):
+  • Foreground service (microphone + special use): "keeps a phone call running while the screen is off / the app is in the background"
+  • Full-screen intent: "shows the incoming call screen — this is a calling app"
+  • Location: "shared with the 911 center only when the user dials 911"
