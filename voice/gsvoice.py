@@ -53,7 +53,7 @@ DEFAULTS = {
     "alert_kinds": ["auto_suspend", "guard_trip", "e911_failed", "release_failed", "low_balance", "line_flood", "backup_failed",
                     "carrier_unregistered", "carrier_registered"],
     "topup_minutes": 300,
-    "limits": {"new_calls_per_10min": 5, "calls_per_day": 100, "new_account_days": 7, "new_account_minutes": 100,
+    "limits": {"new_calls_per_10min": 5, "calls_per_day": 100, "new_account_days": 7, "new_account_minutes": 100, "heavy_day_minutes": 300,
                "robocall_window_min": 30, "robocall_calls": 8, "robocall_short_sec": 15, "robocall_short_calls": 6},
     "reload_cmd": ["asterisk", "-rx", "module reload res_pjsip.so"],
     # receive-only texting: Telnyx → webhook /api/sms/in/<sms_hook_token> → Asterisk (AMI MessageSend) → the app
@@ -321,10 +321,26 @@ def usage(con, cust, t=None):
     included = plan["minutes"]
     L = C["limits"]
     created = dt.datetime.fromisoformat(cust["created_at"]).replace(tzinfo=dt.timezone.utc)
-    new_account = (t - created).days < L["new_account_days"]
-    if new_account: included = min(included, L["new_account_minutes"])
+    # Personal lines get their full plan minutes from day one (customers see what they paid for).
+    # New-line abuse is watched instead: heavy_use_check() alerts the owner, robocall_check() pauses robocalling.
     return {"period_start": ps, "included": included, "extra": extra, "used": used,
-            "remaining": max(0, included + extra - used), "new_account_limit": new_account}
+            "remaining": max(0, included + extra - used), "new_account_limit": False}
+
+def heavy_use_check(con, cust):
+    """Warn the owner (alert email, at most once a day per line and reason) when a line calls out a lot:
+    a new line (first days) past new_account_minutes, or any line past heavy_day_minutes in 24 h. Never blocks a call."""
+    L = C["limits"]; u = cust["sip_user"]; t = now(); day = iso(t - dt.timedelta(days=1))
+    out = lambda since: con.execute("SELECT COALESCE(SUM(minutes),0), COUNT(*), COUNT(DISTINCT peer) FROM calls WHERE sip_user=? AND direction='out' AND started_at>=?", (u, since)).fetchone()
+    created = dt.datetime.fromisoformat(cust["created_at"]).replace(tzinfo=dt.timezone.utc)
+    checks = []
+    if (t - created).days < L["new_account_days"]:
+        m, n, p = out(cust["created_at"])
+        if m >= L["new_account_minutes"]: checks.append(("new", f"NEW line ({(t - created).days + 1} days old): {m} min out in {n} calls to {p} numbers"))
+    m, n, p = out(day)
+    if m >= int(L.get("heavy_day_minutes", 300)): checks.append(("day", f"{m} min out in 24 h ({n} calls to {p} numbers)"))
+    for why, txt in checks:
+        if con.execute("SELECT 1 FROM events WHERE sip_user=? AND kind='heavy_use' AND detail LIKE ? AND ts>=?", (u, f"[{why}]%", day)).fetchone(): continue
+        event(con, u, "heavy_use", f"[{why}] {fmt_num(cust['did']) if cust['did'] else u} {cust['email']}: {txt}")
 
 def event(con, user, kind, detail=""):
     con.execute("INSERT INTO events (sip_user, ts, kind, detail) VALUES (?,?,?,?)", (user, iso(now()), kind, detail))
@@ -1609,7 +1625,7 @@ def alert_loop():
         try:
             with _lock, db() as con:
                 last = int(setting(con, "alert_last_id", "0") or 0)
-                kinds = C["alert_kinds"]
+                kinds = list(dict.fromkeys(list(C["alert_kinds"]) + ["heavy_use"]))
                 rows = con.execute(f"SELECT * FROM events WHERE id>? AND kind IN ({','.join('?' * len(kinds))}) ORDER BY id LIMIT 100", (last, *kinds)).fetchall()
                 top = con.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
                 set_setting(con, "alert_last_id", top); con.commit()
@@ -1640,6 +1656,7 @@ def alert_loop():
 ALERT_TITLES = {"auto_suspend": "ALERT: a line was paused for robocall-like calling", "guard_trip": "ALERT: all outgoing calls paused (master shutoff)",
                 "e911_failed": "ALERT: a 911 address was not accepted", "release_failed": "ALERT: a number could not be released",
                 "low_balance": "ALERT: Telnyx balance is low", "line_flood": "ALERT: unusual number of new lines",
+                "heavy_use": "WARNING: a line is calling out a lot (check for robocalling)",
                 "backup_failed": "ALERT: a backup number could not be changed at Telnyx",
                 "carrier_down": "OUTAGE: incoming test call failed", "carrier_ok": "Restored: incoming test call works again",
                 "carrier_unregistered": "OUTAGE: the voice server is NOT signed in to Telnyx — calls are failing",
@@ -1652,6 +1669,7 @@ ALERT_HELP = {"carrier_unregistered": "Calls in and out through Telnyx fail unti
               "e911_failed": "Fix the customer's 911 address (contact them), then retry.",
               "low_balance": "Add funds at Telnyx, or calls and number purchases will stop.",
               "line_flood": "Many new lines in 24 hours. Check that they are real customers.",
+              "heavy_use": "Nothing was blocked. Open the line in /phone-admin and look at its recent calls: many short calls to many different numbers = robocalling → pause the line. Long calls to a few numbers = a real heavy user.",
               "backup_failed": "Open the number in the Telnyx portal → Voice → Call forwarding and set it by hand. A pooled number must have forwarding OFF."}
 
 def report_main():
@@ -2062,6 +2080,9 @@ def _agi_modes(a, mode, args):
                 row = con.execute("SELECT c.* FROM customers c JOIN calls k ON k.sip_user=c.sip_user WHERE k.id=? AND k.direction='out'", (cid,)).fetchone()
                 if row and row["status"] == "active" and robocall_check(con, row):
                     con.commit(); write_pjsip(con)
+                elif row and row["status"] == "active" and mins > 0:
+                    try: heavy_use_check(con, row)
+                    except Exception as e: sys.stderr.write("heavy_use %r\n" % e)
         con.commit()
 
 # ---------------------------------------------------------------- API
@@ -2591,7 +2612,7 @@ def api_route(method, path, q, body):
                 con.execute("DELETE FROM voicemails WHERE id=?", (v["id"],)); con.commit(); return {"ok": True}
             return {k: v[k] for k in v.keys() if k != "file"}
         if p == ["alerts"]:
-            return {"events": [dict(r) for r in con.execute("SELECT * FROM events WHERE kind IN ('auto_suspend','blocked_out','blocked_in','unknown_in','text_unknown','e911_failed','release_failed','released','guard_trip','guard_set','low_balance','line_flood') ORDER BY id DESC LIMIT 200")]}
+            return {"events": [dict(r) for r in con.execute("SELECT * FROM events WHERE kind IN ('auto_suspend','blocked_out','blocked_in','unknown_in','text_unknown','e911_failed','release_failed','released','guard_trip','guard_set','low_balance','line_flood','heavy_use') ORDER BY id DESC LIMIT 200")]}
         if len(p) >= 2 and p[0] == "customers":
             c = con.execute("SELECT * FROM customers WHERE sip_user=?", (p[1],)).fetchone()
             if not c: raise ApiError(404, "no such customer")
