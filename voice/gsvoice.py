@@ -1837,6 +1837,9 @@ def _agi_modes(a, mode, args):
                         "company": co["name"] if co else "", "owner_email": co["owner_email"] if co else "", "gps": geo_text(g)}
                 notify_detached("e911_call", info)
         elif mode == "in":                # in <exten> <to-header> <caller>
+            # "_." in the dial plan also matches the hangup extension "h": when the caller hangs up while it rings,
+            # Asterisk runs it again — that is not a second call (it showed twice in the app's recent calls)
+            if len(args) > 1 and args[1] in ("h", "i", "t", "s"): a.set("GS_PROBE", "1"); return
             # the dialed number = user part of the To URI (never the host/port digits), else the extension
             def num(x):
                 m = re.search(r"sip:\+?(\d{7,15})@", x or ""); d = m.group(1) if m else (digits(x) if len(digits(x or "")) <= 15 else "")

@@ -468,6 +468,7 @@ BK_PFX=$( [ -n "$BK_USER" ] || echo "+" )
 
 ; Calls coming in from the carrier to your number -> ring the test phone
 [from-carrier]
+exten => h,1,NoOp(caller hung up)
 exten => _.,1,Set(GS_TO=\${PJSIP_HEADER(read,To)})
  same => n,AGI(gs-agi.py,in,\${EXTEN},"\${GS_TO}",\${CALLERID(num)})
  same => n,GotoIf(\$["\${GS_PROBE}" = "1"]?probe)
