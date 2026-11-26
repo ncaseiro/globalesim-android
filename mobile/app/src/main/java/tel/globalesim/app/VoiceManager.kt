@@ -92,7 +92,7 @@ object VoiceManager {
             c.clearAllAuthInfo()
         }
         regState = "none"; emit(snapshot())
-        Ringer.stop(); CallNotif.cancelIncoming(app); VoiceService.stop(app)
+        Ringer.stop(); CallNotif.cancelIncoming(app); VoiceService.stop(app); BootLineService.stop(app)
     }
 
     private fun applyLogin(o: JSONObject) {

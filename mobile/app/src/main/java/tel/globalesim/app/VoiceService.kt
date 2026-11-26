@@ -59,6 +59,7 @@ class VoiceService : Service() {
         CallNotif.channels(this)
         foreground(false)
         VoiceManager.init(this)
+        BootLineService.stop(this)          // the full service took over from the after-reboot one
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -96,11 +97,42 @@ class VoiceService : Service() {
     }
 }
 
-/** Restart the line after the phone reboots or the app is updated. */
+/** Restart the line after the phone reboots or the app is updated.
+ *  Android 15+ forbids starting a microphone-type foreground service from BOOT_COMPLETED, so the
+ *  reboot path uses [BootLineService] (special-use type only): it keeps the line signed in so calls
+ *  ring; the full [VoiceService] (with microphone) starts when the app or a call screen opens. */
 class VoiceBootReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
         if (intent.action == Intent.ACTION_BOOT_COMPLETED || intent.action == Intent.ACTION_MY_PACKAGE_REPLACED ||
-            intent.action == "android.intent.action.LOCKED_BOOT_COMPLETED") VoiceService.start(ctx)
+            intent.action == "android.intent.action.LOCKED_BOOT_COMPLETED") BootLineService.start(ctx)
+    }
+}
+
+/** After a reboot / app update: keeps the line registered with a quiet notification (special use only). */
+class BootLineService : Service() {
+    companion object {
+        fun start(ctx: Context) {
+            if (!VoiceManager.hasLogin(ctx) || VoiceService.instance != null) return
+            val i = Intent(ctx, BootLineService::class.java)
+            runCatching { if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i) }
+        }
+        fun stop(ctx: Context) { runCatching { ctx.stopService(Intent(ctx, BootLineService::class.java)) } }
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        CallNotif.channels(this)
+        val n = CallNotif.line(this, VoiceManager.regText())
+        if (Build.VERSION.SDK_INT >= 34) runCatching { startForeground(CallNotif.ID_LINE, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE) }
+        else runCatching { startForeground(CallNotif.ID_LINE, n) }
+        VoiceManager.init(this)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!VoiceManager.hasLogin(this)) { stopSelf(); return START_NOT_STICKY }
+        return START_STICKY
     }
 }
 
