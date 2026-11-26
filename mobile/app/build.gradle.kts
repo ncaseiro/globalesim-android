@@ -9,12 +9,12 @@ val linphoneVer: String = (project.findProperty("linphoneVer") as String?) ?: "5
 
 android {
     namespace = "tel.globalesim.app"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "tel.globalesim.mobile"
         minSdk = 28
-        targetSdk = 35
+        targetSdk = 36
         versionCode = (System.getenv("GS_VERSION_CODE") ?: "1").toInt()
         versionName = System.getenv("GS_VERSION_NAME") ?: "0.1"
     }
