@@ -2270,6 +2270,13 @@ def api_route(method, path, q, body):
             out = []
             for n in nums:
                 d = digits(n.get("phone_number")); c = con.execute("SELECT * FROM customers WHERE did=?", (d,)).fetchone()
+                c2 = None if c else con.execute("SELECT * FROM customers WHERE did2=? OR did2_pending=?", (d, d)).fetchone()   # a line's second (Mexican…) number
+                if c2:
+                    out.append({"id": n.get("id"), "number": d, "status": n.get("status"), "connection": n.get("connection_name") or "",
+                                "billing": billing.get(n.get("id")) or "pay-per-minute", "e911": False, "purchased_at": (n.get("purchased_at") or n.get("created_at") or "")[:10],
+                                "use": "second", "country": c2["did2_cc"] or "", "pending": not c2["did2"], "dept": "", "email": c2["email"], "sip_user": c2["sip_user"],
+                                "line_status": c2["status"], "company": "", "ext": "", "available_at": "", "prev_email": "", "pool_note": "", "carrier": "Telnyx"})
+                    continue
                 co = co_of(con, c) if c else None
                 out.append({"id": n.get("id"), "number": d, "status": n.get("status"), "connection": n.get("connection_name") or "",
                             "billing": billing.get(n.get("id")) or "pay-per-minute", "e911": bool(n.get("emergency_enabled")),
