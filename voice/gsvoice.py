@@ -117,7 +117,7 @@ def db():
                      ("vm_on", "INTEGER DEFAULT 1"), ("web_pass", "TEXT"), ("web_exp", "TEXT"),
                      ("fwd_mode", "TEXT DEFAULT ''"), ("fwd_to", "TEXT"), ("dnd", "INTEGER DEFAULT 0"),
                      ("desk_pass", "TEXT"), ("desk_brand", "TEXT"), ("desk_mac", "TEXT"), ("billing", "TEXT DEFAULT 'paypal'"), ("admin_note", "TEXT"),
-                     ("backup_to", "TEXT"), ("did2", "TEXT"), ("phone_id2", "TEXT"), ("did2_cc", "TEXT")):
+                     ("backup_to", "TEXT"), ("did2", "TEXT"), ("phone_id2", "TEXT"), ("did2_cc", "TEXT"), ("did2_pending", "TEXT")):
         if col not in cols: con.execute(f"ALTER TABLE customers ADD COLUMN {col} {typ}")
     kc = {r[1] for r in con.execute("PRAGMA table_info(calls)")}
     for col, typ in (("q_jitter", "REAL"), ("q_loss", "REAL"), ("q_rtt", "REAL"), ("q_mos", "REAL"), ("q_pkts", "INTEGER"), ("q_ip", "TEXT"), ("q_dev", "TEXT"),
@@ -387,9 +387,17 @@ def intl_minutes(con, cust, cc):
                     (cust["sip_user"], x["code"] + "%", iso(ps))).fetchone()
     return int(r[0] or 0)
 
-def telnyx_buy_intl(cc, want="", ndc=""):
-    """Buy a number in another country (MX…) from Telnyx: the picked one, else one with the same area code. (num, phone_id)"""
+class IntlPending(Exception):
+    """The number order went through but waits for Telnyx's regulatory approval (minutes to a day or two)."""
+    def __init__(self, num): super().__init__(num); self.num = num
+
+def telnyx_buy_intl(cc, want="", ndc="", taken=()):
+    """Buy a number in another country (MX…) from Telnyx: the picked one, else one with the same area code. (num, phone_id).
+    A number that is already ours at Telnyx and on nobody's line is used as is. IntlPending = ordered, waiting for approval."""
     x = C["intl"][cc]; cands = [want] if want else []
+    if want and want not in taken:
+        pid = telnyx_phone_id(want)
+        if pid: return want, pid
     try:
         params = {"filter[country_code]": cc, "filter[features][]": "voice", "filter[limit]": "5"}
         if digits(ndc): params["filter[national_destination_code]"] = digits(ndc)[:3]
@@ -404,14 +412,18 @@ def telnyx_buy_intl(cc, want="", ndc=""):
             err = e.msg; continue
         st = ((r.get("data") or {}).get("status") or "")
         if st in ("failure", "failed"): err = "order " + st; continue
-        pid = telnyx_phone_id(n, tries=12)
+        pid = telnyx_phone_id(n, tries=6)
         if pid: return n, pid
-        err = "order " + (st or "pending") + " — Telnyx may need documents for this number"
+        raise IntlPending(n)
     raise ApiError(409, "no number available there — try another city" + (f" ({err[:160]})" if err else ""))
 
 def drop_did2(con, c, why):
     """Remove a line's second (international) number and give it back to Telnyx."""
-    if not c["did2"]: return True
+    if not c["did2"]:
+        if c["did2_pending"]:
+            con.execute("UPDATE customers SET did2_pending=NULL, did2_cc=NULL WHERE sip_user=?", (c["sip_user"],))
+            event(con, c["sip_user"], "did2_off", f"{c['did2_pending']} (still pending at Telnyx — cancel that order in the portal) {why}")
+        return True
     ok = True
     if c["phone_id2"] and C["telnyx_api_key"]:
         try: telnyx("DELETE", f"/phone_numbers/{c['phone_id2']}")
@@ -1020,9 +1032,26 @@ def telnyx_adopt_new(say=print):
             event(con, "admin", "stock_adopt", d + " (Telnyx, automatic)"); con.commit(); added += 1; say(f"  {d}: added to the pool (Telnyx)")
     return added
 
+def intl_pending_check(say=print):
+    """Second numbers that were waiting for Telnyx approval: once active, connect them to their line. Returns how many."""
+    if not C["telnyx_api_key"]: return 0
+    n = 0
+    with _lock, db() as con:
+        for c in con.execute("SELECT * FROM customers WHERE did2_pending IS NOT NULL AND did2 IS NULL").fetchall():
+            try: pid = telnyx_phone_id(c["did2_pending"])
+            except ApiError: continue
+            if not pid: continue
+            con.execute("UPDATE customers SET did2=?, phone_id2=?, did2_pending=NULL WHERE sip_user=?", (c["did2_pending"], pid, c["sip_user"]))
+            event(con, c["sip_user"], "did2", f"{c['did2_cc']} {c['did2_pending']} approved by Telnyx — connected"); con.commit(); n += 1
+            say(f"  {c['did2_pending']}: approved, connected to {c['email']}")
+            notify_site("did2_ready", {"email": c["email"], "country": c["did2_cc"], "did2": c["did2_pending"]})
+    return n
+
 def auto_adopt(say=print):
     """Both carriers: new numbers bought in their portals join the pool by themselves (cron every 5 min + admin button)."""
     out = {"telnyx": 0, "sinch": 0, "voipms": 0, "errors": []}
+    try: intl_pending_check(say)
+    except Exception as e: out["errors"].append("pending numbers: " + str(e)[:150])
     try: out["telnyx"] = telnyx_adopt_new(say)
     except ApiError as e: out["errors"].append("Telnyx: " + e.msg[:150])
     if sinch_on():
@@ -1358,7 +1387,7 @@ def to_pool(con, c, why):
 def release_number(con, c, why):
     """Line closes: its number goes to our pool (see to_pool), the line is canceled. A second (international) number is released."""
     to_pool(con, c, why)
-    if c["did2"]: drop_did2(con, c, why)
+    if c["did2"] or c["did2_pending"]: drop_did2(con, c, why)
     con.execute("UPDATE customers SET status='canceled', note=? WHERE sip_user=?", (why, c["sip_user"]))
     event(con, c["sip_user"], "released", f"{c['did']} {why}")
     return True
@@ -2154,7 +2183,9 @@ def cust_json(con, c):
     d = {k: c[k] for k in c.keys() if k not in ("sip_pass", "web_pass", "push_token")}
     d["push"] = bool(c["push_token"]) if "push_token" in c.keys() else False
     d["usage"] = usage(con, c); d["plan_name"] = C["plans"].get(c["plan"], {}).get("name", c["plan"])
-    if "did2_cc" in c.keys() and c["did2_cc"] in (C.get("intl") or {}):
+    if "did2_cc" in c.keys() and c["did2_cc"] in (C.get("intl") or {}) and not c["did2"] and c["did2_pending"]:
+        d["intl_pending"] = {"country": c["did2_cc"], "did": c["did2_pending"]}
+    elif "did2_cc" in c.keys() and c["did2_cc"] in (C.get("intl") or {}):
         d["intl"] = {"country": c["did2_cc"], "did": c["did2"], "used": intl_minutes(con, c, c["did2_cc"]), "max": int(C["intl"][c["did2_cc"]].get("max_minutes", 0))}
     return d
 
@@ -2704,8 +2735,14 @@ def api_route(method, path, q, body):
                     if (c["did2_cc"] or "") == cc: return dict(cust_json(con, c), already=True)
                     raise ApiError(409, "this line already has a second number")
                 want = digits(body.get("phone_number"))
-                num, pid = telnyx_buy_intl(cc, want, digits(body.get("ndc")))
-                con.execute("UPDATE customers SET did2=?, phone_id2=?, did2_cc=? WHERE sip_user=?", (num, pid, cc, u))
+                taken = {r[0] for r in con.execute("SELECT did2 FROM customers WHERE did2 IS NOT NULL UNION SELECT did2_pending FROM customers WHERE did2_pending IS NOT NULL AND sip_user<>?", (u,))}
+                try: num, pid = telnyx_buy_intl(cc, want, digits(body.get("ndc")), taken)
+                except IntlPending as ip:
+                    con.execute("UPDATE customers SET did2_pending=?, did2_cc=? WHERE sip_user=?", (ip.num, cc, u))
+                    event(con, u, "did2_pending", f"{cc} {ip.num} waiting for Telnyx approval"); con.commit()
+                    c = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
+                    return dict(cust_json(con, c), pending=True, did2_pending=ip.num)
+                con.execute("UPDATE customers SET did2=?, phone_id2=?, did2_cc=?, did2_pending=NULL WHERE sip_user=?", (num, pid, cc, u))
                 event(con, u, "did2", f"{cc} {num}" + (" (picked)" if num == want else f" (wanted {want or 'any'})")); con.commit()
                 c = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
                 return dict(cust_json(con, c), picked=(num == want))
