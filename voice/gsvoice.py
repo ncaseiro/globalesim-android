@@ -53,6 +53,9 @@ DEFAULTS = {
     "alert_kinds": ["auto_suspend", "guard_trip", "e911_failed", "release_failed", "low_balance", "line_flood", "backup_failed",
                     "carrier_unregistered", "carrier_registered"],
     "topup_minutes": 300,
+    # second numbers in other countries (an add-on to a line): calls to that number ring the line; calls from the line to that
+    # country are allowed (international calling stays off otherwise) up to max_minutes a month, and show that number
+    "intl": {"MX": {"code": "52", "digits": 10, "max_minutes": 300}},
     "limits": {"new_calls_per_10min": 5, "calls_per_day": 100, "new_account_days": 7, "new_account_minutes": 100, "heavy_day_minutes": 300,
                "robocall_window_min": 30, "robocall_calls": 8, "robocall_short_sec": 15, "robocall_short_calls": 6},
     "reload_cmd": ["asterisk", "-rx", "module reload res_pjsip.so"],
@@ -114,7 +117,7 @@ def db():
                      ("vm_on", "INTEGER DEFAULT 1"), ("web_pass", "TEXT"), ("web_exp", "TEXT"),
                      ("fwd_mode", "TEXT DEFAULT ''"), ("fwd_to", "TEXT"), ("dnd", "INTEGER DEFAULT 0"),
                      ("desk_pass", "TEXT"), ("desk_brand", "TEXT"), ("desk_mac", "TEXT"), ("billing", "TEXT DEFAULT 'paypal'"), ("admin_note", "TEXT"),
-                     ("backup_to", "TEXT")):
+                     ("backup_to", "TEXT"), ("did2", "TEXT"), ("phone_id2", "TEXT"), ("did2_cc", "TEXT")):
         if col not in cols: con.execute(f"ALTER TABLE customers ADD COLUMN {col} {typ}")
     kc = {r[1] for r in con.execute("PRAGMA table_info(calls)")}
     for col, typ in (("q_jitter", "REAL"), ("q_loss", "REAL"), ("q_rtt", "REAL"), ("q_mos", "REAL"), ("q_pkts", "INTEGER"), ("q_ip", "TEXT"), ("q_dev", "TEXT"),
@@ -372,6 +375,52 @@ def guard_check(con):
         return False
     return True
 
+def intl_of(dest):
+    """Country code (MX…) of an international destination we can call, or ''."""
+    for cc, x in (C.get("intl") or {}).items():
+        if dest.startswith(x["code"]) and len(dest) == len(x["code"]) + int(x["digits"]): return cc
+    return ""
+
+def intl_minutes(con, cust, cc):
+    x = C["intl"][cc]; ps = period_start(cust["period_anchor"])
+    r = con.execute("SELECT COALESCE(SUM(minutes),0) FROM calls WHERE sip_user=? AND direction='out' AND peer LIKE ? AND started_at>=?",
+                    (cust["sip_user"], x["code"] + "%", iso(ps))).fetchone()
+    return int(r[0] or 0)
+
+def telnyx_buy_intl(cc, want="", ndc=""):
+    """Buy a number in another country (MX…) from Telnyx: the picked one, else one with the same area code. (num, phone_id)"""
+    x = C["intl"][cc]; cands = [want] if want else []
+    try:
+        params = {"filter[country_code]": cc, "filter[features][]": "voice", "filter[limit]": "5"}
+        if digits(ndc): params["filter[national_destination_code]"] = digits(ndc)[:3]
+        cands += [digits(n.get("phone_number")) for n in telnyx_available(params).get("data", []) if n.get("phone_number")]
+    except ApiError: pass
+    err = ""
+    for n in dict.fromkeys(cands):
+        if not n or not n.startswith(x["code"]): continue
+        try:
+            r = telnyx("POST", "/number_orders", {"phone_numbers": [{"phone_number": "+" + n}], "connection_id": C["telnyx_connection_id"]})
+        except ApiError as e:
+            err = e.msg; continue
+        st = ((r.get("data") or {}).get("status") or "")
+        if st in ("failure", "failed"): err = "order " + st; continue
+        pid = telnyx_phone_id(n, tries=12)
+        if pid: return n, pid
+        err = "order " + (st or "pending") + " — Telnyx may need documents for this number"
+    raise ApiError(409, "no number available there — try another city" + (f" ({err[:160]})" if err else ""))
+
+def drop_did2(con, c, why):
+    """Remove a line's second (international) number and give it back to Telnyx."""
+    if not c["did2"]: return True
+    ok = True
+    if c["phone_id2"] and C["telnyx_api_key"]:
+        try: telnyx("DELETE", f"/phone_numbers/{c['phone_id2']}")
+        except ApiError as e:
+            ok = False; event(con, c["sip_user"], "release_failed", "could not release " + c["did2"] + ": " + e.msg[:150])
+    con.execute("UPDATE customers SET did2=NULL, phone_id2=NULL, did2_cc=NULL WHERE sip_user=?", (c["sip_user"],))
+    event(con, c["sip_user"], "did2_off", f"{c['did2']} {why}")
+    return ok
+
 def check_outbound(con, cust, dest):
     """Returns (ok, reason, max_seconds)."""
     if cust is None: return False, "unknown", 0
@@ -382,6 +431,12 @@ def check_outbound(con, cust, dest):
     if co and co["status"] != "active": return False, "suspended", 0
     u = usage(con, cust)
     if u["remaining"] <= 0: return False, "no_minutes", 0
+    cc = intl_of(dest)
+    if not (dest.startswith("1") and len(dest) == 11):
+        if not cc or (cust["did2_cc"] or "") != cc: return False, "intl_off", 0
+        left = int(C["intl"][cc].get("max_minutes", 0)) - intl_minutes(con, cust, cc)
+        if left <= 0: return False, "intl_minutes", 0
+        u = dict(u, remaining=min(u["remaining"], left))
     L = dict(C["limits"], **(C["limits_biz"] if co else {})); t = now()
     n10 = con.execute("SELECT COUNT(*) FROM calls WHERE sip_user=? AND direction='out' AND started_at>=?", (cust["sip_user"], iso(t - dt.timedelta(minutes=10)))).fetchone()[0]
     if n10 >= L["new_calls_per_10min"]: return False, "rate_10min", 0
@@ -1301,8 +1356,9 @@ def to_pool(con, c, why):
     return True
 
 def release_number(con, c, why):
-    """Line closes: its number goes to our pool (see to_pool), the line is canceled."""
+    """Line closes: its number goes to our pool (see to_pool), the line is canceled. A second (international) number is released."""
     to_pool(con, c, why)
+    if c["did2"]: drop_did2(con, c, why)
     con.execute("UPDATE customers SET status='canceled', note=? WHERE sip_user=?", (why, c["sip_user"]))
     event(con, c["sip_user"], "released", f"{c['did']} {why}")
     return True
@@ -1799,7 +1855,8 @@ def _agi_modes(a, mode, args):
                 co = co_of(con, cust)
                 cur = con.execute("INSERT INTO calls (sip_user, direction, peer, started_at, billsec, result) VALUES (?,?,?,?,0,'dialing')", (user, "out", dest, iso(now())))
                 cid_num = cust["did"] or co_main_did(con, co)
-                if want_cid and want_cid in (cust["did"] or "", co_main_did(con, co) if co else ""): cid_num = want_cid   # only numbers this line may use
+                if cust["did2"] and intl_of(dest) and intl_of(dest) == (cust["did2_cc"] or ""): cid_num = cust["did2"]   # calls to Mexico show the Mexican number
+                if want_cid and want_cid in (cust["did"] or "", cust["did2"] or "", co_main_did(con, co) if co else ""): cid_num = want_cid   # only numbers this line may use
                 con.execute("UPDATE calls SET cid_used=? WHERE id=?", (cid_num, cur.lastrowid))
                 a.set("GS_CALLID", str(cur.lastrowid)); a.set("GS_CID", "+" + cid_num); a.set("GS_MAXMS", str(int(maxsec * 1000)))
                 a.set("GS_CO", f"co{co['id']}" if co else ""); a.set("GS_COMAX", str(max(2, len(co_members(con, co["id"], True)))) if co else "0")
@@ -1858,6 +1915,7 @@ def _agi_modes(a, mode, args):
                     set_setting(con, "watch_hit_" + pn, str(time.time())); con.commit(); a.set("GS_PROBE", "1"); return
             did = (C.get("did_alias") or {}).get(did, did)   # a backup-carrier (Sinch) number that rings like one of our numbers
             cust = con.execute("SELECT * FROM customers WHERE did=? AND status='active'", (did,)).fetchone()
+            if not cust and did: cust = con.execute("SELECT * FROM customers WHERE did2=? AND status='active'", (did,)).fetchone()   # second (Mexican…) number
             dnum = None
             if not cust and did:                  # a department's own direct number: billed to the company's main line
                 dnum = con.execute("SELECT * FROM departments WHERE did=?", (did,)).fetchone()
@@ -2096,6 +2154,8 @@ def cust_json(con, c):
     d = {k: c[k] for k in c.keys() if k not in ("sip_pass", "web_pass", "push_token")}
     d["push"] = bool(c["push_token"]) if "push_token" in c.keys() else False
     d["usage"] = usage(con, c); d["plan_name"] = C["plans"].get(c["plan"], {}).get("name", c["plan"])
+    if "did2_cc" in c.keys() and c["did2_cc"] in (C.get("intl") or {}):
+        d["intl"] = {"country": c["did2_cc"], "did": c["did2"], "used": intl_minutes(con, c, c["did2_cc"]), "max": int(C["intl"][c["did2_cc"]].get("max_minutes", 0))}
     return d
 
 def api_route(method, path, q, body):
@@ -2105,6 +2165,15 @@ def api_route(method, path, q, body):
     with _lock, db() as con:
         if p == ["health"]:
             return {"ok": True, "customers": con.execute("SELECT COUNT(*) FROM customers").fetchone()[0]}
+        if p == ["numbers", "search"] and method == "GET" and (q.get("country") or "US").upper() != "US":
+            cc = q["country"].upper()
+            if cc not in (C.get("intl") or {}): raise ApiError(400, "country not offered")
+            params = {"filter[country_code]": cc, "filter[features][]": "voice", "filter[limit]": str(min(20, int(digits(q.get("limit", "10")) or 10)))}
+            if q.get("ndc"): params["filter[national_destination_code]"] = digits(q["ndc"])[:3]
+            r = telnyx_available(params)
+            return {"numbers": [{"phone_number": n.get("phone_number"), "region": ", ".join(x.get("region_name", "") for x in n.get("region_information", []) if x.get("region_type") in ("rate_center", "location", "state")),
+                                 "monthly": (n.get("cost_information") or {}).get("monthly_cost"), "upfront": (n.get("cost_information") or {}).get("upfront_cost"),
+                                 "type": n.get("phone_number_type") or "", "carrier": "Telnyx"} for n in r.get("data", []) if n.get("phone_number")]}
         if p == ["numbers", "search"] and method == "GET":
             params = {"filter[country_code]": "US", "filter[features][]": "voice", "filter[limit]": q.get("limit", "10")}
             if q.get("area_code"): params["filter[national_destination_code]"] = digits(q["area_code"])[:3]
@@ -2628,6 +2697,21 @@ def api_route(method, path, q, body):
                 co = co_of(con, c)
                 if co: d["company"] = {"id": co["id"], "name": co["name"], "owner": co["owner_email"] == c["email"], "ext": c["ext"], "main_did": co_main_did(con, co)}
                 return d
+            if sub == "did2" and method == "POST":             # add a second number in another country (paid add-on, checked by the website)
+                cc = str(body.get("country") or "").upper()
+                if cc not in (C.get("intl") or {}): raise ApiError(400, "country not offered")
+                if c["did2"]:
+                    if (c["did2_cc"] or "") == cc: return dict(cust_json(con, c), already=True)
+                    raise ApiError(409, "this line already has a second number")
+                want = digits(body.get("phone_number"))
+                num, pid = telnyx_buy_intl(cc, want, digits(body.get("ndc")))
+                con.execute("UPDATE customers SET did2=?, phone_id2=?, did2_cc=? WHERE sip_user=?", (num, pid, cc, u))
+                event(con, u, "did2", f"{cc} {num}" + (" (picked)" if num == want else f" (wanted {want or 'any'})")); con.commit()
+                c = con.execute("SELECT * FROM customers WHERE sip_user=?", (u,)).fetchone()
+                return dict(cust_json(con, c), picked=(num == want))
+            if sub == "did2" and method == "DELETE":
+                ok = drop_did2(con, c, str(body.get("why") or "removed")[:60] if body else "removed"); con.commit()
+                return {"ok": ok}
             if sub == "location" and method == "POST":         # the app's live location during a 911 / 933 call
                 try: lat, lon = float(body.get("lat")), float(body.get("lon"))
                 except (TypeError, ValueError): raise ApiError(400, "lat and lon required")
