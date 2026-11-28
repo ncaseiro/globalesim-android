@@ -1663,7 +1663,10 @@ def sms_in(payload):
     with _lock, db() as con:
         cust = con.execute("SELECT * FROM customers WHERE did=? AND status<>'canceled'", (to,)).fetchone()
         user = cust["sip_user"] if cust else (C["test_user"] if C["company_did"] and to == digits(C["company_did"]) else "")
-        if not user: event(con, "", "text_unknown", f"to={to} from={frm}"); con.commit(); return
+        if not user:
+            if not con.execute("SELECT 1 FROM stock WHERE number=?", (to,)).fetchone():   # pool numbers: texts for the old owner, dropped quietly
+                event(con, "", "text_unknown", f"to={to} from={frm}"); con.commit()
+            return
         if con.execute("SELECT COUNT(*) FROM texts WHERE sip_user=? AND received_at > ?", (user, iso(now() - dt.timedelta(days=1)))).fetchone()[0] >= 300:
             return                                                # flood guard
         try:
@@ -1992,7 +1995,8 @@ def _agi_modes(a, mode, args):
                 a.set("GS_OK", "1"); a.set("GS_USER", C["test_user"]); a.set("GS_DIALS", f"PJSIP/{C['test_user']}"); a.set("GS_CALLID", "0"); a.set("GS_MAXMS", str(4 * 3600 * 1000))
             else:
                 a.set("GS_OK", "0"); a.set("GS_REASON", "unknown_number")
-                if not con.execute("SELECT 1 FROM customers WHERE did=?", (did,)).fetchone():
+                # numbers resting in our pool (incl. the carrier-test number) get calls meant for their old owner: refuse quietly
+                if not con.execute("SELECT 1 FROM customers WHERE did=? UNION SELECT 1 FROM stock WHERE number=?", (did, did)).fetchone():
                     event(con, "", "unknown_in", f"to={to_raw[:120]} exten={args[1]} caller={caller}")
         elif mode == "ext" and len(args) > 2 and re.fullmatch(r"D\d+", args[2] or ""):   # ext <endpoint> D<id> — call a department
             me = con.execute("SELECT * FROM customers WHERE sip_user=?", (base_user(args[1]),)).fetchone()
